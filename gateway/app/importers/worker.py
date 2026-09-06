@@ -22,7 +22,7 @@ class ImportWorker:
 
     def assert_ownership(self, job, token) -> None:
         now = datetime.now(timezone.utc)
-        current = self.db.scalar(select(ImportJob).where(ImportJob.id == job.id, ImportJob.status == "running", ImportJob.lease_token == token, ImportJob.lease_expires_at > now))
+        current = self.db.scalar(select(ImportJob).where(ImportJob.id == job.id, ImportJob.status == "running", ImportJob.lease_token == token, ImportJob.lease_expires_at > now).with_for_update())
         if current is None: raise LeaseLost("ownership_lost")
 
     def attempt_staging_path(self, root, job) -> str:
