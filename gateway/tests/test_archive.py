@@ -85,6 +85,10 @@ def test_database_and_disk_manifest_match(archive_env):
     assert record.sha256 == manifest["sha256"] == hashlib.sha256(target.read_bytes()).hexdigest()
     assert record.size_bytes == manifest["size_bytes"] == target.stat().st_size
     assert record.media_type == "application/json"
+    assert manifest["integrity_status"] == "verified"
+    assert manifest["expected_sha256"] == record.sha256
+    assert manifest["integrity_checked_at"] is not None
+    assert manifest["integrity_error"] is None
 
 def test_same_object_keeps_multiple_source_observations(archive_env):
     root, db = archive_env
@@ -126,6 +130,7 @@ def test_existing_object_digest_corruption_is_rejected(archive_env):
     assert manifest['integrity_status'] == 'integrity_failure'
     assert manifest['expected_sha256'] == first.sha256
     assert manifest['integrity_error'].startswith('digest_mismatch:')
+    assert manifest['integrity_checked_at'] is not None
     target.write_bytes(b'abc')
     with pytest.raises(Exception, match='explicit reverify required'):
         service.archive_file(src, 'original.bin', 'test')

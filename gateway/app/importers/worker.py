@@ -1,11 +1,17 @@
 from datetime import datetime, timezone, timedelta
 import uuid
 from sqlalchemy import func, select, update
-from sqlalchemy.orm import Session
-from ..models import ImportJob
+from pathlib import Path
+
+from sqlalchemy.orm import Session, sessionmaker
+
+from ..archive.manifest import sync_manifest_from_archive_object
+from ..models import ArchiveObject, ImportJob
 
 class ImportWorker:
     def __init__(self, db: Session): self.db = db
+    def _fresh_session(self) -> Session:
+        return sessionmaker(bind=self.db.get_bind(), autoflush=False, expire_on_commit=False)()
     def recover_stale(self) -> int:
         now = datetime.now(timezone.utc); jobs = self.db.scalars(select(ImportJob).where(ImportJob.status == "running", ImportJob.lease_expires_at < now)).all()
         for j in jobs:
@@ -18,13 +24,22 @@ class ImportWorker:
         if job is None: return None
         now = datetime.now(timezone.utc); job.status = "running"; job.started_at = job.started_at or now; job.first_started_at = job.first_started_at or now; job.last_attempt_started_at = now; job.attempt_count += 1; job.last_heartbeat_at = now; job.lease_expires_at = now + timedelta(seconds=lease_duration); job.lease_token = uuid.uuid4(); self.db.commit(); return job
     def _owned(self, job, token, values: dict) -> bool:
+        job_id = job.id if isinstance(job, ImportJob) else job
         values = {k: (database_wall_clock() if k in {"last_heartbeat_at", "finished_at"} else v) for k, v in values.items()}
-        result = self.db.execute(update(ImportJob).where(ownership_predicate(job.id, token)).values(**values)); self.db.commit(); return result.rowcount == 1
+        with self._fresh_session() as lifecycle:
+            result = lifecycle.execute(update(ImportJob).where(ownership_predicate(job_id, token)).values(**values))
+            if result.rowcount != 1:
+                lifecycle.rollback()
+                return False
+            lifecycle.commit()
+            return True
 
     def assert_ownership(self, job, token) -> None:
         if token is None: raise LeaseRequired("lease_required")
         current = self.db.scalar(select(ImportJob).where(ownership_predicate(job.id, token)).with_for_update())
-        if current is None: raise LeaseLost("ownership_lost")
+        if current is None:
+            self.db.rollback()
+            raise LeaseLost("ownership_lost")
 
     def attempt_staging_path(self, root, job) -> str:
         self.assert_ownership(job, job.lease_token)
@@ -37,6 +52,48 @@ class ImportWorker:
         values.update(counts or {})
         return self._owned(job, token, values)
     def mark_failed(self, job, token, error: str, report: dict | None = None, result_code: str | None = None) -> bool: return self._owned(job, token, {"status": "failed", "finished_at": datetime.now(timezone.utc), "error_summary": error, "report_json": report or {}, "error_code": error, "result_code": result_code or "failed", "lease_token": None, "lease_expires_at": None})
+
+    def mark_archive_integrity_failure(
+        self,
+        *,
+        job_id,
+        token,
+        archive_object_id,
+        archive_root: Path,
+        integrity_error: str,
+        report: dict,
+    ) -> None:
+        with self._fresh_session() as lifecycle:
+            with lifecycle.begin():
+                owned_job = lifecycle.scalar(
+                    select(ImportJob)
+                    .where(ownership_predicate(job_id, token))
+                    .with_for_update()
+                )
+                if owned_job is None:
+                    raise LeaseLost("ownership_lost")
+                archive = lifecycle.scalar(
+                    select(ArchiveObject)
+                    .where(ArchiveObject.id == archive_object_id)
+                    .with_for_update()
+                )
+                if archive is None:
+                    raise ValueError("archive_object_missing")
+                archive.integrity_status = "integrity_failure"
+                archive.integrity_error = integrity_error
+                archive.integrity_checked_at = database_wall_clock()
+                owned_job.status = "failed"
+                owned_job.result_code = "archive_integrity_failure"
+                owned_job.error_code = "archive_integrity_failure"
+                owned_job.error_summary = "archive_integrity_failure"
+                owned_job.report_json = report
+                owned_job.finished_at = database_wall_clock()
+                owned_job.lease_token = None
+                owned_job.lease_expires_at = None
+
+            archive = lifecycle.get(ArchiveObject, archive_object_id)
+            lifecycle.refresh(archive)
+            sync_manifest_from_archive_object(archive_root, archive)
 
 class LeaseLost(RuntimeError):
     pass

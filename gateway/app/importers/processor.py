@@ -9,6 +9,7 @@ from ..models import ArchiveObject
 class ImportProcessor:
     def __init__(self, db, archive_root: Path, limits: ZipLimits = ZipLimits()): self.db, self.root, self.limits = db, archive_root, limits
     def process(self, job, token) -> dict:
+        job_id = job.id
         worker=ImportWorker(self.db); worker.assert_ownership(job, token)
         obj=self.db.get(ArchiveObject, job.archive_object_id)
         if obj is None: raise ValueError('archive_object_missing')
@@ -20,7 +21,13 @@ class ImportProcessor:
             verified_source = attempt / '_verified_input.zip'
             actual_size, actual_sha = copy_and_verify_archive(source, verified_source)
             if actual_size != obj.size_bytes or actual_sha != obj.sha256:
-                raise ArchiveConsumptionIntegrityError(f'archive_integrity_failure: expected={obj.sha256}/{obj.size_bytes} actual={actual_sha}/{actual_size}')
+                raise ArchiveConsumptionIntegrityError(
+                    archive_object_id=obj.id,
+                    expected_sha256=obj.sha256,
+                    actual_sha256=actual_sha,
+                    expected_size=obj.size_bytes,
+                    actual_size=actual_size,
+                )
             extract_root = attempt / 'extracted'
             scan=safe_extract(verified_source, extract_root, self.limits)
             files=list(extract_root.rglob('*')); candidates=[p for p in files if p.is_file() and p.suffix.lower()=='.json' and p.name in {'fixture.json','conversations.json'}]
@@ -30,30 +37,48 @@ class ImportProcessor:
             if detection != 'matched': raise UnsupportedStructure(detection)
             outcome=ImportService(self.db).import_fixture(payload, job.archive_object_id, job=job, lease_token=token)
             result=dict(outcome.report); result.update({'scan':scan,'unknown':[{'type':'unknown_file','detail':x,'severity':'info','raw_pointer':str(x)} for x in unknown]}); result['imported_messages']=result.get('messages',{}).get('new',0); result['imported_conversations']=result.get('conversations',{}).get('new',0)
-            if not worker.mark_completed(job, token, result, 'imported', outcome.counts): raise LeaseLost('ownership_lost')
+            if not worker.mark_completed(job_id, token, result, 'imported', outcome.counts): raise LeaseLost('ownership_lost')
             return result
         except LeaseLost:
-            keep=True; raise
+            keep=True; self.db.rollback(); raise
         except ArchiveConsumptionIntegrityError as exc:
             keep=True
-            obj.integrity_status='integrity_failure'; obj.integrity_error=str(exc)
-            if not worker.mark_failed(job, token, 'archive_integrity_failure', {'errors':[{'type':'archive_integrity_failure','detail':str(exc),'severity':'error'}]}, 'archive_integrity_failure'):
-                self.db.rollback(); raise LeaseLost('ownership_lost')
+            self.db.rollback()
+            worker.mark_archive_integrity_failure(
+                job_id=job_id,
+                token=token,
+                archive_object_id=exc.archive_object_id,
+                archive_root=self.root,
+                integrity_error=str(exc),
+                report={'errors':[{'type':'archive_integrity_failure','detail':str(exc),'severity':'error'}]},
+            )
             raise
         except UnsupportedStructure as exc:
             keep=True
-            if not worker.mark_failed(job, token, str(exc), {'unknown':[{'type':str(exc),'detail':'no registered parser matched','severity':'error'}]}, str(exc)): raise LeaseLost('ownership_lost')
+            self.db.rollback()
+            if not worker.mark_failed(job_id, token, str(exc), {'unknown':[{'type':str(exc),'detail':'no registered parser matched','severity':'error'}]}, str(exc)): raise LeaseLost('ownership_lost')
             raise
         except Exception as exc:
             keep=True
-            if not worker.mark_failed(job, token, type(exc).__name__, {'errors':[{'type':'processor_error','detail':str(exc),'severity':'error'}]}): raise LeaseLost('ownership_lost')
+            self.db.rollback()
+            if not worker.mark_failed(job_id, token, type(exc).__name__, {'errors':[{'type':'processor_error','detail':str(exc),'severity':'error'}]}): raise LeaseLost('ownership_lost')
             raise
         finally:
             if not keep: shutil.rmtree(attempt, ignore_errors=True)
 
 class UnsupportedStructure(ValueError): pass
 
-class ArchiveConsumptionIntegrityError(IOError): pass
+class ArchiveConsumptionIntegrityError(IOError):
+    def __init__(self, *, archive_object_id, expected_sha256: str, actual_sha256: str, expected_size: int, actual_size: int):
+        self.archive_object_id = archive_object_id
+        self.expected_sha256 = expected_sha256
+        self.actual_sha256 = actual_sha256
+        self.expected_size = expected_size
+        self.actual_size = actual_size
+        super().__init__(
+            f'archive_integrity_failure: expected={expected_sha256}/{expected_size} '
+            f'actual={actual_sha256}/{actual_size}'
+        )
 
 
 def copy_and_verify_archive(source: Path, destination: Path) -> tuple[int, str]:

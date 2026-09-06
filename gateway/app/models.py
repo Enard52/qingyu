@@ -17,6 +17,7 @@ class ArchiveObject(Base):
     source_platform: Mapped[str | None] = mapped_column(String(100), nullable=True)
     integrity_status: Mapped[str] = mapped_column(String(32), nullable=False, default="verified")
     integrity_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    integrity_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     first_archived_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
     metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
 

@@ -1,5 +1,4 @@
 import hashlib
-import json
 import mimetypes
 import os
 import re
@@ -12,6 +11,7 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from ..models import ArchiveObject, ArchiveObservation
+from .manifest import sync_manifest_from_archive_object
 
 SAFE_NAME = re.compile(r"^[^<>:\"/\\|?*\x00-\x1f]+$")
 
@@ -63,6 +63,7 @@ class ArchiveService:
                     if existing_bad:
                         existing_bad.integrity_status = "integrity_failure"
                         existing_bad.integrity_error = f"digest_mismatch:{actual}"
+                        existing_bad.integrity_checked_at = datetime.now(timezone.utc)
                         self.db.commit()
                         self._write_manifest(existing_bad)
                     raise ArchiveIntegrityError(f"archive_integrity_failure: expected={sha} actual={actual}")
@@ -76,10 +77,11 @@ class ArchiveService:
                 if existing.integrity_status != "verified":
                     self._write_manifest(existing)
                     raise ArchiveIntegrityError("archive_integrity_failure: explicit reverify required")
+                existing.integrity_checked_at = datetime.now(timezone.utc)
                 object_id = existing.id
                 record = existing
             else:
-                record = ArchiveObject(sha256=sha, size_bytes=size, relative_path=rel.as_posix(), media_type=media_type or mimetypes.guess_type(source.name)[0] or "application/octet-stream", integrity_status="verified", metadata_json={})
+                record = ArchiveObject(sha256=sha, size_bytes=size, relative_path=rel.as_posix(), media_type=media_type or mimetypes.guess_type(source.name)[0] or "application/octet-stream", integrity_status="verified", integrity_checked_at=datetime.now(timezone.utc), metadata_json={})
                 self.db.add(record)
                 self.db.commit()
                 object_id = record.id
@@ -101,20 +103,6 @@ class ArchiveService:
         return count
 
     def _write_manifest(self, record: ArchiveObject) -> Path:
-        manifest = {
-            "manifest_version": 2,
-            "object_id": str(record.id),
-            "sha256": record.sha256,
-            "expected_sha256": record.sha256,
-            "size_bytes": record.size_bytes,
-            "relative_path": record.relative_path,
-            "media_type": record.media_type,
-            "integrity_status": record.integrity_status,
-            "integrity_checked_at": datetime.now(timezone.utc).isoformat(),
-            "integrity_error": record.integrity_error,
-        }
-        path = self.manifests / f"{record.sha256}.json"
-        path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        return path
+        return sync_manifest_from_archive_object(self.root, record)
 
 
