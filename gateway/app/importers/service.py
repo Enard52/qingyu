@@ -2,7 +2,7 @@ import hashlib
 from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-from ..models import Conversation, ImportJob, Message, MessageObservation, MessageRevision, SourceAccount
+from ..models import ArchiveObject, Conversation, ImportJob, Message, MessageObservation, MessageRevision, SourceAccount
 from .generic import GenericTreeParser
 from .report import empty_report
 from .tree import TreeValidator
@@ -13,20 +13,37 @@ class ImportService:
     def __init__(self, db: Session): self.db = db
 
     def import_fixture(self, payload: dict[str, Any], archive_object_id, platform="fixture", account_label="default", job: ImportJob | None = None, lease_token=None) -> ImportJob:
-        account = self.db.scalar(select(SourceAccount).where(SourceAccount.platform == platform, SourceAccount.account_label == account_label))
-        if account is None:
-            account = SourceAccount(platform=platform, account_label=account_label, metadata_json={}); self.db.add(account); self.db.flush()
         created_job = job is None
+        if job is not None:
+            account = self.db.get(SourceAccount, job.source_account_id)
+            if account is None:
+                raise ValueError("invalid_source_account")
+            archive = self.db.get(ArchiveObject, job.archive_object_id)
+            if archive is None:
+                raise ValueError("archive_object_missing")
+            archive_object_id = archive.id
+        else:
+            account = self.db.scalar(select(SourceAccount).where(SourceAccount.platform == platform, SourceAccount.account_label == account_label))
+            if account is None:
+                account = SourceAccount(platform=platform, account_label=account_label, metadata_json={}); self.db.add(account); self.db.flush()
         if job is None:
             job = ImportJob(source_account_id=account.id, archive_object_id=archive_object_id, parser_name=GenericTreeParser.name, parser_version=GenericTreeParser.version, status="running", report_json={})
             self.db.add(job); self.db.flush(); lease_token = job.lease_token
+        archive = self.db.get(ArchiveObject, archive_object_id)
+        if archive is None:
+            raise ValueError("archive_object_missing")
         report = empty_report(GenericTreeParser.name, GenericTreeParser.version, "matched")
         try:
-            for parsed in GenericTreeParser().parse(payload):
+            for conv_index, parsed in enumerate(GenericTreeParser().parse(payload)):
                 if lease_token is not None: ImportWorker(self.db).assert_ownership(job, lease_token)
-                conversation = self.db.scalar(select(Conversation).where(Conversation.source_account_id == account.id, Conversation.external_conversation_id == parsed.external_id))
+                external_id = parsed.external_id
+                synthetic = not bool(external_id)
+                if synthetic:
+                    external_id = f"synthetic:{archive.sha256}:conversation:{conv_index}"
+                    report["unknown"].append({"type": "missing_external_conversation_id", "severity": "warning", "conversation_identity": external_id, "detail": "generated deterministic synthetic identity", "raw_pointer": f"/conversations/{conv_index}"})
+                conversation = self.db.scalar(select(Conversation).where(Conversation.source_account_id == account.id, Conversation.external_conversation_id == external_id))
                 if conversation is None:
-                    conversation = Conversation(source_account_id=account.id, external_conversation_id=parsed.external_id, title=parsed.title, metadata_json={}); self.db.add(conversation); self.db.flush(); report["conversations"]["new"] += 1
+                    conversation = Conversation(source_account_id=account.id, external_conversation_id=external_id, title=parsed.title, metadata_json={"identity_kind": "synthetic" if synthetic else "external"}); self.db.add(conversation); self.db.flush(); report["conversations"]["new"] += 1
                 elif conversation.title != parsed.title:
                     conversation.title = parsed.title; report["conversations"]["changed"] += 1
                 else: report["conversations"]["existing"] += 1
