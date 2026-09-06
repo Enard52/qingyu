@@ -69,7 +69,7 @@ class ImportProcessor:
         except Exception as exc:
             keep=True
             self.db.rollback()
-            if not worker.mark_failed(job_id, token, 'processor_error', {'errors':[{'type':'processor_error','detail':'processing failed','severity':'error'}]}): raise LeaseLost('ownership_lost')
+            if not worker.mark_failed(job_id, token, 'processor_error', {'errors':[{'type':'processor_error','detail':'processing failed','severity':'error'}]}, 'processor_error'): raise LeaseLost('ownership_lost')
             raise
         finally:
             if not keep: shutil.rmtree(attempt, ignore_errors=True)
