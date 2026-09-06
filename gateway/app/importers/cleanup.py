@@ -13,3 +13,4 @@ def cleanup_failed_staging(root: Path, retention_days: int = 7, dry_run: bool = 
     if dry_run: return candidates
     for path in candidates: shutil.rmtree(path, ignore_errors=True)
     return len(candidates)
+
