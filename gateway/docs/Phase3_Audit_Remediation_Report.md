@@ -21,6 +21,10 @@
 - AUD-08: `code_fixed / self_tested` — every persisted tree query requires `conversation_id` and `import_job_id`, with explicit message join conditions.
 - AUD-13: `code_fixed / self_tested` — an archive operation returns its exact observation ID; pointers include archive, ZIP member, array index, and escaped mapping key.
 
+## P1 Group C
+
+- AUD-10: `code_fixed / self_tested` — fixture payloads receive complete prevalidation before persistence; candidate selection is unambiguous and the detected parser performs parsing.
+
 ## AUD-01 verification
 
 - Test database: `qingyu_test`

@@ -2,7 +2,7 @@ import hashlib, json, shutil, zipfile
 from pathlib import Path
 from .zip_staging import safe_extract, ZipLimits
 from .service import ImportService
-from .generic import ParserRegistry
+from .generic import ParserRegistry, ParserValidationError
 from .worker import ImportWorker, LeaseLost
 from ..models import ArchiveObject
 
@@ -33,10 +33,12 @@ class ImportProcessor:
             files=list(extract_root.rglob('*')); candidates=[p for p in files if p.is_file() and p.suffix.lower()=='.json' and p.name in {'fixture.json','conversations.json'}]
             unknown=[str(p.relative_to(extract_root)) for p in files if p.is_file() and p not in candidates]
             if not candidates: raise UnsupportedStructure('unsupported_structure')
-            payload=json.loads(candidates[0].read_text(encoding='utf-8')); detection,_=ParserRegistry().detect(payload)
+            if len(candidates) != 1: raise UnsupportedStructure('ambiguous_structure')
+            payload=json.loads(candidates[0].read_text(encoding='utf-8')); detection,parser=ParserRegistry().detect(payload)
             if detection != 'matched': raise UnsupportedStructure(detection)
             source_member = candidates[0].relative_to(extract_root).as_posix()
-            outcome=ImportService(self.db).import_fixture(payload, job.archive_object_id, job=job, lease_token=token, source_member=source_member)
+            unknown_fields = parser.validate(payload, source_member)
+            outcome=ImportService(self.db).import_fixture(payload, job.archive_object_id, job=job, lease_token=token, source_member=source_member, parser=parser, unknown_entries=unknown_fields)
             result=dict(outcome.report); result.update({'scan':scan,'unknown':[{'type':'unknown_file','detail':x,'severity':'info','raw_pointer':str(x)} for x in unknown]}); result['imported_messages']=result.get('messages',{}).get('new',0); result['imported_conversations']=result.get('conversations',{}).get('new',0)
             if not worker.mark_completed(job_id, token, result, 'imported', outcome.counts): raise LeaseLost('ownership_lost')
             return result
@@ -53,6 +55,11 @@ class ImportProcessor:
                 integrity_error=str(exc),
                 report={'errors':[{'type':'archive_integrity_failure','detail':str(exc),'severity':'error'}]},
             )
+            raise
+        except ParserValidationError as exc:
+            keep=True; self.db.rollback()
+            report={'errors':[dict(item, severity='error') for item in exc.errors]}
+            if not worker.mark_failed(job_id, token, 'parser_validation_error', report, 'parser_validation_error'): raise LeaseLost('ownership_lost')
             raise
         except UnsupportedStructure as exc:
             keep=True

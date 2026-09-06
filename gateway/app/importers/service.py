@@ -20,7 +20,7 @@ class ImportService:
     """Persist fixture conversations in short, ownership-fenced transactions."""
     def __init__(self, db: Session): self.db = db
 
-    def import_fixture(self, payload: dict[str, Any], archive_object_id, platform="fixture", account_label="default", job: ImportJob | None = None, lease_token=None, source_member="fixture.json") -> ImportOutcome:
+    def import_fixture(self, payload: dict[str, Any], archive_object_id, platform="fixture", account_label="default", job: ImportJob | None = None, lease_token=None, source_member="fixture.json", parser=None, unknown_entries=None) -> ImportOutcome:
         if job is None or lease_token is None:
             raise LeaseRequired("lease_required")
         account = self.db.get(SourceAccount, job.source_account_id)
@@ -34,8 +34,10 @@ class ImportService:
         if archive is None:
             raise ValueError("archive_object_missing")
         report = empty_report(GenericTreeParser.name, GenericTreeParser.version, "matched")
+        report["unknown"].extend(unknown_entries or [])
+        parser = parser or GenericTreeParser()
         try:
-            for conv_index, parsed in enumerate(GenericTreeParser().parse(payload)):
+            for conv_index, parsed in enumerate(parser.parse(payload)):
                 if lease_token is not None: ImportWorker(self.db).assert_ownership(job, lease_token)
                 self.db.scalar(select(SourceAccount.id).where(SourceAccount.id == account.id).with_for_update())
                 external_id = parsed.external_id
