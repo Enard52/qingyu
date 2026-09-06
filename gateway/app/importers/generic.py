@@ -34,36 +34,126 @@ class GenericTreeParser:
     version = "0.1"
     marker = "qingyu-fixture-v1"
     top_fields = {"schema_marker", "conversations"}
-    conversation_fields = {"id", "title", "current_node", "mapping"}
+    conversation_fields = {"id", "title", "current_node", "mapping", "metadata"}
+    node_fields = {"id", "parent", "children", "message", "metadata"}
+    message_fields = {
+        "id", "author", "content", "metadata", "model", "create_time",
+        "update_time", "attachments",
+    }
+    author_fields = {"role", "name", "metadata"}
+    content_fields = {"content_type", "parts", "text", "metadata"}
 
     def can_parse(self, payload) -> bool:
         return isinstance(payload, dict) and payload.get("schema_marker") == self.marker and isinstance(payload.get("conversations"), list)
 
     def validate(self, payload: Any, member="fixture.json") -> list[dict]:
-        errors=[]; unknown=[]
-        if not isinstance(payload, dict): raise ParserValidationError([{"type":"invalid_top_level","raw_pointer":"","detail":"expected JSON object"}])
-        if payload.get("schema_marker") != self.marker: errors.append({"type":"invalid_schema_marker","raw_pointer":"/schema_marker","detail":"unsupported fixture marker"})
-        conversations=payload.get("conversations")
-        if not isinstance(conversations, list): errors.append({"type":"invalid_conversations","raw_pointer":"/conversations","detail":"expected array"}); conversations=[]
-        for field in payload.keys()-self.top_fields: unknown.append({"type":"unknown_field","severity":"warning","file":member,"field":field,"raw_pointer":f"/{pointer_escape(field)}"})
+        errors = []
+        unknown = []
+        if not isinstance(payload, dict):
+            raise ParserValidationError([{"type": "invalid_top_level", "raw_pointer": "", "detail": "expected JSON object"}])
+        if payload.get("schema_marker") != self.marker:
+            errors.append({"type": "invalid_schema_marker", "raw_pointer": "/schema_marker", "detail": "unsupported fixture marker"})
+        conversations = payload.get("conversations")
+        if not isinstance(conversations, list):
+            errors.append({"type": "invalid_conversations", "raw_pointer": "/conversations", "detail": "expected array"})
+            conversations = []
+        self._unknown_fields(payload, self.top_fields, "", member, unknown)
         for index, conversation in enumerate(conversations):
-            base=f"/conversations/{index}"
-            if not isinstance(conversation, dict): errors.append({"type":"invalid_conversation","raw_pointer":base,"detail":"expected object"}); continue
-            for field in conversation.keys()-self.conversation_fields: unknown.append({"type":"unknown_field","severity":"warning","file":member,"field":field,"raw_pointer":f"{base}/{pointer_escape(field)}"})
-            mapping=conversation.get("mapping")
-            if not isinstance(mapping, dict): errors.append({"type":"invalid_mapping","raw_pointer":f"{base}/mapping","detail":"expected object"}); continue
-            for node_id,node in mapping.items():
-                pointer=f"{base}/mapping/{pointer_escape(node_id)}"
-                if not isinstance(node,dict): errors.append({"type":"invalid_node","raw_pointer":pointer,"detail":"expected object"}); continue
-                if node.get("parent") is not None and not isinstance(node.get("parent"),str): errors.append({"type":"invalid_parent","raw_pointer":f"{pointer}/parent","detail":"expected string or null"})
-                message=node.get("message")
-                if not isinstance(message,dict): errors.append({"type":"invalid_message","raw_pointer":f"{pointer}/message","detail":"expected object"}); continue
-                if not isinstance(message.get("author",{}),dict): errors.append({"type":"invalid_author","raw_pointer":f"{pointer}/message/author","detail":"expected object"})
-                content=message.get("content",{})
-                if not isinstance(content,dict): errors.append({"type":"invalid_content","raw_pointer":f"{pointer}/message/content","detail":"expected object"})
-                elif "parts" in content and not isinstance(content["parts"],list): errors.append({"type":"invalid_parts","raw_pointer":f"{pointer}/message/content/parts","detail":"expected array"})
-        if errors: raise ParserValidationError(errors)
+            base = f"/conversations/{index}"
+            if not isinstance(conversation, dict):
+                self._error(errors, "invalid_conversation", base, "expected object")
+                continue
+            self._unknown_fields(conversation, self.conversation_fields, base, member, unknown)
+            self._optional_type(conversation, "id", str, errors, base)
+            self._optional_type(conversation, "title", str, errors, base)
+            self._optional_type(conversation, "current_node", str, errors, base)
+            self._optional_mapping(conversation, "metadata", errors, base)
+            mapping = conversation.get("mapping")
+            if not isinstance(mapping, dict):
+                self._error(errors, "invalid_mapping", f"{base}/mapping", "expected object")
+                continue
+            for node_id, node in mapping.items():
+                pointer = f"{base}/mapping/{pointer_escape(node_id)}"
+                if not isinstance(node, dict):
+                    self._error(errors, "invalid_node", pointer, "expected object")
+                    continue
+                self._unknown_fields(node, self.node_fields, pointer, member, unknown)
+                self._optional_type(node, "id", str, errors, pointer)
+                self._optional_type(node, "parent", str, errors, pointer)
+                self._optional_mapping(node, "metadata", errors, pointer)
+                self._string_list(node, "children", errors, pointer)
+                message = node.get("message")
+                if not isinstance(message, dict):
+                    self._error(errors, "invalid_message", f"{pointer}/message", "expected object")
+                    continue
+                self._validate_message(message, pointer, member, errors, unknown)
+        if errors:
+            raise ParserValidationError(errors)
         return unknown
+
+    def _validate_message(self, message, node_pointer, member, errors, unknown):
+        base = f"{node_pointer}/message"
+        self._unknown_fields(message, self.message_fields, base, member, unknown)
+        self._optional_type(message, "id", str, errors, base)
+        self._optional_type(message, "model", str, errors, base)
+        self._optional_scalar(message, "create_time", errors, base)
+        self._optional_scalar(message, "update_time", errors, base)
+        self._optional_mapping(message, "metadata", errors, base)
+        self._list_field(message, "attachments", errors, base)
+
+        author = message.get("author")
+        if not isinstance(author, dict):
+            self._error(errors, "invalid_author", f"{base}/author", "expected object")
+        else:
+            self._unknown_fields(author, self.author_fields, f"{base}/author", member, unknown)
+            self._optional_type(author, "role", str, errors, f"{base}/author")
+            self._optional_type(author, "name", str, errors, f"{base}/author")
+            self._optional_mapping(author, "metadata", errors, f"{base}/author")
+
+        content = message.get("content")
+        if not isinstance(content, dict):
+            self._error(errors, "invalid_content", f"{base}/content", "expected object")
+        else:
+            self._unknown_fields(content, self.content_fields, f"{base}/content", member, unknown)
+            self._optional_type(content, "content_type", str, errors, f"{base}/content")
+            self._optional_type(content, "text", str, errors, f"{base}/content")
+            self._optional_mapping(content, "metadata", errors, f"{base}/content")
+            self._list_field(content, "parts", errors, f"{base}/content")
+
+        metadata = message.get("metadata")
+        if isinstance(metadata, dict):
+            self._optional_type(metadata, "model_slug", str, errors, f"{base}/metadata")
+
+    @staticmethod
+    def _error(errors, error_type, pointer, detail):
+        errors.append({"type": error_type, "raw_pointer": pointer, "detail": detail})
+
+    def _optional_type(self, value, field, expected, errors, base):
+        if field in value and value[field] is not None and not isinstance(value[field], expected):
+            self._error(errors, f"invalid_{field}", f"{base}/{pointer_escape(field)}", f"expected {expected.__name__} or null")
+
+    def _optional_mapping(self, value, field, errors, base):
+        if field in value and value[field] is not None and not isinstance(value[field], dict):
+            self._error(errors, f"invalid_{field}", f"{base}/{pointer_escape(field)}", "expected object or null")
+
+    def _list_field(self, value, field, errors, base):
+        if field in value and value[field] is not None and not isinstance(value[field], list):
+            self._error(errors, f"invalid_{field}", f"{base}/{pointer_escape(field)}", "expected array or null")
+
+    def _string_list(self, value, field, errors, base):
+        self._list_field(value, field, errors, base)
+        if isinstance(value.get(field), list) and any(not isinstance(item, str) for item in value[field]):
+            self._error(errors, f"invalid_{field}", f"{base}/{pointer_escape(field)}", "expected array of strings")
+
+    def _optional_scalar(self, value, field, errors, base):
+        item = value.get(field)
+        if field in value and item is not None and (isinstance(item, bool) or not isinstance(item, (str, int, float))):
+            self._error(errors, f"invalid_{field}", f"{base}/{pointer_escape(field)}", "expected string, number, or null")
+
+    @staticmethod
+    def _unknown_fields(value, allowed, base, member, unknown):
+        for field in value.keys() - allowed:
+            unknown.append({"type": "unknown_field", "severity": "warning", "file": member, "field": field, "raw_pointer": f"{base}/{pointer_escape(field)}"})
 
     def parse(self, payload: dict[str, Any]) -> Iterator[ParsedConversation]:
         self.validate(payload)
