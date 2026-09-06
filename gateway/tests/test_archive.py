@@ -112,3 +112,12 @@ def test_manifest_is_content_level_without_source_fields(archive_env):
     assert manifest["sha256"] == result.sha256
 
 
+
+def test_existing_object_digest_corruption_is_rejected(archive_env):
+    root, db = archive_env
+    src = root / 'original.bin'; src.write_bytes(b'abc')
+    service = ArchiveService(root, db); first = service.archive_file(src, 'original.bin', 'test')
+    target = root / first.relative_path; target.write_bytes(b'xyz')
+    with pytest.raises(Exception, match='archive_integrity_failure'):
+        service.archive_file(src, 'original.bin', 'test')
+    assert target.read_bytes() == b'xyz'

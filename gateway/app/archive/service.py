@@ -23,6 +23,7 @@ class ArchiveResult:
     duplicate: bool
     manifest_path: Path
 
+class ArchiveIntegrityError(IOError): pass
 class ArchiveService:
     def __init__(self, root: Path, db: Session):
         self.root = root
@@ -55,10 +56,19 @@ class ArchiveService:
             target.parent.mkdir(parents=True, exist_ok=True)
             duplicate = target.exists()
             if duplicate:
-                if target.stat().st_size != size:
-                    raise IOError("目标对象已存在但大小不一致")
+                actual = hashlib.sha256(target.read_bytes()).hexdigest()
+                if actual != sha:
+                    existing_bad = self.db.scalar(select(ArchiveObject).where(ArchiveObject.sha256 == sha))
+                    if existing_bad:
+                        existing_bad.integrity_status = "integrity_failure"
+                        existing_bad.integrity_error = f"digest_mismatch:{actual}"
+                        self.db.commit()
+                    raise ArchiveIntegrityError(f"archive_integrity_failure: expected={sha} actual={actual}")
             else:
                 os.replace(staged, target)
+                actual = hashlib.sha256(target.read_bytes()).hexdigest()
+                if actual != sha:
+                    raise ArchiveIntegrityError("archive_integrity_failure: post_write_digest_mismatch")
             existing = self.db.scalar(select(ArchiveObject).where(ArchiveObject.sha256 == sha, ArchiveObject.size_bytes == size))
             if existing:
                 object_id = existing.id
@@ -85,3 +95,5 @@ class ArchiveService:
                     path.unlink()
                     count += 1
         return count
+
+

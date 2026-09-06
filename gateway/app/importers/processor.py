@@ -12,6 +12,8 @@ class ImportProcessor:
         worker=ImportWorker(self.db); worker.assert_ownership(job, token)
         obj=self.db.get(ArchiveObject, job.archive_object_id)
         if obj is None: raise ValueError('archive_object_missing')
+        if obj.integrity_status != 'verified':
+            raise ValueError('archive_integrity_failure')
         source=self.root/obj.relative_path; attempt=Path(worker.attempt_staging_path(self.root, job)); attempt.mkdir(parents=True, exist_ok=True); keep=False
         try:
             if source.suffix.lower() != '.zip' and obj.media_type != 'application/zip': raise UnsupportedStructure('unsupported_structure')
