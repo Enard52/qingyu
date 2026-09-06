@@ -8,7 +8,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from ..models import ArchiveObject, ArchiveObservation
 from .manifest import sync_manifest_from_archive_object
@@ -27,12 +27,13 @@ class ArchiveResult:
 
 class ArchiveIntegrityError(IOError): pass
 class ArchiveService:
-    def __init__(self, root: Path, db: Session):
+    def __init__(self, root: Path, db: Session, fault_hook=None):
         self.root = root
         self.staging = root / "staging"
         self.objects = root / "archive" / "objects"
         self.manifests = root / "manifests"
         self.db = db
+        self.fault_hook = fault_hook or (lambda event: None)
 
     def archive_file(self, source: Path, original_filename: str | None = None, source_platform: str = "unknown", media_type: str | None = None) -> ArchiveResult:
         if not SAFE_NAME.fullmatch(original_filename or source.name) or Path(original_filename or source.name).name != (original_filename or source.name):
@@ -56,7 +57,13 @@ class ArchiveService:
             rel = Path("archive") / "objects" / sha[:2] / sha
             target = self.root / rel
             target.parent.mkdir(parents=True, exist_ok=True)
-            duplicate = target.exists()
+            with staged.open("r+b") as staged_file:
+                os.fsync(staged_file.fileno())
+            try:
+                os.link(staged, target)
+                duplicate = False
+            except FileExistsError:
+                duplicate = True
             if duplicate:
                 actual = hashlib.sha256(target.read_bytes()).hexdigest()
                 if actual != sha:
@@ -69,10 +76,11 @@ class ArchiveService:
                         self._write_manifest(existing_bad)
                     raise ArchiveIntegrityError(f"archive_integrity_failure: expected={sha} actual={actual}")
             else:
-                os.replace(staged, target)
                 actual = hashlib.sha256(target.read_bytes()).hexdigest()
                 if actual != sha:
                     raise ArchiveIntegrityError("archive_integrity_failure: post_write_digest_mismatch")
+            self.fault_hook("file_published")
+            self.db.execute(select(func.pg_advisory_xact_lock(func.hashtext(sha))))
             existing = self.db.scalar(select(ArchiveObject).where(ArchiveObject.sha256 == sha, ArchiveObject.size_bytes == size))
             if existing:
                 if existing.integrity_status != "verified":
@@ -86,9 +94,11 @@ class ArchiveService:
                 self.db.add(record)
                 self.db.commit()
                 object_id = record.id
-            observation = ArchiveObservation(archive_object_id=object_id, original_filename=original_filename or source.name, source_platform=source_platform, source_path=str(source), logical_path=original_filename or source.name, metadata_json={})
+            observed_media_type = media_type or mimetypes.guess_type(source.name)[0] or "application/octet-stream"
+            observation = ArchiveObservation(archive_object_id=object_id, original_filename=original_filename or source.name, source_platform=source_platform, source_path=str(source), logical_path=original_filename or source.name, metadata_json={"observed_media_type": observed_media_type})
             self.db.add(observation)
             self.db.commit()
+            self.fault_hook("database_committed")
             manifest_path = self._write_manifest(record)
             return ArchiveResult(object_id, sha, size, rel.as_posix(), duplicate, manifest_path, observation.id)
         finally:

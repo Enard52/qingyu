@@ -25,6 +25,11 @@
 
 - AUD-10: `code_fixed / self_tested` — fixture payloads receive complete prevalidation before persistence; candidate selection is unambiguous and the detected parser performs parsing.
 
+## P1 Group D
+
+- AUD-09: `code_fixed / self_tested` — ZIP member tables are fully validated for traversal, Windows collisions, ADS, reserved names, trailing characters, and unsupported types before extraction.
+- AUD-14: `code_fixed / self_tested` — immutable objects use hard-link create-if-absent publication, digest-keyed database serialization, first-seen media type, and recoverable file/DB/manifest ordering.
+
 ## AUD-01 verification
 
 - Test database: `qingyu_test`

@@ -1,9 +1,9 @@
-import hashlib
-import os
-import shutil
-import zipfile
+import hashlib, os, re, shutil, stat, zipfile
 from dataclasses import dataclass
 from pathlib import Path
+
+WINDOWS_RESERVED = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1,10)), *(f"lpt{i}" for i in range(1,10))}
+
 
 @dataclass(frozen=True)
 class ZipLimits:
@@ -12,33 +12,57 @@ class ZipLimits:
     max_files: int = 10_000
     max_compression_ratio: float = 100.0
 
-class UnsafeZipError(ValueError):
-    pass
+
+class UnsafeZipError(ValueError): pass
+
+
+def _normalized_member(info):
+    raw=info.filename
+    if raw.startswith(("/","\\")) or re.match(r"^[A-Za-z]:",raw): raise UnsafeZipError("ZIP absolute/drive/UNC path")
+    name=raw.replace("\\","/"); parts=name.split("/"); clean=[]
+    for part in parts:
+        if not part: continue
+        if part in {".",".."}: raise UnsafeZipError("ZIP path traversal")
+        if ":" in part: raise UnsafeZipError("ZIP ADS/colon path")
+        if part.endswith(("."," ")): raise UnsafeZipError("ZIP trailing dot/space")
+        if part.split(".",1)[0].casefold() in WINDOWS_RESERVED: raise UnsafeZipError("ZIP Windows reserved name")
+        clean.append(part)
+    if not clean: raise UnsafeZipError("ZIP empty member path")
+    mode=(info.external_attr >> 16) & 0xFFFF
+    kind=stat.S_IFMT(mode)
+    if kind not in {0,stat.S_IFREG,stat.S_IFDIR}: raise UnsafeZipError("ZIP unsupported member type")
+    return "/".join(clean), "/".join(clean).casefold()
+
+
+def _prevalidate(archive, limits):
+    infos=archive.infolist()
+    if len(infos)>limits.max_files: raise UnsafeZipError("ZIP file count exceeded")
+    seen={}; total=0; normalized=[]
+    for info in infos:
+        name,key=_normalized_member(info)
+        if key in seen: raise UnsafeZipError("ZIP duplicate or case-insensitive path collision")
+        seen[key]=name; normalized.append((info,name,key))
+        if info.is_dir(): continue
+        if info.file_size>limits.max_file_bytes: raise UnsafeZipError("ZIP single file size exceeded")
+        total += info.file_size
+        if total>limits.max_total_bytes: raise UnsafeZipError("ZIP total size exceeded")
+        if info.compress_size and info.file_size/info.compress_size>limits.max_compression_ratio: raise UnsafeZipError("ZIP suspicious compression ratio")
+        if name.casefold().endswith(".zip"): raise UnsafeZipError("nested ZIP prohibited")
+    file_keys={key for info,_,key in normalized if not info.is_dir()}
+    for _,_,key in normalized:
+        parts=key.split("/")
+        if any("/".join(parts[:i]) in file_keys for i in range(1,len(parts))): raise UnsafeZipError("ZIP file/directory collision")
+    return normalized,total
+
 
 def safe_extract(zip_path: Path, destination: Path, limits: ZipLimits = ZipLimits()) -> dict:
-    destination.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path) as archive:
-        infos = archive.infolist()
-        if len(infos) > limits.max_files:
-            raise UnsafeZipError("ZIP 文件数量超限")
-        total = 0
-        for info in infos:
-            name = info.filename.replace("\\", "/")
-            target = (destination / name).resolve()
-            if name.startswith("/") or ":" in name.split("/")[0] or not str(target).startswith(str(destination.resolve()) + os.sep):
-                raise UnsafeZipError("ZIP 路径穿越或绝对路径")
-            if info.is_dir():
-                continue
-            if info.file_size > limits.max_file_bytes:
-                raise UnsafeZipError("ZIP 单文件大小超限")
-            total += info.file_size
-            if total > limits.max_total_bytes:
-                raise UnsafeZipError("ZIP 解压总大小超限")
-            if info.compress_size and info.file_size / info.compress_size > limits.max_compression_ratio:
-                raise UnsafeZipError("ZIP 压缩比可疑")
-            if name.lower().endswith(".zip"):
-                raise UnsafeZipError("禁止递归 ZIP")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with archive.open(info) as source, target.open("wb") as out:
-                shutil.copyfileobj(source, out, 1024 * 1024)
-    return {"file_count": len(infos), "total_uncompressed_bytes": total, "sha256": hashlib.sha256(zip_path.read_bytes()).hexdigest()}
+        normalized,total=_prevalidate(archive,limits)
+        destination.mkdir(parents=True,exist_ok=True); root=destination.resolve()
+        for info,name,_ in normalized:
+            target=(destination/name).resolve()
+            if root not in target.parents and target != root: raise UnsafeZipError("ZIP escaped destination")
+            if info.is_dir(): target.mkdir(parents=True,exist_ok=True); continue
+            target.parent.mkdir(parents=True,exist_ok=True)
+            with archive.open(info) as source, target.open("xb") as output: shutil.copyfileobj(source,output,1024*1024)
+    return {"file_count":len(normalized),"total_uncompressed_bytes":total,"sha256":hashlib.sha256(zip_path.read_bytes()).hexdigest()}
