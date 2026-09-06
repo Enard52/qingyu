@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     api_token: str = "change-this-local-token"
     database_url: str = "postgresql+psycopg://qingyu:PASSWORD@localhost:5432/qingyu"
     log_level: str = "INFO"
+    archive_root: str = "<repo>/data"
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
 @lru_cache
