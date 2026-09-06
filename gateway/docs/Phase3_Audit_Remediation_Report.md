@@ -30,6 +30,11 @@
 - AUD-09: `code_fixed / self_tested` — ZIP member tables are fully validated for traversal, Windows collisions, ADS, reserved names, trailing characters, and unsupported types before extraction.
 - AUD-14: `code_fixed / self_tested` — immutable objects use hard-link create-if-absent publication, digest-keyed database serialization, first-seen media type, and recoverable file/DB/manifest ordering.
 
+## P1 Group E
+
+- AUD-15: `code_fixed / self_tested` — non-test startup rejects empty/public tokens and Bearer authentication uses `secrets.compare_digest`.
+- AUD-16: `code_fixed / self_tested` — SQL parameters are hidden, DB errors use stable redacted codes, and worker/API logging never stringifies sensitive exceptions or authorization values.
+
 ## AUD-01 verification
 
 - Test database: `qingyu_test`

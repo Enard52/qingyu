@@ -44,8 +44,8 @@ class WorkerRuntime:
                 ImportProcessor(db, self.archive_root).process(job, token)
             except LeaseLost:
                 logger.info("import worker lost ownership", extra={"job_id": str(job.id)})
-            except Exception:
-                logger.exception("import job processing failed", extra={"job_id": str(job.id)})
+            except Exception as exc:
+                logger.error("import job processing failed", extra={"job_id": str(job.id), "error_type": type(exc).__name__})
             finally:
                 heartbeat_stop.set(); heartbeat.join(timeout=self.heartbeat_interval + 1)
             return True
