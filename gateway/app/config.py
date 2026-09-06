@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://qingyu:PASSWORD@localhost:5432/qingyu"
     log_level: str = "INFO"
     archive_root: str = "<repo>/data"
+    staging_failed_retention_days: int = 7
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
 @lru_cache

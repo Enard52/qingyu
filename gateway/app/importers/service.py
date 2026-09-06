@@ -51,12 +51,14 @@ class ImportService:
                             self.db.add(Attachment(message_revision_id=revision.id, external_attachment_id=str(att.get("id")) if isinstance(att, dict) and att.get("id") else None, original_reference=str(att), filename=att.get("filename") if isinstance(att, dict) else None, availability_status="referenced_only", metadata_json={}))
             job.items_discovered = report["imported_messages"]
             job.items_imported = report["imported_messages"]
+            if lease_token is not None: ImportWorker(self.db).assert_ownership(job, lease_token)
             job.status = "completed"
             job.report_json = report
-            if lease_token is not None: ImportWorker(self.db).assert_ownership(job, lease_token)
             self.db.commit()
         except Exception as exc:
             self.db.rollback()
+            if isinstance(exc, LeaseLost):
+                raise
             job.status = "failed"
             job.error_summary = str(exc)
             self.db.add(job)
