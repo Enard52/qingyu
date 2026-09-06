@@ -4,23 +4,26 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from .generic import GenericTreeParser
 from ..models import SourceAccount, ImportJob, Conversation, Message, MessageRevision, MessageObservation, Attachment
+from .worker import ImportWorker, LeaseLost
 
 class ImportService:
     def __init__(self, db: Session):
         self.db = db
 
-    def import_fixture(self, payload: dict[str, Any], archive_object_id, platform: str = "fixture", account_label: str = "default") -> ImportJob:
+    def import_fixture(self, payload: dict[str, Any], archive_object_id, platform: str = "fixture", account_label: str = "default", job: ImportJob | None = None, lease_token=None) -> ImportJob:
         account = self.db.scalar(select(SourceAccount).where(SourceAccount.platform == platform, SourceAccount.account_label == account_label))
         if account is None:
             account = SourceAccount(platform=platform, account_label=account_label, metadata_json={})
             self.db.add(account)
             self.db.flush()
-        job = ImportJob(source_account_id=account.id, archive_object_id=archive_object_id, parser_name=GenericTreeParser.name, parser_version=GenericTreeParser.version, status="running", report_json={})
-        self.db.add(job)
-        self.db.flush()
+        if job is None:
+            job = ImportJob(source_account_id=account.id, archive_object_id=archive_object_id, parser_name=GenericTreeParser.name, parser_version=GenericTreeParser.version, status="running", report_json={})
+            self.db.add(job); self.db.flush()
+            lease_token = job.lease_token
         report = {"unknown_fields": [], "orphan_nodes": [], "imported_conversations": 0, "imported_messages": 0}
         try:
             for parsed in GenericTreeParser().parse(payload):
+                if lease_token is not None: ImportWorker(self.db).assert_ownership(job, lease_token)
                 conversation = self.db.scalar(select(Conversation).where(Conversation.source_account_id == account.id, Conversation.external_conversation_id == parsed.external_id)) if parsed.external_id else None
                 if conversation is None:
                     conversation = Conversation(source_account_id=account.id, external_conversation_id=parsed.external_id, title=parsed.title, metadata_json={})
@@ -50,6 +53,7 @@ class ImportService:
             job.items_imported = report["imported_messages"]
             job.status = "completed"
             job.report_json = report
+            if lease_token is not None: ImportWorker(self.db).assert_ownership(job, lease_token)
             self.db.commit()
         except Exception as exc:
             self.db.rollback()
