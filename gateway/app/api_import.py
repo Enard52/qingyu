@@ -43,4 +43,5 @@ def create_import(file: UploadFile = File(...), source_platform: str = Form("cha
 def get_import_job(job_id: str, db: Session = Depends(get_db)) -> dict:
     job = db.get(ImportJob, job_id)
     if job is None: raise HTTPException(404, "Import Job not found")
-    return {"import_job_id": str(job.id), "status": job.status, "progress": job.checkpoint, "counts": {"discovered": job.discovered_count, "imported": job.imported_count, "skipped": job.skipped_count, "failed": job.failed_count}, "errors": job.error_summary, "report": job.report_json}
+    return {"import_job_id": str(job.id), "status": job.status, "result_code": job.result_code, "error_code": job.error_code, "progress": job.checkpoint, "counts": {"discovered": job.discovered_count, "imported": job.imported_count, "skipped": job.skipped_count, "failed": job.failed_count}, "errors": job.error_summary, "report": job.report_json}
+
