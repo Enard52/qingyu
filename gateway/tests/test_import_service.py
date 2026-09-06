@@ -20,7 +20,7 @@ def import_db():
 
 def test_import_service_persists_tree(import_db):
     db, archive_id = import_db
-    payload = {"conversations": [{"id": "c1", "title": "Fixture", "current_node": "n2", "mapping": {"n1": {"parent": None, "message": {"author": {"role": "user"}, "content": {"parts": ["hi"]}}}, "n2": {"parent": "n1", "message": {"author": {"role": "assistant"}, "content": {"parts": ["hello"]}}}}}]}
+    payload = {"schema_marker":"qingyu-fixture-v1", "conversations": [{"id": "c1", "title": "Fixture", "current_node": "n2", "mapping": {"n1": {"parent": None, "message": {"author": {"role": "user"}, "content": {"parts": ["hi"]}}}, "n2": {"parent": "n1", "message": {"author": {"role": "assistant"}, "content": {"parts": ["hello"]}}}}}]}
     job = ImportService(db).import_fixture(payload, archive_id)
     assert job.status == "running"
     assert db.query(Conversation).count() == 1

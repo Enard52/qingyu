@@ -16,6 +16,7 @@ class ImportService:
             account = SourceAccount(platform=platform, account_label=account_label, metadata_json={})
             self.db.add(account)
             self.db.flush()
+        created_job = job is None
         if job is None:
             job = ImportJob(source_account_id=account.id, archive_object_id=archive_object_id, parser_name=GenericTreeParser.name, parser_version=GenericTreeParser.version, status="running", report_json={})
             self.db.add(job); self.db.flush()
@@ -57,6 +58,8 @@ class ImportService:
         except Exception as exc:
             self.db.rollback()
             if isinstance(exc, LeaseLost):
+                raise
+            if created_job:
                 raise
             job.status = "failed"
             job.error_summary = str(exc)

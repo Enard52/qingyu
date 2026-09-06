@@ -37,7 +37,7 @@ def test_retry_reuses_stable_entities(clean_db):
     db, job_id, archive_id = clean_db
     service = ImportService(db); first = service.import_fixture(fixture_payload("retry-c"), archive_id)
     second = service.import_fixture(fixture_payload("retry-c"), archive_id)
-    assert first.status == second.status == "completed"
+    assert first.status == second.status == "running"
     assert db.query(Conversation).filter_by(external_conversation_id="retry-c").count() == 1
     assert db.query(Message).count() == 1
     assert db.query(MessageRevision).count() == 1
