@@ -2,24 +2,24 @@
 
 ## Scope and status
 
-This report covers Phase 3 P1, AUD-06 through AUD-16. Every item is `self_tested`;
-none is declared closed or independently verified. AUD-01 through AUD-05 remain
-the accepted baseline and pass the regression suite. AUD-17 and AUD-18 remain
-open and unchanged.
+This report covers Phase 3 P1, AUD-06 through AUD-16. The independent P1 re-audit
+closed AUD-06 through AUD-09 and AUD-12 through AUD-15. Its remaining findings,
+AUD-10, AUD-11 and AUD-16, are now `code_fixed / self_tested` and await final
+independent verification. AUD-17 and AUD-18 remain open and unchanged.
 
 | Audit | Status | Commit | Migration |
 |---|---|---|---|
-| AUD-06 | self_tested | `0f7c4b8` | none |
-| AUD-07 | self_tested | `d908912` | `0012_import_identity_constraints` |
-| AUD-08 | self_tested | `d908912` | none |
-| AUD-09 | self_tested | `c108de4` | none |
-| AUD-10 | self_tested | `04eff03` | none |
-| AUD-11 | self_tested | `0f7c4b8` | none |
-| AUD-12 | self_tested | `0f7c4b8` | none |
-| AUD-13 | self_tested | `d908912` | none |
-| AUD-14 | self_tested | `c108de4` | none |
-| AUD-15 | self_tested | `a6385ce` | none |
-| AUD-16 | self_tested | `a6385ce` | none |
+| AUD-06 | CLOSED | `0f7c4b8` | none |
+| AUD-07 | CLOSED | `d908912` | `0012_import_identity_constraints` |
+| AUD-08 | CLOSED | `d908912` | none |
+| AUD-09 | CLOSED | `c108de4` | none |
+| AUD-10 | code_fixed / self_tested | `0df8d88` | none |
+| AUD-11 | code_fixed / self_tested | `8f2015a` | none |
+| AUD-12 | CLOSED | `0f7c4b8` | none |
+| AUD-13 | CLOSED | `d908912` | none |
+| AUD-14 | CLOSED | `c108de4` | none |
+| AUD-15 | CLOSED | `a6385ce` | none |
+| AUD-16 | code_fixed / self_tested | `9c7e0c7` | none |
 
 ## AUD-06 — stale recovery stale-read race
 
@@ -178,6 +178,32 @@ and corrupted Archive. They assert explicit failed results and no conversation
 rows. Existing fencing tests cover stale-worker takeover and prohibit obsolete
 business writes or finalization.
 
+## P1 final-closure follow-up
+
+- AUD-10: fixture validation now covers every currently accessed contract field
+  at conversation, mapping-node, message, author and content levels, including
+  metadata mappings, children, attachments, model and timestamps. The complete
+  payload validates before `ImportService` starts its first conversation
+  transaction. A legal first conversation followed by invalid list/string
+  metadata produces zero Conversation, Message, Revision and Observation rows.
+  Targeted result: 11 passed. Commit: `0df8d88`.
+- AUD-16: `safe_log_exception` records only a controlled message, exception class,
+  safe code, operation and job/correlation ID. It never stores exception message,
+  args or traceback. API database failures return a stable code plus request ID.
+  Processor no longer formats caught exceptions. Real PostgreSQL marker tests
+  capture logs, stdout, stderr and response. Targeted result: 13 passed. Commit:
+  `9c7e0c7`.
+- AUD-11: recover and claim database failures are contained within one Runtime
+  iteration. Failed Sessions are rolled back and closed; the next poll creates a
+  new Session. Runtime uses bounded exponential backoff. Heartbeat exceptions are
+  caught inside the thread, safely logged and signalled through `AttemptHealth`;
+  Processor and conversation boundaries translate the signal to `LeaseLost`
+  without marking a possibly recoverable Job failed. Targeted result: 7 passed.
+  Commit: `8f2015a`.
+- Repository scan after the fixes found no `str(exc)`, `repr(exc)`,
+  `logger.exception`, `exc_info=True`, direct traceback printing, or direct
+  exception printing in application code.
+
 ## Database, migration and validation safety
 
 - Destructive tests require TEST_DATABASE_URL and verify using a real connection
@@ -187,7 +213,7 @@ business writes or finalization.
 - `qingyu_test` was upgraded to the new head. The long-term `qingyu` database was
   not upgraded and is checked read-only; deployment awaits the controlled
   migration procedure.
-- Full suite: 76 passed.
+- Full suite: 88 passed.
 - Two unsuppressed third-party deprecations originate in FastAPI/Starlette
   TestClient and AnyIO compatibility.
 - P0 regression coverage remains green: database guard, account identity,
