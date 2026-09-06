@@ -114,6 +114,7 @@ def test_manifest_is_content_level_without_source_fields(archive_env):
 
 
 def test_existing_object_digest_corruption_is_rejected(archive_env):
+    import json
     root, db = archive_env
     src = root / 'original.bin'; src.write_bytes(b'abc')
     service = ArchiveService(root, db); first = service.archive_file(src, 'original.bin', 'test')
@@ -121,3 +122,11 @@ def test_existing_object_digest_corruption_is_rejected(archive_env):
     with pytest.raises(Exception, match='archive_integrity_failure'):
         service.archive_file(src, 'original.bin', 'test')
     assert target.read_bytes() == b'xyz'
+    manifest = json.loads(first.manifest_path.read_text(encoding='utf-8'))
+    assert manifest['integrity_status'] == 'integrity_failure'
+    assert manifest['expected_sha256'] == first.sha256
+    assert manifest['integrity_error'].startswith('digest_mismatch:')
+    target.write_bytes(b'abc')
+    with pytest.raises(Exception, match='explicit reverify required'):
+        service.archive_file(src, 'original.bin', 'test')
+    assert json.loads(first.manifest_path.read_text(encoding='utf-8'))['integrity_status'] == 'integrity_failure'

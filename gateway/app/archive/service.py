@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -63,6 +64,7 @@ class ArchiveService:
                         existing_bad.integrity_status = "integrity_failure"
                         existing_bad.integrity_error = f"digest_mismatch:{actual}"
                         self.db.commit()
+                        self._write_manifest(existing_bad)
                     raise ArchiveIntegrityError(f"archive_integrity_failure: expected={sha} actual={actual}")
             else:
                 os.replace(staged, target)
@@ -71,7 +73,11 @@ class ArchiveService:
                     raise ArchiveIntegrityError("archive_integrity_failure: post_write_digest_mismatch")
             existing = self.db.scalar(select(ArchiveObject).where(ArchiveObject.sha256 == sha, ArchiveObject.size_bytes == size))
             if existing:
+                if existing.integrity_status != "verified":
+                    self._write_manifest(existing)
+                    raise ArchiveIntegrityError("archive_integrity_failure: explicit reverify required")
                 object_id = existing.id
+                record = existing
             else:
                 record = ArchiveObject(sha256=sha, size_bytes=size, relative_path=rel.as_posix(), media_type=media_type or mimetypes.guess_type(source.name)[0] or "application/octet-stream", integrity_status="verified", metadata_json={})
                 self.db.add(record)
@@ -79,9 +85,7 @@ class ArchiveService:
                 object_id = record.id
             self.db.add(ArchiveObservation(archive_object_id=object_id, original_filename=original_filename or source.name, source_platform=source_platform, source_path=str(source), logical_path=original_filename or source.name, metadata_json={}))
             self.db.commit()
-            manifest = {"manifest_version": 2, "object_id": str(object_id), "sha256": sha, "size_bytes": size, "relative_path": rel.as_posix(), "media_type": media_type or mimetypes.guess_type(source.name)[0] or "application/octet-stream", "integrity_status": "verified"}
-            manifest_path = self.manifests / f"{sha}.json"
-            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            manifest_path = self._write_manifest(record)
             return ArchiveResult(object_id, sha, size, rel.as_posix(), duplicate, manifest_path)
         finally:
             if staged.exists():
@@ -95,5 +99,22 @@ class ArchiveService:
                     path.unlink()
                     count += 1
         return count
+
+    def _write_manifest(self, record: ArchiveObject) -> Path:
+        manifest = {
+            "manifest_version": 2,
+            "object_id": str(record.id),
+            "sha256": record.sha256,
+            "expected_sha256": record.sha256,
+            "size_bytes": record.size_bytes,
+            "relative_path": record.relative_path,
+            "media_type": record.media_type,
+            "integrity_status": record.integrity_status,
+            "integrity_checked_at": datetime.now(timezone.utc).isoformat(),
+            "integrity_error": record.integrity_error,
+        }
+        path = self.manifests / f"{record.sha256}.json"
+        path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
 
 
