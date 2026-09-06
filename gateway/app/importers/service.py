@@ -6,7 +6,7 @@ from ..models import ArchiveObject, Conversation, ImportJob, Message, MessageObs
 from .generic import GenericTreeParser
 from .report import empty_report
 from .tree import TreeValidator
-from .worker import ImportWorker, LeaseLost
+from .worker import ImportWorker, LeaseLost, LeaseRequired
 from .revision import compute_revision_fingerprint, compute_text_hash
 
 class ImportService:
@@ -16,6 +16,8 @@ class ImportService:
     def import_fixture(self, payload: dict[str, Any], archive_object_id, platform="fixture", account_label="default", job: ImportJob | None = None, lease_token=None) -> ImportJob:
         created_job = job is None
         if job is not None:
+            if job.status == "running" and lease_token is None:
+                raise LeaseRequired("lease_required")
             account = self.db.get(SourceAccount, job.source_account_id)
             if account is None:
                 raise ValueError("invalid_source_account")
