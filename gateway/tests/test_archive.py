@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import create_engine, delete
 from sqlalchemy.orm import Session
-from app.models import ArchiveObject
+from app.models import ArchiveObject, ArchiveObservation
 from app.db import Base
 from app.archive.service import ArchiveService
 
@@ -12,8 +12,10 @@ DB_URL = "postgresql+psycopg://qingyu:PASSWORD@127.0.0.1:5432/qingyu"
 @pytest.fixture()
 def archive_env(tmp_path: Path):
     engine = create_engine(DB_URL)
-    Base.metadata.create_all(engine)
+    ArchiveObject.__table__.create(engine, checkfirst=True)
+    ArchiveObservation.__table__.create(engine, checkfirst=True)
     with Session(engine) as db:
+        db.execute(delete(ArchiveObservation))
         db.execute(delete(ArchiveObject))
         db.commit()
         yield tmp_path, db
@@ -81,4 +83,29 @@ def test_database_and_disk_manifest_match(archive_env):
     assert target.exists()
     assert record.sha256 == manifest["sha256"] == hashlib.sha256(target.read_bytes()).hexdigest()
     assert record.size_bytes == manifest["size_bytes"] == target.stat().st_size
-    assert record.source_platform == "chatgpt"
+    assert record.media_type == "application/json"
+
+def test_same_object_keeps_multiple_source_observations(archive_env):
+    root, db = archive_env
+    service = ArchiveService(root, db)
+    first = root / "first.txt"
+    second = root / "second.txt"
+    first.write_bytes(b"same")
+    second.write_bytes(b"same")
+    a = service.archive_file(first, "export-a.txt", "chatgpt")
+    b = service.archive_file(second, "export-b.txt", "telegram")
+    rows = db.query(ArchiveObservation).filter_by(archive_object_id=a.object_id).order_by(ArchiveObservation.original_filename).all()
+    assert a.object_id == b.object_id
+    assert [(r.original_filename, r.source_platform) for r in rows] == [("export-a.txt", "chatgpt"), ("export-b.txt", "telegram")]
+    assert len(list((root / "archive" / "objects").rglob(a.sha256))) == 1
+
+def test_manifest_is_content_level_without_source_fields(archive_env):
+    import json
+    root, db = archive_env
+    src = root / "x.txt"
+    src.write_bytes(b"manifest")
+    result = ArchiveService(root, db).archive_file(src, "name.txt", "manual")
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert "original_filename" not in manifest
+    assert "source_platform" not in manifest
+    assert manifest["sha256"] == result.sha256

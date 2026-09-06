@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-from ..models import ArchiveObject
+from ..models import ArchiveObject, ArchiveObservation
 
 SAFE_NAME = re.compile(r"^[^<>:\"/\\|?*\x00-\x1f]+$")
 
@@ -63,11 +63,13 @@ class ArchiveService:
             if existing:
                 object_id = existing.id
             else:
-                record = ArchiveObject(sha256=sha, size_bytes=size, relative_path=rel.as_posix(), original_filename=original_filename or source.name, media_type=media_type or mimetypes.guess_type(source.name)[0] or "application/octet-stream", source_platform=source_platform, integrity_status="verified", metadata_json={})
+                record = ArchiveObject(sha256=sha, size_bytes=size, relative_path=rel.as_posix(), media_type=media_type or mimetypes.guess_type(source.name)[0] or "application/octet-stream", integrity_status="verified", metadata_json={})
                 self.db.add(record)
                 self.db.commit()
                 object_id = record.id
-            manifest = {"object_id": str(object_id), "sha256": sha, "size_bytes": size, "relative_path": rel.as_posix(), "original_filename": original_filename or source.name, "media_type": media_type or mimetypes.guess_type(source.name)[0] or "application/octet-stream", "source_platform": source_platform, "integrity_status": "verified", "duplicate": duplicate}
+            self.db.add(ArchiveObservation(archive_object_id=object_id, original_filename=original_filename or source.name, source_platform=source_platform, source_path=str(source), logical_path=original_filename or source.name, metadata_json={}))
+            self.db.commit()
+            manifest = {"manifest_version": 2, "object_id": str(object_id), "sha256": sha, "size_bytes": size, "relative_path": rel.as_posix(), "media_type": media_type or mimetypes.guess_type(source.name)[0] or "application/octet-stream", "integrity_status": "verified"}
             manifest_path = self.manifests / f"{sha}.json"
             manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
             return ArchiveResult(object_id, sha, size, rel.as_posix(), duplicate, manifest_path)
