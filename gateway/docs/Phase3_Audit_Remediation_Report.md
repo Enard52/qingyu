@@ -35,6 +35,10 @@
 - AUD-15: `code_fixed / self_tested` — non-test startup rejects empty/public tokens and Bearer authentication uses `secrets.compare_digest`.
 - AUD-16: `code_fixed / self_tested` — SQL parameters are hidden, DB errors use stable redacted codes, and worker/API logging never stringifies sensitive exceptions or authorization values.
 
+## P1 end-to-end self-test
+
+`tests/test_p1_e2e.py` verifies authenticated POST, Raw Archive, pending Job, real runtime claim/heartbeat/process/finalize, parser prevalidation, persisted tree snapshot and provenance, report/counts, staging cleanup, GET Job, and retained archive bytes.
+
 ## AUD-01 verification
 
 - Test database: `qingyu_test`

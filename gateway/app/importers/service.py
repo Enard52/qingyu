@@ -75,7 +75,7 @@ class ImportService:
                 if lease_token is not None: ImportWorker(self.db).assert_ownership(job, lease_token)
                 self.db.commit(); self.db.refresh(job)
             report["items"] = {"conversations": sum(report["conversations"].values()), "messages": sum(report["messages"].values())}
-            counts = {"items_discovered": report["items"]["messages"], "items_imported": report["messages"]["new"]}
+            counts = {"items_discovered": report["items"]["messages"], "items_imported": report["messages"]["new"], "discovered_count": report["items"]["messages"], "imported_count": report["messages"]["new"], "skipped_count": report["messages"]["existing"], "failed_count": report["messages"]["failed"]}
         except Exception:
             self.db.rollback()
             raise
