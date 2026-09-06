@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from ..config import get_settings
 from ..db import engine
+from ..errors import safe_log_exception
 from .processor import ImportProcessor
 from .worker import ImportWorker, LeaseLost
 
@@ -45,7 +46,15 @@ class WorkerRuntime:
             except LeaseLost:
                 logger.info("import worker lost ownership", extra={"job_id": str(job.id)})
             except Exception as exc:
-                logger.error("import job processing failed", extra={"job_id": str(job.id), "error_type": type(exc).__name__})
+                safe_log_exception(
+                    logger,
+                    logging.ERROR,
+                    "import job processing failed",
+                    error_code="import_processing_failed",
+                    operation="process_job",
+                    exception=exc,
+                    job_id=job.id,
+                )
             finally:
                 heartbeat_stop.set(); heartbeat.join(timeout=self.heartbeat_interval + 1)
             return True

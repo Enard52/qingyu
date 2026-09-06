@@ -3,7 +3,8 @@ from fastapi import Depends, FastAPI
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 import logging
-from .errors import safe_database_error
+import uuid
+from .errors import safe_database_error, safe_log_exception
 from .auth import require_token
 from .config import get_settings
 from .logging_config import configure_logging
@@ -19,8 +20,17 @@ app.include_router(import_router)
 @app.exception_handler(SQLAlchemyError)
 async def database_error_handler(request, exc):
     error_code = safe_database_error(exc)
-    logging.getLogger(__name__).error("database operation failed", extra={"error_code": error_code})
-    return JSONResponse(status_code=500, content={"detail": {"code": error_code}})
+    request_id = uuid.uuid4().hex
+    safe_log_exception(
+        logging.getLogger(__name__),
+        logging.ERROR,
+        "database operation failed",
+        error_code=error_code,
+        operation="api_request",
+        exception=exc,
+        correlation_id=request_id,
+    )
+    return JSONResponse(status_code=500, content={"detail": {"code": error_code, "request_id": request_id}})
 
 @app.get("/health")
 def health() -> dict[str, str]:

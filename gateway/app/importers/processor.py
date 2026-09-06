@@ -52,8 +52,8 @@ class ImportProcessor:
                 token=token,
                 archive_object_id=exc.archive_object_id,
                 archive_root=self.root,
-                integrity_error=str(exc),
-                report={'errors':[{'type':'archive_integrity_failure','detail':str(exc),'severity':'error'}]},
+                integrity_error='archive_integrity_failure',
+                report={'errors':[{'type':'archive_integrity_failure','detail':'archive bytes failed integrity verification','severity':'error'}]},
             )
             raise
         except ParserValidationError as exc:
@@ -64,7 +64,7 @@ class ImportProcessor:
         except UnsupportedStructure as exc:
             keep=True
             self.db.rollback()
-            if not worker.mark_failed(job_id, token, str(exc), {'unknown':[{'type':str(exc),'detail':'no registered parser matched','severity':'error'}]}, str(exc)): raise LeaseLost('ownership_lost')
+            if not worker.mark_failed(job_id, token, exc.code, {'unknown':[{'type':exc.code,'detail':'no registered parser matched','severity':'error'}]}, exc.code): raise LeaseLost('ownership_lost')
             raise
         except Exception as exc:
             keep=True
@@ -74,7 +74,10 @@ class ImportProcessor:
         finally:
             if not keep: shutil.rmtree(attempt, ignore_errors=True)
 
-class UnsupportedStructure(ValueError): pass
+class UnsupportedStructure(ValueError):
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
 
 class ArchiveConsumptionIntegrityError(IOError):
     def __init__(self, *, archive_object_id, expected_sha256: str, actual_sha256: str, expected_size: int, actual_size: int):

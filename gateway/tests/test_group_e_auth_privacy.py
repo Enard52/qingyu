@@ -8,7 +8,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.config import Settings
 from app.db import engine
 from app.main import app
-from app.errors import safe_database_error
+from app.errors import safe_database_error, safe_log_exception
 
 
 @pytest.mark.parametrize('token',['','changeme','example','change-this-local-token'])
@@ -25,14 +25,30 @@ def test_sqlalchemy_hides_secret_parameters():
     assert marker not in safe_database_error(caught.value)
 
 
-def test_api_database_error_and_auth_logs_do_not_leak_secrets(caplog):
-    marker='SUPER_SECRET_CHAT_CONTENT_123'; token='SUPER_SECRET_TOKEN'
+def test_api_database_error_and_auth_logs_do_not_leak_secrets(caplog, capsys):
+    marker='SUPER_SECRET_CHAT_CONTENT_123'; token='SUPER_SECRET_TOKEN_456'
     if not any(getattr(route,'path',None)=='/_test_database_error' for route in app.routes):
         @app.get('/_test_database_error')
-        def fail(): raise SQLAlchemyError(marker)
+        def fail():
+            with engine.connect() as connection:
+                connection.execute(text('select cast(:value as integer)'), {'value': marker})
     caplog.set_level(logging.INFO)
     response=TestClient(app).get('/_test_database_error')
-    assert response.status_code==500 and response.json()=={'detail':{'code':'database_error'}}
+    assert response.status_code==500
+    assert response.json()['detail']['code']=='database_operation_failed'
+    assert response.json()['detail']['request_id']
     TestClient(app).get('/api/v1/protected-ping',headers={'Authorization':f'Bearer {token}'})
-    output=caplog.text
+    captured=capsys.readouterr()
+    output=caplog.text+captured.out+captured.err+response.text
     assert marker not in output and token not in output
+
+
+def test_safe_logger_never_formats_exception_message(caplog, capsys):
+    marker='SUPER_SECRET_CHAT_CONTENT_123'
+    caplog.set_level(logging.ERROR)
+    safe_log_exception(logging.getLogger('privacy-test'),logging.ERROR,'safe failure',error_code='database_operation_failed',operation='test',exception=SQLAlchemyError(marker),job_id='safe-job')
+    captured=capsys.readouterr()
+    output=caplog.text+captured.out+captured.err
+    assert marker not in output
+    record=caplog.records[-1]
+    assert record.error_type=='SQLAlchemyError' and record.error_code=='database_operation_failed'
