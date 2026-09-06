@@ -35,6 +35,7 @@ class ArchiveObservation(Base):
 
 class SourceAccount(Base):
     __tablename__ = "source_accounts"
+    __table_args__ = (UniqueConstraint("platform", "account_label", name="uq_source_accounts_platform_label"),)
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     platform: Mapped[str] = mapped_column(String(100), nullable=False)
     account_label: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -89,6 +90,7 @@ class Conversation(Base):
 
 class Message(Base):
     __tablename__ = "messages"
+    __table_args__ = (UniqueConstraint("conversation_id", "external_message_id", name="uq_messages_conversation_external"),)
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     conversation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("conversations.id"), nullable=False)
     external_message_id: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -97,7 +99,7 @@ class Message(Base):
 
 class MessageRevision(Base):
     __tablename__ = "message_revisions"
-    __table_args__ = (UniqueConstraint("message_id", "revision_no", name="uq_message_revisions_no"),)
+    __table_args__ = (UniqueConstraint("message_id", "revision_no", name="uq_message_revisions_no"), UniqueConstraint("message_id", "revision_fingerprint", name="uq_message_revisions_fingerprint"))
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     message_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("messages.id"), nullable=False)
     revision_no: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -115,6 +117,7 @@ class MessageRevision(Base):
 
 class MessageObservation(Base):
     __tablename__ = "message_observations"
+    __table_args__ = (UniqueConstraint("import_job_id", "message_revision_id", "external_node_id", name="uq_message_observations_job_revision_node"),)
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     import_job_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("import_jobs.id"), nullable=False)
     message_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("messages.id"), nullable=False)

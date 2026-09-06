@@ -33,7 +33,8 @@ def create_import(file: UploadFile = File(...), source_platform: str = Form("cha
             db.add(account); db.flush()
         job = ImportJob(source_account_id=account.id, archive_object_id=archived.object_id, parser_name=GenericTreeParser.name, parser_version=GenericTreeParser.version, status="pending", report_json={})
         db.add(job); db.flush()
-        db.query(ArchiveObservation).filter(ArchiveObservation.archive_object_id == archived.object_id, ArchiveObservation.import_job_id.is_(None)).update({"import_job_id": job.id}, synchronize_session=False)
+        observation = db.get(ArchiveObservation, archived.observation_id)
+        observation.import_job_id = job.id
         db.commit()
         return {"import_job_id": str(job.id)}
     finally:

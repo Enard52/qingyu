@@ -15,6 +15,12 @@
 - AUD-11: `code_fixed / self_tested` — `python -m app.importers.worker_runtime` provides recovery, claim, heartbeat, processing, finalization, polling, and graceful shutdown.
 - AUD-12: `code_fixed / self_tested` — claim uses `LIMIT 1`; file I/O uses lock-free ownership checks and business writes retain short fenced transactions.
 
+## P1 Group B
+
+- AUD-07: `code_fixed / self_tested` — stable account/message/revision/observation identities are enforced by migration `0012_import_identity_constraints`; account-level locking serializes competing inserts.
+- AUD-08: `code_fixed / self_tested` — every persisted tree query requires `conversation_id` and `import_job_id`, with explicit message join conditions.
+- AUD-13: `code_fixed / self_tested` — an archive operation returns its exact observation ID; pointers include archive, ZIP member, array index, and escaped mapping key.
+
 ## AUD-01 verification
 
 - Test database: `qingyu_test`

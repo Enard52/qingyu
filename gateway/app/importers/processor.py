@@ -35,7 +35,8 @@ class ImportProcessor:
             if not candidates: raise UnsupportedStructure('unsupported_structure')
             payload=json.loads(candidates[0].read_text(encoding='utf-8')); detection,_=ParserRegistry().detect(payload)
             if detection != 'matched': raise UnsupportedStructure(detection)
-            outcome=ImportService(self.db).import_fixture(payload, job.archive_object_id, job=job, lease_token=token)
+            source_member = candidates[0].relative_to(extract_root).as_posix()
+            outcome=ImportService(self.db).import_fixture(payload, job.archive_object_id, job=job, lease_token=token, source_member=source_member)
             result=dict(outcome.report); result.update({'scan':scan,'unknown':[{'type':'unknown_file','detail':x,'severity':'info','raw_pointer':str(x)} for x in unknown]}); result['imported_messages']=result.get('messages',{}).get('new',0); result['imported_conversations']=result.get('conversations',{}).get('new',0)
             if not worker.mark_completed(job_id, token, result, 'imported', outcome.counts): raise LeaseLost('ownership_lost')
             return result

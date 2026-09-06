@@ -20,7 +20,7 @@ class ImportService:
     """Persist fixture conversations in short, ownership-fenced transactions."""
     def __init__(self, db: Session): self.db = db
 
-    def import_fixture(self, payload: dict[str, Any], archive_object_id, platform="fixture", account_label="default", job: ImportJob | None = None, lease_token=None) -> ImportOutcome:
+    def import_fixture(self, payload: dict[str, Any], archive_object_id, platform="fixture", account_label="default", job: ImportJob | None = None, lease_token=None, source_member="fixture.json") -> ImportOutcome:
         if job is None or lease_token is None:
             raise LeaseRequired("lease_required")
         account = self.db.get(SourceAccount, job.source_account_id)
@@ -37,11 +37,12 @@ class ImportService:
         try:
             for conv_index, parsed in enumerate(GenericTreeParser().parse(payload)):
                 if lease_token is not None: ImportWorker(self.db).assert_ownership(job, lease_token)
+                self.db.scalar(select(SourceAccount.id).where(SourceAccount.id == account.id).with_for_update())
                 external_id = parsed.external_id
                 synthetic = not bool(external_id)
                 if synthetic:
-                    external_id = f"synthetic:{archive.sha256}:conversation:{conv_index}"
-                    report["unknown"].append({"type": "missing_external_conversation_id", "severity": "warning", "conversation_identity": external_id, "detail": "generated deterministic synthetic identity", "raw_pointer": f"/conversations/{conv_index}"})
+                    external_id = f"synthetic:{archive.sha256}:{source_member}:conversation:{conv_index}"
+                    report["unknown"].append({"type": "missing_external_conversation_id", "severity": "warning", "conversation_identity": external_id, "detail": "generated deterministic synthetic identity", "archive_object_id": str(archive.id), "zip_member": source_member, "raw_pointer": f"/conversations/{conv_index}"})
                 conversation = self.db.scalar(select(Conversation).where(Conversation.source_account_id == account.id, Conversation.external_conversation_id == external_id))
                 if conversation is None:
                     conversation = Conversation(source_account_id=account.id, external_conversation_id=external_id, title=parsed.title, metadata_json={"identity_kind": "synthetic" if synthetic else "external"}); self.db.add(conversation); self.db.flush(); report["conversations"]["new"] += 1
@@ -59,14 +60,16 @@ class ImportService:
                     revision = self.db.scalar(select(MessageRevision).where(MessageRevision.message_id == message.id, MessageRevision.revision_fingerprint == fingerprint))
                     if revision is None:
                         latest = self.db.scalar(select(MessageRevision).where(MessageRevision.message_id == message.id).order_by(MessageRevision.revision_no.desc()))
-                        revision = MessageRevision(message_id=message.id, revision_no=(latest.revision_no + 1 if latest else 1), role=item.role, content_text=item.content_text, content_json=item.content_json, model=item.model, raw_timestamp=item.raw_timestamp, content_hash=digest, revision_fingerprint=fingerprint, archive_object_id=archive_object_id, raw_json_pointer=f"/conversations/{parsed.external_id}/mapping/{item.node_id}"); self.db.add(revision); self.db.flush(); report["revisions"]["new"] += 1
+                        pointer = f"/conversations/{conv_index}/mapping/{json_pointer_escape(item.node_id)}"
+                        revision = MessageRevision(message_id=message.id, revision_no=(latest.revision_no + 1 if latest else 1), role=item.role, content_text=item.content_text, content_json=item.content_json, model=item.model, raw_timestamp=item.raw_timestamp, content_hash=digest, revision_fingerprint=fingerprint, archive_object_id=archive_object_id, raw_json_pointer=pointer); self.db.add(revision); self.db.flush(); report["revisions"]["new"] += 1
                     else: report["revisions"]["existing"] += 1
                     resolved[item.node_id], revisions[item.node_id] = message, revision
                 report["tree_anomalies"].extend(TreeValidator().validate(parsed.messages))
                 for order, item in enumerate(parsed.messages):
                     if self.db.scalar(select(MessageObservation).where(MessageObservation.import_job_id == job.id, MessageObservation.external_node_id == item.node_id, MessageObservation.message_revision_id == revisions[item.node_id].id)): continue
                     parent = resolved.get(item.parent_node_id)
-                    self.db.add(MessageObservation(import_job_id=job.id, message_id=resolved[item.node_id].id, message_revision_id=revisions[item.node_id].id, external_node_id=item.node_id, external_parent_node_id=item.parent_node_id, parent_message_id=parent.id if parent else None, branch_key=item.branch_key, is_current_path=item.node_id == parsed.current_node_id, observation_order=order, raw_mapping_pointer=f"/mapping/{item.node_id}", metadata_json={}))
+                    pointer = f"/conversations/{conv_index}/mapping/{json_pointer_escape(item.node_id)}"
+                    self.db.add(MessageObservation(import_job_id=job.id, message_id=resolved[item.node_id].id, message_revision_id=revisions[item.node_id].id, external_node_id=item.node_id, external_parent_node_id=item.parent_node_id, parent_message_id=parent.id if parent else None, branch_key=item.branch_key, is_current_path=item.node_id == parsed.current_node_id, observation_order=order, raw_mapping_pointer=pointer, metadata_json={"archive_object_id": str(archive.id), "zip_member": source_member}))
                 if lease_token is not None: ImportWorker(self.db).assert_ownership(job, lease_token)
                 self.db.commit(); self.db.refresh(job)
             report["items"] = {"conversations": sum(report["conversations"].values()), "messages": sum(report["messages"].values())}
@@ -75,3 +78,7 @@ class ImportService:
             self.db.rollback()
             raise
         return ImportOutcome(report=report, counts=counts)
+
+
+def json_pointer_escape(value: str) -> str:
+    return str(value).replace("~", "~0").replace("/", "~1")

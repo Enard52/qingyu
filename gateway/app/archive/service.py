@@ -23,6 +23,7 @@ class ArchiveResult:
     relative_path: str
     duplicate: bool
     manifest_path: Path
+    observation_id: uuid.UUID
 
 class ArchiveIntegrityError(IOError): pass
 class ArchiveService:
@@ -85,10 +86,11 @@ class ArchiveService:
                 self.db.add(record)
                 self.db.commit()
                 object_id = record.id
-            self.db.add(ArchiveObservation(archive_object_id=object_id, original_filename=original_filename or source.name, source_platform=source_platform, source_path=str(source), logical_path=original_filename or source.name, metadata_json={}))
+            observation = ArchiveObservation(archive_object_id=object_id, original_filename=original_filename or source.name, source_platform=source_platform, source_path=str(source), logical_path=original_filename or source.name, metadata_json={})
+            self.db.add(observation)
             self.db.commit()
             manifest_path = self._write_manifest(record)
-            return ArchiveResult(object_id, sha, size, rel.as_posix(), duplicate, manifest_path)
+            return ArchiveResult(object_id, sha, size, rel.as_posix(), duplicate, manifest_path, observation.id)
         finally:
             if staged.exists():
                 staged.unlink()
