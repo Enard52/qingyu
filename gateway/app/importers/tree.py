@@ -7,7 +7,7 @@ class TreeValidator:
             if n.node_id in seen: anomalies.append({"type":"duplicate_node","node_id":n.node_id})
             seen.add(n.node_id)
             if n.parent_node_id == n.node_id: anomalies.append({"type":"self_parent","node_id":n.node_id})
-            if n.parent_node_id and n.parent_node_id not in mapping: anomalies.append({"type":"missing_parent","node_id":n.node_id,"parent":n.parent_node_id})
+            if n.parent_node_id and n.parent_node_id not in mapping: anomalies.append({"type":"missing_parent","node_id":n.node_id,"parent":n.parent_node_id}); anomalies.append({"type":"orphan","node_id":n.node_id,"parent":n.parent_node_id})
         for n in nodes:
             cur=n.node_id; path=set()
             while cur and cur in mapping:
@@ -22,3 +22,4 @@ class TreeQuery:
         out=[]; cur=leaf_id; seen=set()
         while cur and cur in self.nodes and cur not in seen: seen.add(cur); out.append(self.nodes[cur]); cur=self.nodes[cur].parent_node_id
         return list(reversed(out))
+

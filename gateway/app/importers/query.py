@@ -11,3 +11,11 @@ class ImportedTreeQuery:
         rows={r.message_id:r for r in self.db.scalars(select(MessageObservation))}; out=[]; cur=leaf_message_id; seen=set()
         while cur in rows and cur not in seen: seen.add(cur); out.append(rows[cur]); cur=rows[cur].parent_message_id
         return list(reversed(out))
+
+    def get_branch(self, conversation_id, branch_key):
+        stmt = select(MessageObservation).join(Message).where(Message.conversation_id == conversation_id, MessageObservation.branch_key == branch_key).order_by(MessageObservation.observation_order)
+        return list(self.db.scalars(stmt))
+
+    def get_current_path(self, conversation_id):
+        rows = list(self.db.scalars(select(MessageObservation).join(Message).where(Message.conversation_id == conversation_id, MessageObservation.is_current_path.is_(True)).order_by(MessageObservation.observation_order)))
+        return rows
