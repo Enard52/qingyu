@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import create_engine, delete
 from sqlalchemy.orm import Session
-from app.models import ArchiveObject, ArchiveObservation
+from app.models import ArchiveObject, ArchiveObservation, ImportJob, MessageObservation, MessageRevision, Message, Conversation, SourceAccount
 from app.db import Base
 from app.archive.service import ArchiveService
 
@@ -15,8 +15,8 @@ def archive_env(tmp_path: Path):
     ArchiveObject.__table__.create(engine, checkfirst=True)
     ArchiveObservation.__table__.create(engine, checkfirst=True)
     with Session(engine) as db:
-        db.execute(delete(ArchiveObservation))
-        db.execute(delete(ArchiveObject))
+        for model in (MessageObservation, MessageRevision, Message, Conversation, ImportJob, ArchiveObservation, SourceAccount, ArchiveObject):
+            db.execute(delete(model))
         db.commit()
         yield tmp_path, db
     engine.dispose()

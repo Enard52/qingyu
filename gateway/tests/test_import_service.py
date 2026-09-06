@@ -4,13 +4,13 @@ import pytest
 from sqlalchemy import delete
 from sqlalchemy.orm import Session
 from app.db import engine
-from app.models import ArchiveObject, SourceAccount, ImportJob, Conversation, Message, MessageRevision, MessageObservation
+from app.models import ArchiveObject, SourceAccount, ImportJob, Conversation, Message, MessageRevision, MessageObservation, Attachment
 from app.importers.service import ImportService
 
 @pytest.fixture()
 def import_db():
     with Session(engine) as db:
-        for model in (MessageObservation, MessageRevision, Message, Conversation, ImportJob, SourceAccount, ArchiveObject):
+        for model in (Attachment, MessageObservation, MessageRevision, Message, Conversation, ImportJob, SourceAccount, ArchiveObject):
             db.execute(delete(model))
         archive = ArchiveObject(sha256=uuid.uuid4().hex * 2, size_bytes=1, relative_path="archive/objects/test", media_type="application/json", integrity_status="verified", metadata_json={})
         db.add(archive)
