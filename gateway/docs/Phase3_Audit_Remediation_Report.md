@@ -9,6 +9,12 @@
 | AUD-05 | code_fixed / self_tested | `aa969e1`, `6280a11`, `9e5cada`, `d51a702` | archive corruption, processor consumption, manifest consistency tests | Attempt-local verified copy; manifest rendered atomically from committed ArchiveObject state; explicit reverify required |
 | AUD-06–AUD-18 | open | — | — | Outside current P0 closure scope |
 
+## P1 Group A
+
+- AUD-06: `code_fixed / self_tested` — stale recovery uses an observed token/expiry conditional update.
+- AUD-11: `code_fixed / self_tested` — `python -m app.importers.worker_runtime` provides recovery, claim, heartbeat, processing, finalization, polling, and graceful shutdown.
+- AUD-12: `code_fixed / self_tested` — claim uses `LIMIT 1`; file I/O uses lock-free ownership checks and business writes retain short fenced transactions.
+
 ## AUD-01 verification
 
 - Test database: `qingyu_test`

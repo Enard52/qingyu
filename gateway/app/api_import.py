@@ -16,8 +16,8 @@ router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_token)])
 
 @router.post("/import/chatgpt", status_code=status.HTTP_202_ACCEPTED)
 def create_import(file: UploadFile = File(...), source_platform: str = Form("chatgpt"), db: Session = Depends(get_db)) -> dict:
-    if not (file.filename or "").lower().endswith((".zip", ".json")):
-        raise HTTPException(415, "仅支持 ZIP/JSON 导入")
+    if not (file.filename or "").lower().endswith(".zip"):
+        raise HTTPException(415, "仅支持 ZIP 导入")
     root = Path(get_settings().archive_root)
     root.joinpath("staging").mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(prefix="import-upload-", dir=root / "staging")

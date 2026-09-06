@@ -1,4 +1,4 @@
-import hashlib, json, shutil
+import hashlib, json, shutil, zipfile
 from pathlib import Path
 from .zip_staging import safe_extract, ZipLimits
 from .service import ImportService
@@ -10,14 +10,13 @@ class ImportProcessor:
     def __init__(self, db, archive_root: Path, limits: ZipLimits = ZipLimits()): self.db, self.root, self.limits = db, archive_root, limits
     def process(self, job, token) -> dict:
         job_id = job.id
-        worker=ImportWorker(self.db); worker.assert_ownership(job, token)
+        worker=ImportWorker(self.db); worker.check_ownership(job, token)
         obj=self.db.get(ArchiveObject, job.archive_object_id)
         if obj is None: raise ValueError('archive_object_missing')
         if obj.integrity_status != 'verified':
             raise ValueError('archive_integrity_failure')
         source=self.root/obj.relative_path; attempt=Path(worker.attempt_staging_path(self.root, job)); attempt.mkdir(parents=True, exist_ok=True); keep=False
         try:
-            if source.suffix.lower() != '.zip' and obj.media_type != 'application/zip': raise UnsupportedStructure('unsupported_structure')
             verified_source = attempt / '_verified_input.zip'
             actual_size, actual_sha = copy_and_verify_archive(source, verified_source)
             if actual_size != obj.size_bytes or actual_sha != obj.sha256:
@@ -28,6 +27,7 @@ class ImportProcessor:
                     expected_size=obj.size_bytes,
                     actual_size=actual_size,
                 )
+            if not zipfile.is_zipfile(verified_source): raise UnsupportedStructure('unsupported_structure')
             extract_root = attempt / 'extracted'
             scan=safe_extract(verified_source, extract_root, self.limits)
             files=list(extract_root.rglob('*')); candidates=[p for p in files if p.is_file() and p.suffix.lower()=='.json' and p.name in {'fixture.json','conversations.json'}]
