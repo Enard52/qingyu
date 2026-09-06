@@ -49,6 +49,8 @@ class ImportJob(Base):
     parser_name: Mapped[str] = mapped_column(String(100), nullable=False)
     parser_version: Mapped[str] = mapped_column(String(50), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    result_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     discovered_count: Mapped[int] = mapped_column(Integer, default=0)

@@ -25,10 +25,10 @@ class ImportProcessor:
                 detection, parser = ParserRegistry().detect(payload)
                 if detection != "matched": raise UnsupportedStructure(detection)
                 report = ImportService(self.db).import_fixture(payload, job.archive_object_id, job=job, lease_token=token)
-                result = dict(report.report_json); result.update({"scan": scan, "unknown": {"unknown_file": unknown}}); job.report_json = result; self.db.commit(); return result
+                result = dict(report.report_json); result.update({"scan": scan, "unknown": [{"type":"unknown_file","detail":x,"severity":"info"} for x in unknown]}); job.report_json = result; job.result_code = "imported"; self.db.commit(); return result
             raise UnsupportedStructure("unsupported_structure")
         except UnsupportedStructure:
-            keep = True; worker.mark_failed(job, token, "unsupported_structure", {"unknown": {"unsupported_structure": 1}}); raise
+            keep = True; worker.mark_failed(job, token, "unsupported_structure", {"unknown": [{"type":"unsupported_structure","detail":"no registered parser matched","severity":"error"}]}); job.result_code = "unsupported_structure"; self.db.commit(); raise
         finally:
             if not keep: shutil.rmtree(attempt, ignore_errors=True)
 
