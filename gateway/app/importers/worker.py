@@ -18,21 +18,24 @@ class ImportWorker:
         if job is None: return None
         now = datetime.now(timezone.utc); job.status = "running"; job.started_at = job.started_at or now; job.first_started_at = job.first_started_at or now; job.last_attempt_started_at = now; job.attempt_count += 1; job.last_heartbeat_at = now; job.lease_expires_at = now + timedelta(seconds=lease_duration); job.lease_token = uuid.uuid4(); self.db.commit(); return job
     def _owned(self, job, token, values: dict) -> bool:
-        values = {k: (func.now() if k in {"last_heartbeat_at", "finished_at"} else v) for k, v in values.items()}
-        result = self.db.execute(update(ImportJob).where(ImportJob.id == job.id, ImportJob.status == "running", ImportJob.lease_token.is_not(None), ImportJob.lease_token == token, ImportJob.lease_expires_at.is_not(None), ImportJob.lease_expires_at > func.now()).values(**values)); self.db.commit(); return result.rowcount == 1
+        values = {k: (database_wall_clock() if k in {"last_heartbeat_at", "finished_at"} else v) for k, v in values.items()}
+        result = self.db.execute(update(ImportJob).where(ownership_predicate(job.id, token)).values(**values)); self.db.commit(); return result.rowcount == 1
 
     def assert_ownership(self, job, token) -> None:
         if token is None: raise LeaseRequired("lease_required")
-        current = self.db.scalar(select(ImportJob).where(ImportJob.id == job.id, ImportJob.status == "running", ImportJob.lease_token.is_not(None), ImportJob.lease_token == token, ImportJob.lease_expires_at.is_not(None), ImportJob.lease_expires_at > func.now()).with_for_update())
+        current = self.db.scalar(select(ImportJob).where(ownership_predicate(job.id, token)).with_for_update())
         if current is None: raise LeaseLost("ownership_lost")
 
     def attempt_staging_path(self, root, job) -> str:
         self.assert_ownership(job, job.lease_token)
         return str(root / "staging" / str(job.id) / str(job.attempt_count) / str(job.lease_token))
     def heartbeat(self, job, token, lease_duration: int = 300) -> bool:
-        now = datetime.now(timezone.utc); return self._owned(job, token, {"last_heartbeat_at": now, "lease_expires_at": now + timedelta(seconds=lease_duration)})
+        return self._owned(job, token, {"last_heartbeat_at": database_wall_clock(), "lease_expires_at": database_wall_clock() + timedelta(seconds=lease_duration)})
     def update_progress(self, job, token, checkpoint: dict) -> bool: return self._owned(job, token, {"checkpoint": checkpoint})
-    def mark_completed(self, job, token, report: dict | None = None, result_code: str = "imported") -> bool: return self._owned(job, token, {"status": "completed", "finished_at": datetime.now(timezone.utc), "report_json": report or {}, "result_code": result_code, "lease_token": None, "lease_expires_at": None})
+    def mark_completed(self, job, token, report: dict | None = None, result_code: str = "imported", counts: dict | None = None) -> bool:
+        values = {"status": "completed", "finished_at": database_wall_clock(), "report_json": report or {}, "result_code": result_code, "lease_token": None, "lease_expires_at": None}
+        values.update(counts or {})
+        return self._owned(job, token, values)
     def mark_failed(self, job, token, error: str, report: dict | None = None, result_code: str | None = None) -> bool: return self._owned(job, token, {"status": "failed", "finished_at": datetime.now(timezone.utc), "error_summary": error, "report_json": report or {}, "error_code": error, "result_code": result_code or "failed", "lease_token": None, "lease_expires_at": None})
 
 class LeaseLost(RuntimeError):
@@ -40,3 +43,18 @@ class LeaseLost(RuntimeError):
 
 class LeaseRequired(RuntimeError):
     pass
+
+
+def database_wall_clock():
+    return func.clock_timestamp()
+
+
+def ownership_predicate(job_id, token):
+    return (
+        (ImportJob.id == job_id)
+        & (ImportJob.status == "running")
+        & ImportJob.lease_token.is_not(None)
+        & (ImportJob.lease_token == token)
+        & ImportJob.lease_expires_at.is_not(None)
+        & (ImportJob.lease_expires_at > database_wall_clock())
+    )

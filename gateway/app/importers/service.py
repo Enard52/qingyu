@@ -1,4 +1,5 @@
 import hashlib
+from dataclasses import dataclass
 from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -9,29 +10,26 @@ from .tree import TreeValidator
 from .worker import ImportWorker, LeaseLost, LeaseRequired
 from .revision import compute_revision_fingerprint, compute_text_hash
 
+
+@dataclass(frozen=True)
+class ImportOutcome:
+    report: dict
+    counts: dict
+
 class ImportService:
     """Persist fixture conversations in short, ownership-fenced transactions."""
     def __init__(self, db: Session): self.db = db
 
-    def import_fixture(self, payload: dict[str, Any], archive_object_id, platform="fixture", account_label="default", job: ImportJob | None = None, lease_token=None) -> ImportJob:
-        created_job = job is None
-        if job is not None:
-            if job.status == "running" and lease_token is None:
-                raise LeaseRequired("lease_required")
-            account = self.db.get(SourceAccount, job.source_account_id)
-            if account is None:
-                raise ValueError("invalid_source_account")
-            archive = self.db.get(ArchiveObject, job.archive_object_id)
-            if archive is None:
-                raise ValueError("archive_object_missing")
-            archive_object_id = archive.id
-        else:
-            account = self.db.scalar(select(SourceAccount).where(SourceAccount.platform == platform, SourceAccount.account_label == account_label))
-            if account is None:
-                account = SourceAccount(platform=platform, account_label=account_label, metadata_json={}); self.db.add(account); self.db.flush()
-        if job is None:
-            job = ImportJob(source_account_id=account.id, archive_object_id=archive_object_id, parser_name=GenericTreeParser.name, parser_version=GenericTreeParser.version, status="running", report_json={})
-            self.db.add(job); self.db.flush(); lease_token = job.lease_token
+    def import_fixture(self, payload: dict[str, Any], archive_object_id, platform="fixture", account_label="default", job: ImportJob | None = None, lease_token=None) -> ImportOutcome:
+        if job is None or lease_token is None:
+            raise LeaseRequired("lease_required")
+        account = self.db.get(SourceAccount, job.source_account_id)
+        if account is None:
+            raise ValueError("invalid_source_account")
+        archive = self.db.get(ArchiveObject, job.archive_object_id)
+        if archive is None:
+            raise ValueError("archive_object_missing")
+        archive_object_id = archive.id
         archive = self.db.get(ArchiveObject, archive_object_id)
         if archive is None:
             raise ValueError("archive_object_missing")
@@ -72,8 +70,8 @@ class ImportService:
                 if lease_token is not None: ImportWorker(self.db).assert_ownership(job, lease_token)
                 self.db.commit(); self.db.refresh(job)
             report["items"] = {"conversations": sum(report["conversations"].values()), "messages": sum(report["messages"].values())}
-            job.report_json = report; job.items_discovered = report["items"]["messages"]; job.items_imported = report["messages"]["new"]; self.db.commit()
+            counts = {"items_discovered": report["items"]["messages"], "items_imported": report["messages"]["new"]}
         except Exception:
             self.db.rollback()
             raise
-        return job
+        return ImportOutcome(report=report, counts=counts)
