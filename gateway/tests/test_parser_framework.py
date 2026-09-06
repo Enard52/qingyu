@@ -1,7 +1,7 @@
 from app.importers.generic import GenericTreeParser
 
 def test_generic_fixture_parser_preserves_tree_and_unknown_content() -> None:
-    payload = {"conversations": [{"id": "c1", "title": "Fixture", "current_node": "n2", "mapping": {
+    payload = {"schema_marker":"qingyu-fixture-v1", "conversations": [{"id": "c1", "title": "Fixture", "current_node": "n2", "mapping": {
         "n1": {"message": {"author": {"role": "user"}, "content": {"parts": ["你好"]}}, "parent": None},
         "n2": {"message": {"author": {"role": "assistant"}, "content": {"parts": ["你好！"]}}, "parent": "n1"},
         "n3": {"message": {"author": {"role": "tool"}, "content": {"weird": True}}, "parent": "n1"},

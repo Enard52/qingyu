@@ -9,7 +9,7 @@ from app.importers.service import ImportService
 from app.importers.worker import ImportWorker, LeaseLost
 
 def fixture_payload(cid="c2"):
-    return {"conversations": [{"id": cid, "title": "retry", "current_node": "n1", "mapping": {"n1": {"parent": None, "message": {"author": {"role": "user"}, "content": {"parts": ["hello"]}}}}}]}
+    return {"schema_marker":"qingyu-fixture-v1", "conversations": [{"id": cid, "title": "retry", "current_node": "n1", "mapping": {"n1": {"parent": None, "message": {"author": {"role": "user"}, "content": {"parts": ["hello"]}}}}}]}
 
 @pytest.fixture()
 def clean_db():

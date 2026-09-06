@@ -2,6 +2,7 @@ import json, shutil
 from pathlib import Path
 from .zip_staging import safe_extract, ZipLimits, UnsafeZipError
 from .service import ImportService
+from .generic import ParserRegistry
 from .worker import ImportWorker, LeaseLost
 from ..models import ArchiveObject
 
@@ -21,6 +22,8 @@ class ImportProcessor:
                 unknown = [str(p.relative_to(attempt)) for p in files if p.is_file() and p not in candidates]
                 if not candidates: raise UnsupportedStructure("unsupported_structure")
                 payload = json.loads(candidates[0].read_text(encoding="utf-8"))
+                detection, parser = ParserRegistry().detect(payload)
+                if detection != "matched": raise UnsupportedStructure(detection)
                 report = ImportService(self.db).import_fixture(payload, job.archive_object_id, job=job, lease_token=token)
                 result = dict(report.report_json); result.update({"scan": scan, "unknown": {"unknown_file": unknown}}); job.report_json = result; self.db.commit(); return result
             raise UnsupportedStructure("unsupported_structure")

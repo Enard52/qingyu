@@ -52,7 +52,6 @@ class ImportService:
             job.items_discovered = report["imported_messages"]
             job.items_imported = report["imported_messages"]
             if lease_token is not None: ImportWorker(self.db).assert_ownership(job, lease_token)
-            job.status = "completed"
             job.report_json = report
             self.db.commit()
         except Exception as exc:

@@ -1,0 +1,2 @@
+def empty_report(parser_name="", parser_version="", detection=""):
+    return {"parser":{"name":parser_name,"version":parser_version,"detection":detection},"conversations":{k:0 for k in ("new","existing","changed","skipped","failed")},"messages":{k:0 for k in ("new","existing","changed","skipped","failed")},"revisions":{"new":0,"existing":0},"attachments":{k:0 for k in ("available","missing","referenced_only","failed")},"tree_anomalies":[],"unknown":[],"errors":[]}

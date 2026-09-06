@@ -8,7 +8,7 @@ from app.importers.worker import ImportWorker
 
 def test_zip_processor_fixture(tmp_path: Path):
     root=tmp_path/'data'; (root/'archive/objects/aa').mkdir(parents=True)
-    payload={"conversations":[{"id":"pc1","title":"p","mapping":{"n1":{"parent":None,"message":{"author":{"role":"user"},"content":{"parts":["x"]}}}},"current_node":"n1"}]}
+    payload={"schema_marker":"qingyu-fixture-v1","conversations":[{"id":"pc1","title":"p","mapping":{"n1":{"parent":None,"message":{"author":{"role":"user"},"content":{"parts":["x"]}}}},"current_node":"n1"}]}
     z=tmp_path/'x.zip'
     with zipfile.ZipFile(z,'w') as f:f.writestr('fixture.json',json.dumps(payload))
     sha='a'*64; objpath=root/'archive/objects/aa'/sha; objpath.write_bytes(z.read_bytes())
