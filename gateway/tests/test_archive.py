@@ -1,4 +1,5 @@
 import hashlib
+import os
 from pathlib import Path
 import pytest
 from sqlalchemy import create_engine, delete
@@ -7,7 +8,7 @@ from app.models import ArchiveObject, ArchiveObservation, ImportJob, MessageObse
 from app.db import Base
 from app.archive.service import ArchiveService
 
-DB_URL = "postgresql+psycopg://qingyu:PASSWORD@127.0.0.1:5432/qingyu"
+DB_URL = os.environ["TEST_DATABASE_URL"]
 
 @pytest.fixture()
 def archive_env(tmp_path: Path):
@@ -109,3 +110,5 @@ def test_manifest_is_content_level_without_source_fields(archive_env):
     assert "original_filename" not in manifest
     assert "source_platform" not in manifest
     assert manifest["sha256"] == result.sha256
+
+
