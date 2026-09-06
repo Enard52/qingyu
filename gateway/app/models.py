@@ -106,6 +106,7 @@ class MessageRevision(Base):
     raw_timestamp: Mapped[str | None] = mapped_column(Text, nullable=True)
     normalized_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    revision_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     archive_object_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("archive_objects.id"), nullable=True)
     raw_json_pointer: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
@@ -139,3 +140,5 @@ class Attachment(Base):
     availability_status: Mapped[str] = mapped_column(String(32), nullable=False, default="referenced_only")
     metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+

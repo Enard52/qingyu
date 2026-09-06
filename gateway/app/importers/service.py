@@ -7,6 +7,7 @@ from .generic import GenericTreeParser
 from .report import empty_report
 from .tree import TreeValidator
 from .worker import ImportWorker, LeaseLost
+from .revision import compute_revision_fingerprint, compute_text_hash
 
 class ImportService:
     """Persist fixture conversations in short, ownership-fenced transactions."""
@@ -53,11 +54,12 @@ class ImportService:
                     if message is None:
                         message = Message(conversation_id=conversation.id, external_message_id=item.node_id); self.db.add(message); self.db.flush(); report["messages"]["new"] += 1
                     else: report["messages"]["existing"] += 1
-                    digest = hashlib.sha256((item.content_text or "").encode()).hexdigest()
-                    revision = self.db.scalar(select(MessageRevision).where(MessageRevision.message_id == message.id, MessageRevision.content_hash == digest))
+                    digest = compute_text_hash(item.content_text)
+                    fingerprint = compute_revision_fingerprint(role=item.role, content_text=item.content_text, content_json=item.content_json, model=item.model, raw_timestamp=item.raw_timestamp)
+                    revision = self.db.scalar(select(MessageRevision).where(MessageRevision.message_id == message.id, MessageRevision.revision_fingerprint == fingerprint))
                     if revision is None:
                         latest = self.db.scalar(select(MessageRevision).where(MessageRevision.message_id == message.id).order_by(MessageRevision.revision_no.desc()))
-                        revision = MessageRevision(message_id=message.id, revision_no=(latest.revision_no + 1 if latest else 1), role=item.role, content_text=item.content_text, content_json=item.content_json, model=item.model, raw_timestamp=item.raw_timestamp, content_hash=digest, archive_object_id=archive_object_id, raw_json_pointer=f"/conversations/{parsed.external_id}/mapping/{item.node_id}"); self.db.add(revision); self.db.flush(); report["revisions"]["new"] += 1
+                        revision = MessageRevision(message_id=message.id, revision_no=(latest.revision_no + 1 if latest else 1), role=item.role, content_text=item.content_text, content_json=item.content_json, model=item.model, raw_timestamp=item.raw_timestamp, content_hash=digest, revision_fingerprint=fingerprint, archive_object_id=archive_object_id, raw_json_pointer=f"/conversations/{parsed.external_id}/mapping/{item.node_id}"); self.db.add(revision); self.db.flush(); report["revisions"]["new"] += 1
                     else: report["revisions"]["existing"] += 1
                     resolved[item.node_id], revisions[item.node_id] = message, revision
                 report["tree_anomalies"].extend(TreeValidator().validate(parsed.messages))
