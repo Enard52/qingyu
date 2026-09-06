@@ -2,16 +2,18 @@
 
 | Audit | Status | Commit | Tests | Result |
 |---|---|---|---|---|
-| AUD-01 | fixed / verified | pending | test database guard + full pytest | TEST_DATABASE_URL is mandatory and must contain `test`; destructive fixtures refuse other databases |
-| AUD-02 | fixed / verified | 01824e1 | tests/test_aud02.py | SourceAccount scoped; synthetic identities for missing IDs |`r`| AUD-03 | fixed / verified | pending | tests/test_revision_fingerprint.py | canonical full revision fingerprint |`r`| AUD-04 | fixed / verified | pending | worker/processor fencing tests | DB-time ownership, fenced finalization, required tokens |`r`| AUD-05 | fixed / verified | pending | test_archive corruption regression + processor integrity guard | Existing object digest verification and corruption rejection |`r`| AUD-06..AUD-18 | open | — | — | queued in mandated order |
+| AUD-01 | code_fixed / self_tested | pending | `tests/test_database_safety.py` + full pytest | Explicit URL allowlist and runtime `current_database()` verification |
+| AUD-02 | closed / independently_verified | `01824e1` | `tests/test_aud02.py` | SourceAccount-scoped identities and synthetic missing IDs |
+| AUD-03 | code_fixed / independently_verified / deployment_pending | `6d40e0d` | `tests/test_revision_fingerprint.py` | Canonical full revision fingerprint; application DB migration pending |
+| AUD-04 | reopened | — | — | P0 closure pending |
+| AUD-05 | partially_fixed | `aa969e1` | archive corruption regression | Processor consumption and manifest consistency pending |
+| AUD-06–AUD-18 | open | — | — | Outside current P0 closure scope |
 
 ## AUD-01 verification
 
 - Test database: `qingyu_test`
 - Test URL: `postgresql+psycopg://qingyu:PASSWORD@127.0.0.1:5432/qingyu_test`
-- Persistent application database `qingyu` was not used by pytest.
-- Alembic migrations were applied to the isolated test database.
-
-
-
-
+- `TEST_DATABASE_URL` must be explicitly provided.
+- Query parameters capable of overriding the database target are rejected.
+- A real connection must return `current_database() = qingyu_test` before tests run.
+- The persistent application database `qingyu` is not used by pytest.
