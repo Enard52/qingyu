@@ -20,7 +20,8 @@ class ImportService:
     """Persist fixture conversations in short, ownership-fenced transactions."""
     def __init__(self, db: Session): self.db = db
 
-    def import_fixture(self, payload: dict[str, Any], archive_object_id, platform="fixture", account_label="default", job: ImportJob | None = None, lease_token=None, source_member="fixture.json", parser=None, unknown_entries=None) -> ImportOutcome:
+    def import_fixture(self, payload: dict[str, Any], archive_object_id, platform="fixture", account_label="default", job: ImportJob | None = None, lease_token=None, source_member="fixture.json", parser=None, unknown_entries=None, health_check=None) -> ImportOutcome:
+        health_check = health_check or (lambda: None)
         if job is None or lease_token is None:
             raise LeaseRequired("lease_required")
         account = self.db.get(SourceAccount, job.source_account_id)
@@ -38,6 +39,7 @@ class ImportService:
         parser = parser or GenericTreeParser()
         try:
             for conv_index, parsed in enumerate(parser.parse(payload)):
+                health_check()
                 if lease_token is not None: ImportWorker(self.db).assert_ownership(job, lease_token)
                 self.db.scalar(select(SourceAccount.id).where(SourceAccount.id == account.id).with_for_update())
                 external_id = parsed.external_id
@@ -72,6 +74,7 @@ class ImportService:
                     parent = resolved.get(item.parent_node_id)
                     pointer = f"/conversations/{conv_index}/mapping/{json_pointer_escape(item.node_id)}"
                     self.db.add(MessageObservation(import_job_id=job.id, message_id=resolved[item.node_id].id, message_revision_id=revisions[item.node_id].id, external_node_id=item.node_id, external_parent_node_id=item.parent_node_id, parent_message_id=parent.id if parent else None, branch_key=item.branch_key, is_current_path=item.node_id == parsed.current_node_id, observation_order=order, raw_mapping_pointer=pointer, metadata_json={"archive_object_id": str(archive.id), "zip_member": source_member}))
+                health_check()
                 if lease_token is not None: ImportWorker(self.db).assert_ownership(job, lease_token)
                 self.db.commit(); self.db.refresh(job)
             report["items"] = {"conversations": sum(report["conversations"].values()), "messages": sum(report["messages"].values())}

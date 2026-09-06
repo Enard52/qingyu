@@ -8,9 +8,10 @@ from ..models import ArchiveObject
 
 class ImportProcessor:
     def __init__(self, db, archive_root: Path, limits: ZipLimits = ZipLimits()): self.db, self.root, self.limits = db, archive_root, limits
-    def process(self, job, token) -> dict:
+    def process(self, job, token, health_check=None) -> dict:
+        health_check = health_check or (lambda: None)
         job_id = job.id
-        worker=ImportWorker(self.db); worker.check_ownership(job, token)
+        worker=ImportWorker(self.db); health_check(); worker.check_ownership(job, token)
         obj=self.db.get(ArchiveObject, job.archive_object_id)
         if obj is None: raise ValueError('archive_object_missing')
         if obj.integrity_status != 'verified':
@@ -19,6 +20,7 @@ class ImportProcessor:
         try:
             verified_source = attempt / '_verified_input.zip'
             actual_size, actual_sha = copy_and_verify_archive(source, verified_source)
+            health_check()
             if actual_size != obj.size_bytes or actual_sha != obj.sha256:
                 raise ArchiveConsumptionIntegrityError(
                     archive_object_id=obj.id,
@@ -30,6 +32,7 @@ class ImportProcessor:
             if not zipfile.is_zipfile(verified_source): raise UnsupportedStructure('unsupported_structure')
             extract_root = attempt / 'extracted'
             scan=safe_extract(verified_source, extract_root, self.limits)
+            health_check()
             files=list(extract_root.rglob('*')); candidates=[p for p in files if p.is_file() and p.suffix.lower()=='.json' and p.name in {'fixture.json','conversations.json'}]
             unknown=[str(p.relative_to(extract_root)) for p in files if p.is_file() and p not in candidates]
             if not candidates: raise UnsupportedStructure('unsupported_structure')
@@ -38,8 +41,10 @@ class ImportProcessor:
             if detection != 'matched': raise UnsupportedStructure(detection)
             source_member = candidates[0].relative_to(extract_root).as_posix()
             unknown_fields = parser.validate(payload, source_member)
-            outcome=ImportService(self.db).import_fixture(payload, job.archive_object_id, job=job, lease_token=token, source_member=source_member, parser=parser, unknown_entries=unknown_fields)
+            health_check()
+            outcome=ImportService(self.db).import_fixture(payload, job.archive_object_id, job=job, lease_token=token, source_member=source_member, parser=parser, unknown_entries=unknown_fields, health_check=health_check)
             result=dict(outcome.report); result.update({'scan':scan,'unknown':[{'type':'unknown_file','detail':x,'severity':'info','raw_pointer':str(x)} for x in unknown]}); result['imported_messages']=result.get('messages',{}).get('new',0); result['imported_conversations']=result.get('conversations',{}).get('new',0)
+            health_check()
             if not worker.mark_completed(job_id, token, result, 'imported', outcome.counts): raise LeaseLost('ownership_lost')
             return result
         except LeaseLost:
@@ -52,7 +57,7 @@ class ImportProcessor:
                 token=token,
                 archive_object_id=exc.archive_object_id,
                 archive_root=self.root,
-                integrity_error='archive_integrity_failure',
+                integrity_error='archive_integrity_failure: digest_or_size_mismatch',
                 report={'errors':[{'type':'archive_integrity_failure','detail':'archive bytes failed integrity verification','severity':'error'}]},
             )
             raise
