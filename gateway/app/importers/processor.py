@@ -65,18 +65,18 @@ class ImportProcessor:
         except ParserValidationError as exc:
             keep=True; self.db.rollback()
             report={'errors':[dict(item, severity='error') for item in exc.errors]}
-            if not worker.mark_failed(job_id, token, 'parser_validation_error', report, 'parser_validation_error'): raise LeaseLost('ownership_lost')
+            worker.mark_failed_or_partial(job_id, token, 'parser_validation_error', report, 'parser_validation_error')
             raise
         except UnsupportedZipError as exc:
             keep=True
             self.db.rollback()
             report={'errors':[{'type':exc.code,'detail':'encrypted ZIP members are unsupported','severity':'error'}]}
-            if not worker.mark_failed(job_id, token, exc.code, report, exc.code): raise LeaseLost('ownership_lost')
+            worker.mark_failed_or_partial(job_id, token, exc.code, report, exc.code)
             raise
         except UnsupportedStructure as exc:
             keep=True
             self.db.rollback()
-            if not worker.mark_failed(job_id, token, exc.code, {'unknown':[{'type':exc.code,'detail':'no registered parser matched','severity':'error'}]}, exc.code): raise LeaseLost('ownership_lost')
+            worker.mark_failed_or_partial(job_id, token, exc.code, {'unknown':[{'type':exc.code,'detail':'no registered parser matched','severity':'error'}]}, exc.code)
             raise
         except SQLAlchemyError:
             keep=True
@@ -85,7 +85,7 @@ class ImportProcessor:
         except Exception as exc:
             keep=True
             self.db.rollback()
-            if not worker.mark_failed(job_id, token, 'processor_error', {'errors':[{'type':'processor_error','detail':'processing failed','severity':'error'}]}, 'processor_error'): raise LeaseLost('ownership_lost')
+            worker.mark_failed_or_partial(job_id, token, 'processor_error', {'errors':[{'type':'processor_error','detail':'processing failed','severity':'error'}]}, 'processor_error')
             raise
         finally:
             if not keep: shutil.rmtree(attempt, ignore_errors=True)

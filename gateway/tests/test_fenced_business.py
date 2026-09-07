@@ -4,7 +4,7 @@ import pytest
 from sqlalchemy import delete, update
 from sqlalchemy.orm import Session
 from app.db import engine
-from app.models import ArchiveObject, SourceAccount, ImportJob, Conversation, Message, MessageRevision, MessageObservation, Attachment
+from app.models import ArchiveObject, SourceAccount, ImportBatchCommit, ImportJob, Conversation, Message, MessageRevision, MessageObservation, Attachment
 from app.importers.service import ImportService
 from app.importers.worker import ClaimedJob, ImportWorker, LeaseLost
 
@@ -38,19 +38,21 @@ def test_retry_reuses_stable_entities(clean_db):
     worker = ImportWorker(db); job = worker.claim_next(); token = job.lease_token
     service = ImportService(db); first = service.import_fixture(fixture_payload("retry-c"), archive_id, job=job, lease_token=token)
     second = service.import_fixture(fixture_payload("retry-c"), archive_id, job=job, lease_token=token)
-    assert first.report["messages"]["new"] == 1 and second.report["messages"]["existing"] == 1
+    assert first.report["messages"]["new"] == 1 and second.report["messages"]["new"] == 1
     assert db.query(Conversation).filter_by(external_conversation_id="retry-c").count() == 1
     assert db.query(Message).count() == 1
     assert db.query(MessageRevision).count() == 1
     assert db.query(MessageObservation).count() == 1
+    assert db.query(ImportBatchCommit).count() == 1
 
 def test_checkpoint_only_after_business_commit(clean_db):
-    db, job_id, _ = clean_db
+    db, job_id, archive_id = clean_db
     worker = ImportWorker(db); job = worker.claim_next(); token = job.lease_token
-    assert worker.update_progress(job, token, {"committed": 1}) is True
-    db.expire_all(); assert db.get(ImportJob,job.id).checkpoint == {"committed": 1}
-    assert worker.update_progress(job, uuid.uuid4(), {"committed": 2}) is False
-    db.expire_all(); assert db.get(ImportJob,job.id).checkpoint == {"committed": 1}
+    assert worker.advance_checkpoint(job, token, 1, "fixture.json:conversation:0") is False
+    ImportService(db).import_fixture(fixture_payload("checkpoint"), archive_id, job=job, lease_token=token)
+    db.expire_all(); assert db.get(ImportJob,job.id).checkpoint_sequence == 1
+    assert worker.advance_checkpoint(job, uuid.uuid4(), 1, "fixture.json:conversation:0") is False
+    db.expire_all(); assert db.get(ImportJob,job.id).checkpoint_sequence == 1
 
 def test_attempt_staging_isolated(clean_db, tmp_path):
     db, _, _ = clean_db

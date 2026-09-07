@@ -1,0 +1,11 @@
+PENDING = "pending"
+RUNNING = "running"
+COMPLETED = "completed"
+FAILED = "failed"
+PARTIAL = "partial"
+CANCELLED = "cancelled"
+
+CLAIMABLE_STATUSES = frozenset({PENDING})
+ACTIVE_STATUSES = frozenset({PENDING, RUNNING})
+RETRYABLE_STATUSES = frozenset({FAILED, PARTIAL})
+TERMINAL_STATUSES = frozenset({COMPLETED, FAILED, PARTIAL, CANCELLED})

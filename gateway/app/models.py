@@ -1,9 +1,10 @@
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import DateTime, Integer, String, Text, UniqueConstraint, ForeignKey, text
+from sqlalchemy import CheckConstraint, DateTime, Integer, String, Text, UniqueConstraint, ForeignKey, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 from .db import Base
+from .importers.status import PENDING
 
 class ArchiveObject(Base):
     __tablename__ = "archive_objects"
@@ -46,12 +47,18 @@ class SourceAccount(Base):
 
 class ImportJob(Base):
     __tablename__ = "import_jobs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending','running','completed','failed','partial','cancelled')",
+            name="ck_import_jobs_status",
+        ),
+    )
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     source_account_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("source_accounts.id"), nullable=False)
     archive_object_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("archive_objects.id"), nullable=False)
     parser_name: Mapped[str] = mapped_column(String(100), nullable=False)
     parser_version: Mapped[str] = mapped_column(String(50), nullable=False)
-    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default=PENDING)
     result_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -72,10 +79,29 @@ class ImportJob(Base):
     items_skipped: Mapped[int] = mapped_column(Integer, default=0)
     items_failed: Mapped[int] = mapped_column(Integer, default=0)
     checkpoint: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    checkpoint_sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     report_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+class ImportBatchCommit(Base):
+    __tablename__ = "import_batch_commits"
+    __table_args__ = (
+        UniqueConstraint("import_job_id", "sequence_no", name="uq_import_batch_commits_job_sequence"),
+        UniqueConstraint("import_job_id", "batch_key", name="uq_import_batch_commits_job_key"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    import_job_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("import_jobs.id", ondelete="CASCADE"), nullable=False, index=True)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False)
+    sequence_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    batch_key: Mapped[str] = mapped_column(Text, nullable=False)
+    external_conversation_id: Mapped[str] = mapped_column(Text, nullable=False)
+    parser_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    contract_version: Mapped[str] = mapped_column(String(50), nullable=False)
+    report_delta: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    counts_delta: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    committed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
 
 class Conversation(Base):
     __tablename__ = "conversations"

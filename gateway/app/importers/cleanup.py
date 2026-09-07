@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..models import ImportJob
+from .status import ACTIVE_STATUSES, TERMINAL_STATUSES
 
 
 @dataclass
@@ -89,10 +90,10 @@ def cleanup_failed_staging(
         if job is not None and _has_live_lease(job, database_now):
             result.record("skipped_unknown", path)
             continue
-        if job is not None and job.status in {"pending", "running"}:
+        if job is not None and job.status in ACTIVE_STATUSES:
             result.record("skipped_active", path)
             continue
-        if job is not None and job.status not in {"completed", "failed"}:
+        if job is not None and job.status not in TERMINAL_STATUSES:
             result.record("skipped_unknown", path)
             continue
         if not _tree_is_safe(path, base):

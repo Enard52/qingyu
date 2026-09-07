@@ -182,7 +182,7 @@ def test_fresh_postgresql_upgrade_schema_and_deterministic_downgrade(disposable_
     fresh=create_engine(disposable_postgres_database)
     try:
         with fresh.connect() as connection:
-            assert connection.scalar(text('select version_num from alembic_version'))=='0013_import_job_defaults'
+            assert connection.scalar(text('select version_num from alembic_version'))=='0014_import_batch_commits'
         _assert_import_job_contract(fresh)
         _run_alembic(disposable_postgres_database,'downgrade','0012_import_identity_constraints')
         downgraded=_column_map(fresh,'import_jobs')
