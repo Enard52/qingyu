@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import stat
@@ -85,6 +86,9 @@ def cleanup_failed_staging(
         if job is not None and _has_active_ownership(job, attempt, token, database_now):
             result.record("skipped_active", path)
             continue
+        if job is not None and _has_live_lease(job, database_now):
+            result.record("skipped_unknown", path)
+            continue
         if job is not None and job.status in {"pending", "running"}:
             result.record("skipped_active", path)
             continue
@@ -106,7 +110,7 @@ def cleanup_failed_staging(
             result.record("deleted", path)
             continue
         try:
-            _remove_tree_without_links(path)
+            _quarantine_and_remove(path, base)
             result.record("deleted", path)
         except UnsafeStagingPath:
             result.record("skipped_unknown", path)
@@ -170,6 +174,14 @@ def _has_active_ownership(job: ImportJob, attempt: int, token: uuid.UUID, databa
     )
 
 
+def _has_live_lease(job: ImportJob, database_now: datetime) -> bool:
+    return (
+        job.lease_token is not None
+        and job.lease_expires_at is not None
+        and job.lease_expires_at > database_now
+    )
+
+
 def _tree_is_safe(candidate: Path, base: Path) -> bool:
     candidate = _lexical_path(candidate)
     base = _lexical_path(base)
@@ -204,19 +216,80 @@ def _tree_is_safe(candidate: Path, base: Path) -> bool:
     return True
 
 
+def _restore_quarantine(quarantine: Path, original: Path) -> None:
+    if os.path.lexists(quarantine) and not os.path.lexists(original):
+        try:
+            os.replace(quarantine, original)
+        except OSError:
+            pass
+
+
+def _quarantine_and_remove(path: Path, base: Path) -> None:
+    quarantine = path.with_name(f".{path.name}.cleanup-{uuid.uuid4()}")
+    os.replace(path, quarantine)
+    try:
+        if not _tree_is_safe(quarantine, base):
+            raise UnsafeStagingPath("unsafe_after_quarantine")
+        _remove_tree_without_links(quarantine)
+    except Exception:
+        _restore_quarantine(quarantine, path)
+        raise
+
+
 def _remove_tree_without_links(path: Path) -> None:
-    if _is_link_like(path):
-        raise UnsafeStagingPath("link_like_path")
-    with os.scandir(path) as entries:
-        children = [Path(entry.path) for entry in entries]
-    for child in children:
-        if _is_link_like(child):
-            raise UnsafeStagingPath("link_like_entry")
-        if _is_directory(child):
-            _remove_tree_without_links(child)
-        else:
-            os.unlink(child)
+    with _directory_identity_guard(path):
+        if _is_link_like(path):
+            raise UnsafeStagingPath("link_like_path")
+        with os.scandir(path) as entries:
+            children = [Path(entry.path) for entry in entries]
+        for child in children:
+            if _is_link_like(child):
+                raise UnsafeStagingPath("link_like_entry")
+            if _is_directory(child):
+                quarantine = child.with_name(f".{child.name}.cleanup-{uuid.uuid4()}")
+                os.replace(child, quarantine)
+                try:
+                    _remove_tree_without_links(quarantine)
+                except Exception:
+                    _restore_quarantine(quarantine, child)
+                    raise
+            else:
+                os.unlink(child)
     os.rmdir(path)
+
+
+@contextmanager
+def _directory_identity_guard(path: Path):
+    """Prevent a Windows directory path from being replaced while traversed."""
+    if os.name != "nt":
+        yield
+        return
+
+    import ctypes
+    from ctypes import wintypes
+
+    create_file = ctypes.windll.kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        str(path),
+        0x10080,  # DELETE | FILE_READ_ATTRIBUTES
+        0x1 | 0x2,  # FILE_SHARE_READ | FILE_SHARE_WRITE; deliberately no DELETE
+        None,
+        3,  # OPEN_EXISTING
+        0x02000000 | 0x00200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+        None,
+    )
+    invalid_handle = wintypes.HANDLE(-1).value
+    if handle in (None, 0, invalid_handle):
+        raise OSError(ctypes.get_last_error(), "directory_identity_guard_failed")
+    try:
+        yield
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
 
 
 def _attempt_leaves(base: Path, job_dir: Path, result: StagingCleanupResult) -> list[tuple[Path, int, uuid.UUID]]:

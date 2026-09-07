@@ -110,11 +110,23 @@ def test_terminal_jobs_with_expired_or_absent_ownership_are_deleted(tmp_path):
         assert all(not path.exists() for path in paths)
 
 
+def test_terminal_job_with_live_but_mismatched_ownership_fails_closed(tmp_path):
+    with Session(engine,expire_on_commit=False) as db:
+        _clear(db)
+        job,token_a=_job(db,'failed',datetime.now(timezone.utc)+timedelta(minutes=5),retain_lease=True)
+        token_b=uuid.uuid4(); mismatched=_attempt(tmp_path,job.id,token_b)
+        wrong_attempt=_attempt(tmp_path,job.id,token_a,attempt=2)
+        result=cleanup_failed_staging(tmp_path,db,7)
+        assert set(result.skipped_unknown)=={mismatched,wrong_attempt}
+        assert not result.deleted
+        assert mismatched.exists() and wrong_attempt.exists()
+
+
 def test_cleanup_delete_failure_is_reported_without_stopping_other_candidates(tmp_path,monkeypatch):
     with Session(engine) as db:
         _clear(db); path=_attempt(tmp_path,uuid.uuid4(),uuid.uuid4()); safe=_attempt(tmp_path,uuid.uuid4(),uuid.uuid4())
-        original=cleanup_module._remove_tree_without_links
-        monkeypatch.setattr(cleanup_module,'_remove_tree_without_links',lambda candidate: (_ for _ in ()).throw(PermissionError('busy')) if candidate==path else original(candidate))
+        original=cleanup_module._quarantine_and_remove
+        monkeypatch.setattr(cleanup_module,'_quarantine_and_remove',lambda candidate,base: (_ for _ in ()).throw(PermissionError('busy')) if candidate==path else original(candidate,base))
         result=cleanup_failed_staging(tmp_path,db,7)
         assert result.failed==[path] and result.deleted==[safe]
         assert path.exists() and not safe.exists()
@@ -133,6 +145,54 @@ def test_directory_symlink_cannot_alias_and_delete_active_attempt(tmp_path):
         assert target in result.skipped_active
         assert target.exists() and (target/'diagnostic').exists()
         assert set(result.deleted).isdisjoint(result.skipped_active)
+
+
+@pytest.mark.skipif(sys.platform!='win32',reason='Windows junction race integration')
+def test_candidate_replaced_by_junction_at_quarantine_boundary_is_not_followed(tmp_path,monkeypatch):
+    target=tmp_path/'race-target'; target.mkdir(); sentinel=target/'sentinel'; sentinel.write_text('preserve')
+    root=tmp_path/'root'; candidate=_attempt(root,uuid.uuid4(),uuid.uuid4()); backup=tmp_path/'candidate-backup'
+    original_replace=cleanup_module.os.replace; injected=False
+    def replace_with_race(source,destination):
+        nonlocal injected
+        if not injected and Path(source)==candidate:
+            injected=True
+            original_replace(source,backup)
+            created=subprocess.run(['cmd','/c','mklink','/J',str(candidate),str(target)],capture_output=True,text=True)
+            if created.returncode: pytest.skip('Windows junction creation unavailable')
+        return original_replace(source,destination)
+    monkeypatch.setattr(cleanup_module.os,'replace',replace_with_race)
+    try:
+        with Session(engine) as db:
+            result=cleanup_failed_staging(root,db,7)
+        assert injected
+        assert candidate in result.skipped_unknown and not result.deleted
+        assert sentinel.read_text()=='preserve'
+    finally:
+        monkeypatch.undo()
+        if candidate.exists(): os.rmdir(candidate)
+        if backup.exists(): cleanup_module._remove_tree_without_links(backup)
+
+
+@pytest.mark.skipif(sys.platform!='win32',reason='Windows directory handle integration')
+def test_directory_identity_guard_blocks_replacement_during_traversal(tmp_path,monkeypatch):
+    candidate=tmp_path/'guarded'; candidate.mkdir(); (candidate/'local').write_text('local')
+    outside=tmp_path/'outside'; outside.mkdir(); sentinel=outside/'sentinel'; sentinel.write_text('preserve')
+    backup=tmp_path/'guarded-backup'; original_scandir=cleanup_module.os.scandir
+    attempted=False; blocked=False
+    def racing_scandir(path):
+        nonlocal attempted,blocked
+        if not attempted and Path(path)==candidate:
+            attempted=True
+            try:
+                os.replace(candidate,backup)
+            except PermissionError:
+                blocked=True
+        return original_scandir(path)
+    monkeypatch.setattr(cleanup_module.os,'scandir',racing_scandir)
+    cleanup_module._remove_tree_without_links(candidate)
+    assert attempted and blocked
+    assert sentinel.read_text()=='preserve'
+    assert not candidate.exists() and not backup.exists()
 
 
 @pytest.mark.parametrize('target_name',['outside-sentinel','archive-objects','manifests'])
@@ -198,7 +258,12 @@ def test_expired_attempt_survives_cleanup_recovery_and_retry_claim(tmp_path):
         claim=ImportWorker(db).claim_next(60); assert claim.job_id==job.id and claim.lease_token!=token_a
         new_path=Path(ImportWorker(db).attempt_staging_path(tmp_path,claim)); new_path.mkdir(parents=True)
         result=cleanup_failed_staging(tmp_path,db,7)
-        assert set(result.skipped_active)=={old_path,new_path.resolve()}
+        assert result.skipped_active==[new_path.resolve()]
+        assert result.skipped_unknown==[old_path]
+        job=db.get(ImportJob,job.id); job.status='completed'; job.lease_token=None; job.lease_expires_at=None; db.commit()
+        result=cleanup_failed_staging(tmp_path,db,7)
+        assert result.deleted==[old_path]
+        assert result.skipped_recent==[new_path.resolve()]
 
 
 def test_cleanup_cannot_delete_attempt_while_processor_is_copying(tmp_path,monkeypatch):
