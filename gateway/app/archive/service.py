@@ -105,14 +105,9 @@ class ArchiveService:
             if staged.exists():
                 staged.unlink()
 
-    def cleanup_staging(self) -> int:
-        count = 0
-        if self.staging.exists():
-            for path in self.staging.iterdir():
-                if path.is_file():
-                    path.unlink()
-                    count += 1
-        return count
+    def cleanup_staging(self):
+        from ..importers.cleanup import cleanup_failed_staging
+        return cleanup_failed_staging(self.root, self.db)
 
     def _write_manifest(self, record: ArchiveObject) -> Path:
         return sync_manifest_from_archive_object(self.root, record)

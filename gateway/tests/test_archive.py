@@ -69,8 +69,9 @@ def test_invalid_names_path_traversal_and_staging_cleanup(archive_env):
     stale = service.staging / "stale.tmp"
     stale.parent.mkdir(parents=True)
     stale.write_bytes(b"stale")
-    assert service.cleanup_staging() == 1
-    assert not stale.exists()
+    cleanup = service.cleanup_staging()
+    assert stale.resolve() in cleanup.skipped_unknown
+    assert stale.exists()
 
 def test_database_and_disk_manifest_match(archive_env):
     import json
