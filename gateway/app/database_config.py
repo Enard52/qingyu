@@ -1,4 +1,6 @@
 from alembic.config import Config
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
 
 from .config import get_settings
 
@@ -12,6 +14,10 @@ def configured_database_url() -> str:
     url = get_settings().database_url
     if url is None or not url.strip():
         raise DatabaseConfigurationError("database_url_required")
+    try:
+        make_url(url)
+    except ArgumentError:
+        raise DatabaseConfigurationError("database_url_invalid") from None
     return url
 
 

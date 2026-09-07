@@ -1,15 +1,22 @@
 import logging
 import os
+import sys
 import threading
 
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ..config import get_settings
-from ..db import engine
+from ..database_config import DatabaseConfigurationError
 from ..errors import safe_log_exception
-from .processor import ImportProcessor
-from .worker import ClaimedJob, ImportWorker, LeaseLost
+try:
+    from .processor import ImportProcessor
+    from .worker import ClaimedJob, ImportWorker, LeaseLost
+except DatabaseConfigurationError as exc:
+    if __name__ == "__main__":
+        sys.stderr.write(f"worker_startup_failed code={exc} exception=DatabaseConfigurationError\n")
+        raise SystemExit(2) from None
+    raise
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +41,10 @@ class WorkerRuntime:
         self.heartbeat_interval = heartbeat_interval
         self.lease_duration = lease_duration
         self.error_backoff_max = error_backoff_max
-        self.session_factory = session_factory or (lambda: Session(engine))
+        if session_factory is None:
+            from ..db import engine
+            session_factory = lambda: Session(engine)
+        self.session_factory = session_factory
         self.stop_event = threading.Event()
         self.last_iteration_failed = False
 
@@ -156,15 +166,26 @@ class WorkerRuntime:
             self.stop_event.set()
 
 
-def main():
-    settings = get_settings()
-    runtime = WorkerRuntime(
-        archive_root=__import__('pathlib').Path(settings.archive_root),
-        poll_interval=float(os.getenv("IMPORT_WORKER_POLL_SECONDS", "1")),
-        heartbeat_interval=float(os.getenv("IMPORT_WORKER_HEARTBEAT_SECONDS", "10")),
-        lease_duration=int(os.getenv("IMPORT_WORKER_LEASE_SECONDS", "30")),
-    )
-    runtime.run_forever()
+def main() -> int:
+    try:
+        settings = get_settings()
+        runtime = WorkerRuntime(
+            archive_root=__import__('pathlib').Path(settings.archive_root),
+            poll_interval=float(os.getenv("IMPORT_WORKER_POLL_SECONDS", "1")),
+            heartbeat_interval=float(os.getenv("IMPORT_WORKER_HEARTBEAT_SECONDS", "10")),
+            lease_duration=int(os.getenv("IMPORT_WORKER_LEASE_SECONDS", "30")),
+        )
+        runtime.run_forever()
+        return 0
+    except DatabaseConfigurationError as exc:
+        sys.stderr.write(f"worker_startup_failed code={exc} exception=DatabaseConfigurationError\n")
+        return 2
+    except SQLAlchemyError as exc:
+        sys.stderr.write(
+            f"worker_startup_failed code=database_initialization_failed exception={exc.__class__.__name__}\n"
+        )
+        return 2
 
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    raise SystemExit(main())

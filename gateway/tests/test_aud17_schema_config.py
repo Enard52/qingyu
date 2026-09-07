@@ -94,7 +94,7 @@ def test_runtime_and_alembic_resolve_the_same_settings_url():
 
 def test_runtime_fails_closed_without_database_url_or_env_file(tmp_path):
     result=subprocess.run(
-        [sys.executable,'-c','from app.db import engine'],
+        [sys.executable,'-m','app.importers.worker_runtime'],
         cwd=tmp_path,
         env={**_environment_without_database_url(),'PYTHONPATH':str(Path(__file__).parents[1])},
         capture_output=True,text=True,timeout=15,
@@ -102,6 +102,7 @@ def test_runtime_fails_closed_without_database_url_or_env_file(tmp_path):
     output=result.stdout+result.stderr
     assert result.returncode != 0
     assert 'database_url_required' in output
+    assert 'Traceback' not in output
     assert 'SUPER_SECRET_TOKEN_456' not in output
     assert 'postgresql' not in output.lower()
     assert '/qingyu' not in output.lower()
@@ -125,9 +126,55 @@ def test_alembic_fails_closed_without_database_url_and_ignores_stale_ini(tmp_pat
     output=result.stdout+result.stderr
     assert result.returncode != 0
     assert 'database_url_required' in output
+    assert 'Traceback' not in output
     assert 'SUPER_SECRET_PASSWORD' not in output
     assert 'SUPER_SECRET_TOKEN_456' not in output
     assert stale not in output
+
+
+@pytest.mark.parametrize('command',[
+    [sys.executable,'-m','app.importers.worker_runtime'],
+    [sys.executable,'-m','alembic','-c','alembic.ini','current'],
+])
+def test_invalid_database_url_is_rejected_without_secret_or_traceback(tmp_path,command):
+    repository=Path(__file__).parents[1]
+    if 'alembic' in command:
+        config=tmp_path/'alembic.ini'
+        config.write_text(
+            '[alembic]\n'
+            f'script_location = {repository / "alembic"}\n'
+            f'prepend_sys_path = {repository}\n'
+            'sqlalchemy.url = postgresql+psycopg://unused/unused\n',
+            encoding='utf-8',
+        )
+    env=_environment_without_database_url()
+    env.update({'DATABASE_URL':'not-a-valid-url-SUPER_SECRET_DB_PASSWORD_123','PYTHONPATH':str(repository)})
+    result=subprocess.run(command,cwd=tmp_path,env=env,capture_output=True,text=True,timeout=15)
+    output=result.stdout+result.stderr
+    assert result.returncode != 0
+    assert 'database_url_invalid' in output
+    assert 'Traceback' not in output
+    assert 'SUPER_SECRET_DB_PASSWORD_123' not in output
+    assert 'SUPER_SECRET_TOKEN_456' not in output
+
+
+def test_alembic_connection_failure_is_redacted_without_traceback():
+    env=os.environ.copy()
+    env.update({
+        'DATABASE_URL':'postgresql+psycopg://audit:PASSWORD@127.0.0.1:1/unreachable?connect_timeout=2',
+        'APP_ENV':'test',
+        'API_TOKEN':'SUPER_SECRET_TOKEN_456',
+    })
+    result=subprocess.run(
+        [sys.executable,'-m','alembic','current'],
+        cwd=Path(__file__).parents[1],env=env,capture_output=True,text=True,timeout=15,
+    )
+    output=result.stdout+result.stderr
+    assert result.returncode != 0
+    assert 'database_operation_failed' in output
+    assert 'Traceback' not in output
+    assert 'SUPER_SECRET_DB_PASSWORD_123' not in output
+    assert 'SUPER_SECRET_TOKEN_456' not in output
 
 
 def test_fresh_postgresql_upgrade_schema_and_deterministic_downgrade(disposable_postgres_database):
