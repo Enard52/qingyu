@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8000
     api_token: str = ""
-    database_url: str = "postgresql+psycopg://qingyu:PASSWORD@localhost:5432/qingyu"
+    database_url: str | None = None
     log_level: str = "INFO"
     archive_root: str = "<repo>/data"
     staging_failed_retention_days: int = 7

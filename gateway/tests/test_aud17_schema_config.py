@@ -54,6 +54,13 @@ def _run_alembic(url, *arguments):
     return subprocess.run([sys.executable,'-m','alembic',*arguments],cwd=Path(__file__).parents[1],env=env,capture_output=True,text=True,timeout=30,check=True)
 
 
+def _environment_without_database_url():
+    env=os.environ.copy()
+    env.pop('DATABASE_URL',None)
+    env.update({'APP_ENV':'test','API_TOKEN':'SUPER_SECRET_TOKEN_456'})
+    return env
+
+
 @pytest.fixture()
 def disposable_postgres_database():
     name=f"qingyu_disposable_{uuid.uuid4().hex[:12]}"
@@ -78,11 +85,49 @@ def test_current_test_database_matches_model_schema_contract():
 
 
 def test_runtime_and_alembic_resolve_the_same_settings_url():
-    config=Config('alembic.ini')
+    config=Config('alembic.ini'); config.set_main_option('sqlalchemy.url','postgresql+psycopg://stale:PASSWORD@127.0.0.1/db_b')
     resolved=apply_alembic_database_url(config)
     assert make_url(resolved)==make_url(config.get_main_option('sqlalchemy.url'))
     assert make_url(resolved)==engine.url==make_url(configured_database_url())
     assert engine.url.database=='qingyu_test'
+
+
+def test_runtime_fails_closed_without_database_url_or_env_file(tmp_path):
+    result=subprocess.run(
+        [sys.executable,'-c','from app.db import engine'],
+        cwd=tmp_path,
+        env={**_environment_without_database_url(),'PYTHONPATH':str(Path(__file__).parents[1])},
+        capture_output=True,text=True,timeout=15,
+    )
+    output=result.stdout+result.stderr
+    assert result.returncode != 0
+    assert 'database_url_required' in output
+    assert 'SUPER_SECRET_TOKEN_456' not in output
+    assert 'postgresql' not in output.lower()
+    assert '/qingyu' not in output.lower()
+
+
+def test_alembic_fails_closed_without_database_url_and_ignores_stale_ini(tmp_path):
+    repository=Path(__file__).parents[1]
+    stale='postgresql+psycopg://stale:PASSWORD@127.0.0.1/db_b'
+    config=tmp_path/'alembic.ini'
+    config.write_text(
+        '[alembic]\n'
+        f'script_location = {repository / "alembic"}\n'
+        f'prepend_sys_path = {repository}\n'
+        f'sqlalchemy.url = {stale}\n',
+        encoding='utf-8',
+    )
+    result=subprocess.run(
+        [sys.executable,'-m','alembic','-c',str(config),'current'],
+        cwd=tmp_path,env=_environment_without_database_url(),capture_output=True,text=True,timeout=15,
+    )
+    output=result.stdout+result.stderr
+    assert result.returncode != 0
+    assert 'database_url_required' in output
+    assert 'SUPER_SECRET_PASSWORD' not in output
+    assert 'SUPER_SECRET_TOKEN_456' not in output
+    assert stale not in output
 
 
 def test_fresh_postgresql_upgrade_schema_and_deterministic_downgrade(disposable_postgres_database):
