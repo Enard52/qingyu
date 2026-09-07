@@ -3,8 +3,8 @@
 ## Scope and status
 
 This report covers Phase 3 P1, AUD-06 through AUD-16. The independent P1 re-audit
-closed AUD-06 through AUD-09 and AUD-12 through AUD-15. Its remaining findings,
-AUD-10, AUD-11 and AUD-16, are now `code_fixed / self_tested` and await final
+closed AUD-06 through AUD-10 and AUD-12 through AUD-15. Its remaining findings,
+AUD-11 and AUD-16, are now `code_fixed / self_tested` and await a narrow final
 independent verification. AUD-17 and AUD-18 remain open and unchanged.
 
 | Audit | Status | Commit | Migration |
@@ -13,13 +13,13 @@ independent verification. AUD-17 and AUD-18 remain open and unchanged.
 | AUD-07 | CLOSED | `d908912` | `0012_import_identity_constraints` |
 | AUD-08 | CLOSED | `d908912` | none |
 | AUD-09 | CLOSED | `c108de4` | none |
-| AUD-10 | code_fixed / self_tested | `0df8d88` | none |
-| AUD-11 | code_fixed / self_tested | `8f2015a` | none |
+| AUD-10 | CLOSED | `0df8d88` | none |
+| AUD-11 | code_fixed / self_tested | `8f2015a`, `afb8cec` | none |
 | AUD-12 | CLOSED | `0f7c4b8` | none |
 | AUD-13 | CLOSED | `d908912` | none |
 | AUD-14 | CLOSED | `c108de4` | none |
 | AUD-15 | CLOSED | `a6385ce` | none |
-| AUD-16 | code_fixed / self_tested | `9c7e0c7` | none |
+| AUD-16 | code_fixed / self_tested | `9c7e0c7`, `afb8cec` | none |
 
 ## AUD-06 — stale recovery stale-read race
 
@@ -204,6 +204,33 @@ business writes or finalization.
   `logger.exception`, `exc_info=True`, direct traceback printing, or direct
   exception printing in application code.
 
+## AUD-11 / AUD-16 narrow post-claim remediation
+
+- Root cause: `claim_next()` committed and returned an expired ImportJob ORM
+  instance. Reading `job.id` or `job.lease_token` after commit could trigger an
+  implicit refresh SELECT outside the protected recover/claim block.
+- `claim_next()` now materializes a frozen `ClaimedJob` before commit. It contains
+  only the scalar job ID, token, attempt number, account ID and archive ID. Runtime
+  heartbeat and processing consume this snapshot and cannot trigger lazy SQL.
+- The complete iteration owns one explicit Session lifecycle. Recovery, claim,
+  claim materialization, post-claim setup, heartbeat setup, Processor and
+  finalization SQLAlchemy errors enter the same safe boundary. The Session is
+  rolled back and closed in `finally`; the next iteration creates a fresh one and
+  uses the existing bounded exponential backoff.
+- A final `run_forever()` SQLAlchemy safety net also uses `safe_log_exception` and
+  cannot reach Python's default traceback printer. A post-claim failure leaves the
+  already claimed Job running for ordinary lease expiry/stale recovery and does
+  not mark it as a Processor failure.
+- SQL statement capture proves snapshot scalar access executes zero statements
+  after claim commit. A PostgreSQL statement-timeout OperationalError carrying
+  `SUPER_SECRET_CHAT_CONTENT_123` is injected at post-claim setup; Runtime remains
+  alive, closes the failed Session and completes the next pending Job.
+- A real subprocess calls `worker_runtime.main()` through the same failure. Its
+  stdout and stderr contain neither the chat marker nor
+  `SUPER_SECRET_TOKEN_456`, `Traceback`, or `Exception in thread`.
+- Combined AUD-11/AUD-16 targeted suite: 18 passed. Existing fencing regression:
+  14 passed. Commit: `afb8cec`. Migration: none.
+
 ## Database, migration and validation safety
 
 - Destructive tests require TEST_DATABASE_URL and verify using a real connection
@@ -213,7 +240,7 @@ business writes or finalization.
 - `qingyu_test` was upgraded to the new head. The long-term `qingyu` database was
   not upgraded and is checked read-only; deployment awaits the controlled
   migration procedure.
-- Full suite: 88 passed.
+- Full suite: 92 passed.
 - Two unsuppressed third-party deprecations originate in FastAPI/Starlette
   TestClient and AnyIO compatibility.
 - P0 regression coverage remains green: database guard, account identity,
