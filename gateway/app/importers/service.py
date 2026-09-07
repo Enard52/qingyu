@@ -76,7 +76,7 @@ class ImportService:
                     self.db.add(MessageObservation(import_job_id=job.id, message_id=resolved[item.node_id].id, message_revision_id=revisions[item.node_id].id, external_node_id=item.node_id, external_parent_node_id=item.parent_node_id, parent_message_id=parent.id if parent else None, branch_key=item.branch_key, is_current_path=item.node_id == parsed.current_node_id, observation_order=order, raw_mapping_pointer=pointer, metadata_json={"archive_object_id": str(archive.id), "zip_member": source_member}))
                 health_check()
                 if lease_token is not None: ImportWorker(self.db).assert_ownership(job, lease_token)
-                self.db.commit(); self.db.refresh(job)
+                self.db.commit()
             report["items"] = {"conversations": sum(report["conversations"].values()), "messages": sum(report["messages"].values())}
             counts = {"items_discovered": report["items"]["messages"], "items_imported": report["messages"]["new"], "discovered_count": report["items"]["messages"], "imported_count": report["messages"]["new"], "skipped_count": report["messages"]["existing"], "failed_count": report["messages"]["failed"]}
         except Exception:

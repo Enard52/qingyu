@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from app.db import engine
 from app.models import ArchiveObject, SourceAccount, ImportJob, Conversation, Message, MessageRevision, MessageObservation, Attachment
 from app.importers.service import ImportService
-from app.importers.worker import ImportWorker, LeaseLost
+from app.importers.worker import ClaimedJob, ImportWorker, LeaseLost
 
 def fixture_payload(cid="c2"):
     return {"schema_marker":"qingyu-fixture-v1", "conversations": [{"id": cid, "title": "retry", "current_node": "n1", "mapping": {"n1": {"parent": None, "message": {"author": {"role": "user"}, "content": {"parts": ["hello"]}}}}}]}
@@ -48,14 +48,16 @@ def test_checkpoint_only_after_business_commit(clean_db):
     db, job_id, _ = clean_db
     worker = ImportWorker(db); job = worker.claim_next(); token = job.lease_token
     assert worker.update_progress(job, token, {"committed": 1}) is True
-    db.refresh(job); assert job.checkpoint == {"committed": 1}
+    db.expire_all(); assert db.get(ImportJob,job.id).checkpoint == {"committed": 1}
     assert worker.update_progress(job, uuid.uuid4(), {"committed": 2}) is False
-    db.refresh(job); assert job.checkpoint == {"committed": 1}
+    db.expire_all(); assert db.get(ImportJob,job.id).checkpoint == {"committed": 1}
 
 def test_attempt_staging_isolated(clean_db, tmp_path):
     db, _, _ = clean_db
     worker = ImportWorker(db); job = worker.claim_next(); first = worker.attempt_staging_path(tmp_path, job)
-    job.lease_token = uuid.uuid4(); job.attempt_count += 1; db.commit()
-    second = worker.attempt_staging_path(tmp_path, job)
+    token_b=uuid.uuid4()
+    db.execute(update(ImportJob).where(ImportJob.id==job.id).values(lease_token=token_b,attempt_count=job.attempt_count+1,lease_expires_at=datetime.now(timezone.utc)+timedelta(seconds=60))); db.commit()
+    next_attempt=ClaimedJob(job_id=job.id,lease_token=token_b,attempt_count=job.attempt_count+1,source_account_id=job.source_account_id,archive_object_id=job.archive_object_id)
+    second = worker.attempt_staging_path(tmp_path, next_attempt)
     assert first != second
     assert str(first).startswith(str(tmp_path)) and str(second).startswith(str(tmp_path))

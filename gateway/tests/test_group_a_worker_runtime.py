@@ -22,7 +22,7 @@ def test_stale_recovery_cannot_overwrite_new_claim():
         token_a=uuid.uuid4(); expiry=datetime.now(timezone.utc)-timedelta(seconds=1); job=ImportJob(source_account_id=account.id,archive_object_id=archive.id,parser_name='x',parser_version='1',status='running',lease_token=token_a,lease_expires_at=expiry,attempt_count=1,max_attempts=3,report_json={}); db.add(job); db.commit(); observed=(job.id,token_a,expiry,1,3)
         assert ImportWorker(db).recover_stale()==1; claimed=ImportWorker(db).claim_next(60); token_b=claimed.lease_token
         assert ImportWorker(db).recover_observed(*observed) is False
-        db.refresh(claimed); assert claimed.status=='running' and claimed.lease_token==token_b
+        current=db.get(ImportJob,claimed.id); assert current.status=='running' and current.lease_token==token_b
 
 
 def test_worker_runtime_processes_pending_zip(tmp_path: Path):

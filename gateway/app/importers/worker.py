@@ -1,4 +1,5 @@
 from datetime import datetime, timezone, timedelta
+from dataclasses import dataclass
 import uuid
 from sqlalchemy import func, select, update
 from pathlib import Path
@@ -7,6 +8,20 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from ..archive.manifest import sync_manifest_from_archive_object
 from ..models import ArchiveObject, ImportJob
+
+
+@dataclass(frozen=True)
+class ClaimedJob:
+    """Commit-stable Worker claim data; accessing it can never issue SQL."""
+    job_id: uuid.UUID
+    lease_token: uuid.UUID
+    attempt_count: int
+    source_account_id: uuid.UUID
+    archive_object_id: uuid.UUID
+
+    @property
+    def id(self):
+        return self.job_id
 
 class ImportWorker:
     def __init__(self, db: Session): self.db = db
@@ -28,12 +43,24 @@ class ImportWorker:
         result = self.db.execute(update(ImportJob).where(ImportJob.id == job_id, ImportJob.status == "running", ImportJob.lease_token == token, ImportJob.lease_expires_at == expiry, ImportJob.lease_expires_at <= database_wall_clock()).values(**values))
         self.db.commit()
         return result.rowcount == 1
-    def claim_next(self, lease_duration: int = 300) -> ImportJob | None:
+    def claim_next(self, lease_duration: int = 300) -> ClaimedJob | None:
         job = self.db.scalar(select(ImportJob).where(ImportJob.status == "pending").order_by(ImportJob.created_at).limit(1).with_for_update(skip_locked=True))
         if job is None: return None
-        now = datetime.now(timezone.utc); job.status = "running"; job.started_at = job.started_at or now; job.first_started_at = job.first_started_at or now; job.last_attempt_started_at = now; job.attempt_count += 1; job.last_heartbeat_at = now; job.lease_expires_at = now + timedelta(seconds=lease_duration); job.lease_token = uuid.uuid4(); self.db.commit(); return job
+        now = datetime.now(timezone.utc)
+        token = uuid.uuid4()
+        job.status = "running"; job.started_at = job.started_at or now; job.first_started_at = job.first_started_at or now; job.last_attempt_started_at = now; job.attempt_count += 1; job.last_heartbeat_at = now; job.lease_expires_at = now + timedelta(seconds=lease_duration); job.lease_token = token
+        self.db.flush()
+        claimed = ClaimedJob(
+            job_id=job.id,
+            lease_token=token,
+            attempt_count=job.attempt_count,
+            source_account_id=job.source_account_id,
+            archive_object_id=job.archive_object_id,
+        )
+        self.db.commit()
+        return claimed
     def _owned(self, job, token, values: dict) -> bool:
-        job_id = job.id if isinstance(job, ImportJob) else job
+        job_id = getattr(job, "id", job)
         values = {k: (database_wall_clock() if k in {"last_heartbeat_at", "finished_at"} else v) for k, v in values.items()}
         with self._fresh_session() as lifecycle:
             result = lifecycle.execute(update(ImportJob).where(ownership_predicate(job_id, token)).values(**values))
@@ -51,7 +78,7 @@ class ImportWorker:
             raise LeaseLost("ownership_lost")
 
     def check_ownership(self, job, token) -> None:
-        job_id = job.id if isinstance(job, ImportJob) else job
+        job_id = getattr(job, "id", job)
         if token is None: raise LeaseRequired("lease_required")
         with self._fresh_session() as lifecycle:
             if lifecycle.scalar(select(ImportJob.id).where(ownership_predicate(job_id, token))) is None:

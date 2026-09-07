@@ -1,5 +1,6 @@
 import hashlib, json, shutil, zipfile
 from pathlib import Path
+from sqlalchemy.exc import SQLAlchemyError
 from .zip_staging import safe_extract, ZipLimits
 from .service import ImportService
 from .generic import ParserRegistry, ParserValidationError
@@ -70,6 +71,10 @@ class ImportProcessor:
             keep=True
             self.db.rollback()
             if not worker.mark_failed(job_id, token, exc.code, {'unknown':[{'type':exc.code,'detail':'no registered parser matched','severity':'error'}]}, exc.code): raise LeaseLost('ownership_lost')
+            raise
+        except SQLAlchemyError:
+            keep=True
+            self.db.rollback()
             raise
         except Exception as exc:
             keep=True
