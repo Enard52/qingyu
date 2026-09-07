@@ -2,10 +2,9 @@
 
 ## Scope and status
 
-This report covers Phase 3 P1, AUD-06 through AUD-16. The independent P1 re-audit
-closed AUD-06 through AUD-10 and AUD-12 through AUD-15. Its remaining findings,
-AUD-11 and AUD-16, are now `code_fixed / self_tested` and await a narrow final
-independent verification. AUD-17 and AUD-18 remain open and unchanged.
+Independent re-audit has closed AUD-01 through AUD-16. The remaining Phase 3
+items, AUD-17 and AUD-18, have now been repaired and are `code_fixed /
+self_tested`; they await an independent narrow re-audit.
 
 | Audit | Status | Commit | Migration |
 |---|---|---|---|
@@ -14,12 +13,14 @@ independent verification. AUD-17 and AUD-18 remain open and unchanged.
 | AUD-08 | CLOSED | `d908912` | none |
 | AUD-09 | CLOSED | `c108de4` | none |
 | AUD-10 | CLOSED | `0df8d88` | none |
-| AUD-11 | code_fixed / self_tested | `8f2015a`, `afb8cec` | none |
+| AUD-11 | CLOSED | `8f2015a`, `afb8cec` | none |
 | AUD-12 | CLOSED | `0f7c4b8` | none |
 | AUD-13 | CLOSED | `d908912` | none |
 | AUD-14 | CLOSED | `c108de4` | none |
 | AUD-15 | CLOSED | `a6385ce` | none |
-| AUD-16 | code_fixed / self_tested | `9c7e0c7`, `afb8cec` | none |
+| AUD-16 | CLOSED | `9c7e0c7`, `afb8cec` | none |
+| AUD-17 | code_fixed / self_tested | `6dd5648` | `0013_import_job_defaults` |
+| AUD-18 | code_fixed / self_tested | `a0063e1` | none |
 
 ## AUD-06 — stale recovery stale-read race
 
@@ -231,16 +232,57 @@ business writes or finalization.
 - Combined AUD-11/AUD-16 targeted suite: 18 passed. Existing fencing regression:
   14 passed. Commit: `afb8cec`. Migration: none.
 
+## AUD-17 — schema and database URL consistency
+
+- Current-head introspection reproduced six nullable mismatches on
+  `import_jobs`: the four result counters, `attempt_count`, and `max_attempts`.
+  The result counters also lacked database defaults.
+- Migration `0013_import_job_defaults` deterministically backfills NULL values,
+  sets NOT NULL, and establishes server defaults 0/3 while retaining application
+  defaults. Its downgrade restores the exact 0012 nullable/default contract.
+- Runtime engine and Alembic now resolve one Settings `DATABASE_URL` through
+  `app.database_config`. `alembic.ini` contains no independent database address.
+  Existing TEST_DATABASE_URL allowlisting and connected-database verification are
+  unchanged.
+- Schema tests inspect nullable/type/default, stable identity unique constraints,
+  ImportJob foreign keys, and the lease-token index. A disposable PostgreSQL
+  database migrates from empty to head, downgrades to 0012, and upgrades to head
+  again. Targeted result: 8 passed. Commit: `6dd5648`.
+- Historical migration 0003 remains unchanged. Its provenance-losing downgrade
+  is explicitly documented as destructive and unsupported for production in
+  `docs/Migration_Downgrade_Policy.md`.
+
+## AUD-18 — lifecycle-aware staging cleanup
+
+- Previous cleanup treated old mtime as sufficient and ArchiveService could
+  delete every top-level staging file without knowing whether an upload or Worker
+  was active.
+- Cleanup now accepts a database Session and recognizes strict
+  `job_id/attempt/lease_token` paths. Pending and running Jobs are always
+  `skipped_active`, including an expired running lease before stale recovery.
+  Completed/failed attempts and valid orphan attempts are deleted only after the
+  retention period. Recent paths, unowned/unsafe layouts, and failures are
+  reported separately.
+- Top-level upload files have no reliable database owner and are therefore
+  `skipped_unknown`; ArchiveService delegates to the same lifecycle-aware cleanup
+  instead of deleting them blindly. `protected_paths` remains optional extra
+  protection rather than the ownership source.
+- Real concurrency pauses Processor archive copy while cleanup runs; the active
+  attempt survives and the Job completes normally. Tests also cover pending,
+  valid/expired running leases, completed, failed, orphan, recent, unsafe Windows
+  layouts, deletion failure reporting, stale recovery, and retry attempt
+  isolation. Targeted result: 18 passed. Commit: `a0063e1`.
+
 ## Database, migration and validation safety
 
 - Destructive tests require TEST_DATABASE_URL and verify using a real connection
   that `current_database() = qingyu_test`; override-capable URL parameters are
   rejected. Pytest never uses the long-term `qingyu` database.
-- New Alembic head: `0012_import_identity_constraints`.
+- New Alembic head: `0013_import_job_defaults`.
 - `qingyu_test` was upgraded to the new head. The long-term `qingyu` database was
   not upgraded and is checked read-only; deployment awaits the controlled
   migration procedure.
-- Full suite: 92 passed.
+- Full suite: 100 passed.
 - Two unsuppressed third-party deprecations originate in FastAPI/Starlette
   TestClient and AnyIO compatibility.
 - P0 regression coverage remains green: database guard, account identity,

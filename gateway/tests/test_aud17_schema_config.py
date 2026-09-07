@@ -45,6 +45,8 @@ def _assert_import_job_contract(target_engine):
     foreign_keys={tuple(item['constrained_columns']):tuple(item['referred_columns']) for item in inspector.get_foreign_keys('import_jobs')}
     assert foreign_keys[('source_account_id',)]==('id',)
     assert foreign_keys[('archive_object_id',)]==('id',)
+    indexes={item['name']:tuple(item['column_names']) for item in inspector.get_indexes('import_jobs')}
+    assert indexes['ix_import_jobs_lease_token']==('lease_token',)
 
 
 def _run_alembic(url, *arguments):
