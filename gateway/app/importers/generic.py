@@ -1,3 +1,5 @@
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any, Iterator
 
@@ -42,6 +44,10 @@ class GenericTreeParser:
     }
     author_fields = {"role", "name", "metadata"}
     content_fields = {"content_type", "parts", "text", "metadata"}
+    attachment_fields = {
+        "id", "reference", "member_path", "filename", "media_type",
+        "size_bytes", "metadata",
+    }
 
     def can_parse(self, payload) -> bool:
         return isinstance(payload, dict) and payload.get("schema_marker") == self.marker and isinstance(payload.get("conversations"), list)
@@ -72,6 +78,7 @@ class GenericTreeParser:
             if not isinstance(mapping, dict):
                 self._error(errors, "invalid_mapping", f"{base}/mapping", "expected object")
                 continue
+            declared_node_ids = {}
             for node_id, node in mapping.items():
                 pointer = f"{base}/mapping/{pointer_escape(node_id)}"
                 if not isinstance(node, dict):
@@ -79,6 +86,25 @@ class GenericTreeParser:
                     continue
                 self._unknown_fields(node, self.node_fields, pointer, member, unknown)
                 self._optional_type(node, "id", str, errors, pointer)
+                declared_node_id = node.get("id")
+                if declared_node_id is not None:
+                    if declared_node_id != node_id:
+                        self._error(
+                            errors,
+                            "mapping_node_id_mismatch",
+                            f"{pointer}/id",
+                            "declared node id does not match mapping key",
+                        )
+                    previous = declared_node_ids.get(declared_node_id)
+                    if previous is not None:
+                        self._error(
+                            errors,
+                            "duplicate_node_id",
+                            f"{pointer}/id",
+                            f"node id already declared at {previous}",
+                        )
+                    else:
+                        declared_node_ids[declared_node_id] = f"{pointer}/id"
                 self._optional_type(node, "parent", str, errors, pointer)
                 self._optional_mapping(node, "metadata", errors, pointer)
                 self._string_list(node, "children", errors, pointer)
@@ -99,7 +125,7 @@ class GenericTreeParser:
         self._optional_scalar(message, "create_time", errors, base)
         self._optional_scalar(message, "update_time", errors, base)
         self._optional_mapping(message, "metadata", errors, base)
-        self._list_field(message, "attachments", errors, base)
+        self._validate_attachments(message, base, member, errors, unknown)
 
         author = message.get("author")
         if not isinstance(author, dict):
@@ -123,6 +149,50 @@ class GenericTreeParser:
         metadata = message.get("metadata")
         if isinstance(metadata, dict):
             self._optional_type(metadata, "model_slug", str, errors, f"{base}/metadata")
+
+    def _validate_attachments(self, message, base, member, errors, unknown):
+        attachments = message.get("attachments")
+        self._list_field(message, "attachments", errors, base)
+        if not isinstance(attachments, list):
+            return
+        named_keys = {}
+        anonymous_counts = {}
+        for index, attachment in enumerate(attachments):
+            pointer = f"{base}/attachments/{index}"
+            if not isinstance(attachment, dict):
+                self._error(errors, "invalid_attachment", pointer, "expected object")
+                continue
+            self._unknown_fields(attachment, self.attachment_fields, pointer, member, unknown)
+            for field in ("id", "reference", "member_path", "filename", "media_type"):
+                self._optional_type(attachment, field, str, errors, pointer)
+            self._optional_mapping(attachment, "metadata", errors, pointer)
+            size = attachment.get("size_bytes")
+            if "size_bytes" in attachment and size is not None and (
+                isinstance(size, bool) or not isinstance(size, int) or size < 0
+            ):
+                self._error(errors, "invalid_size_bytes", f"{pointer}/size_bytes", "expected non-negative integer or null")
+            try:
+                base_key, anonymous, _canonical = attachment_identity_components(attachment)
+            except ValueError as exc:
+                self._error(errors, str(exc), pointer, "attachment identity field is empty or invalid")
+                continue
+            if anonymous:
+                occurrence = anonymous_counts.get(base_key, 0) + 1
+                anonymous_counts[base_key] = occurrence
+                # Identical anonymous descriptors are distinct source declarations.
+                # Their occurrence suffix is stable under reordering among identical values.
+                stable_attachment_key(attachment, occurrence)
+            else:
+                previous = named_keys.get(base_key)
+                if previous is not None:
+                    self._error(
+                        errors,
+                        "duplicate_attachment_identity",
+                        pointer,
+                        f"stable attachment key already declared at {previous}",
+                    )
+                else:
+                    named_keys[base_key] = pointer
 
     @staticmethod
     def _error(errors, error_type, pointer, detail):
@@ -177,3 +247,84 @@ class ParserRegistry:
 
 
 def pointer_escape(value) -> str: return str(value).replace("~","~0").replace("/","~1")
+
+
+class JSONObjectPairs(list):
+    """Distinguish JSON objects from arrays while preserving duplicate keys."""
+
+
+def load_json_document(raw: str, member: str = "fixture.json"):
+    """Decode JSON without silently discarding duplicate object keys."""
+    decoded = json.loads(raw, object_pairs_hook=JSONObjectPairs)
+    errors = []
+
+    def normalize(value, pointer=""):
+        if isinstance(value, JSONObjectPairs):
+            result = {}
+            first_pointers = {}
+            for key, child in value:
+                child_pointer = f"{pointer}/{pointer_escape(key)}"
+                if key in result:
+                    errors.append({
+                        "type": "duplicate_json_key",
+                        "file": member,
+                        "raw_pointer": child_pointer,
+                        "detail": f"JSON object key already declared at {first_pointers[key]}",
+                    })
+                    continue
+                first_pointers[key] = child_pointer
+                result[key] = normalize(child, child_pointer)
+            return result
+        if isinstance(value, list):
+            return [normalize(child, f"{pointer}/{index}") for index, child in enumerate(value)]
+        return value
+
+    normalized = normalize(decoded)
+    if errors:
+        raise ParserValidationError(errors)
+    return normalized
+
+
+def canonical_attachment_descriptor(attachment: dict) -> str:
+    """Canonical source-declared fields only; excludes import-time observations."""
+    descriptor = {
+        field: attachment.get(field)
+        for field in sorted(GenericTreeParser.attachment_fields)
+        if field in attachment
+    }
+    if isinstance(descriptor.get("member_path"), str):
+        descriptor["member_path"] = descriptor["member_path"].replace("\\", "/")
+    return json.dumps(descriptor, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def attachment_identity_components(attachment: dict) -> tuple[str, bool, str]:
+    canonical = canonical_attachment_descriptor(attachment)
+    for field, prefix in (("id", "external"), ("reference", "reference"), ("member_path", "member")):
+        value = attachment.get(field)
+        if isinstance(value, str):
+            normalized = value.strip().replace("\\", "/") if field == "member_path" else value.strip()
+            if not normalized:
+                raise ValueError(f"invalid_attachment_{field}")
+            return f"{prefix}:{normalized}", False, canonical
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"descriptor:{digest}", True, canonical
+
+
+def stable_attachment_key(attachment: dict, occurrence: int = 1) -> str:
+    """Return a source-stable identity without using the attachment array index."""
+    base_key, anonymous, _canonical = attachment_identity_components(attachment)
+    return f"{base_key}:occurrence:{occurrence}" if anonymous else base_key
+
+
+def stable_attachment_keys(attachments: list[dict]) -> list[str]:
+    """Assign deterministic occurrence suffixes only to identical anonymous descriptors."""
+    counts = {}
+    keys = []
+    for attachment in attachments:
+        base_key, anonymous, _canonical = attachment_identity_components(attachment)
+        if anonymous:
+            counts[base_key] = counts.get(base_key, 0) + 1
+            keys.append(stable_attachment_key(attachment, counts[base_key]))
+        else:
+            keys.append(base_key)
+    return keys

@@ -1,9 +1,9 @@
-import hashlib, json, shutil, zipfile
+import hashlib, shutil, zipfile
 from pathlib import Path
 from sqlalchemy.exc import SQLAlchemyError
-from .zip_staging import safe_extract, ZipLimits
+from .zip_staging import safe_extract, ZipLimits, UnsupportedZipError
 from .service import ImportService
-from .generic import ParserRegistry, ParserValidationError
+from .generic import ParserRegistry, ParserValidationError, load_json_document
 from .worker import ImportWorker, LeaseLost
 from ..models import ArchiveObject
 
@@ -38,9 +38,9 @@ class ImportProcessor:
             unknown=[str(p.relative_to(extract_root)) for p in files if p.is_file() and p not in candidates]
             if not candidates: raise UnsupportedStructure('unsupported_structure')
             if len(candidates) != 1: raise UnsupportedStructure('ambiguous_structure')
-            payload=json.loads(candidates[0].read_text(encoding='utf-8')); detection,parser=ParserRegistry().detect(payload)
-            if detection != 'matched': raise UnsupportedStructure(detection)
             source_member = candidates[0].relative_to(extract_root).as_posix()
+            payload=load_json_document(candidates[0].read_text(encoding='utf-8'), source_member); detection,parser=ParserRegistry().detect(payload)
+            if detection != 'matched': raise UnsupportedStructure(detection)
             unknown_fields = parser.validate(payload, source_member)
             health_check()
             outcome=ImportService(self.db).import_fixture(payload, job.archive_object_id, job=job, lease_token=token, source_member=source_member, parser=parser, unknown_entries=unknown_fields, health_check=health_check)
@@ -66,6 +66,12 @@ class ImportProcessor:
             keep=True; self.db.rollback()
             report={'errors':[dict(item, severity='error') for item in exc.errors]}
             if not worker.mark_failed(job_id, token, 'parser_validation_error', report, 'parser_validation_error'): raise LeaseLost('ownership_lost')
+            raise
+        except UnsupportedZipError as exc:
+            keep=True
+            self.db.rollback()
+            report={'errors':[{'type':exc.code,'detail':'encrypted ZIP members are unsupported','severity':'error'}]}
+            if not worker.mark_failed(job_id, token, exc.code, report, exc.code): raise LeaseLost('ownership_lost')
             raise
         except UnsupportedStructure as exc:
             keep=True

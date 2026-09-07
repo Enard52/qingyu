@@ -16,6 +16,12 @@ class ZipLimits:
 class UnsafeZipError(ValueError): pass
 
 
+class UnsupportedZipError(ValueError):
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
 def _normalized_member(info):
     raw=info.filename
     if raw.startswith(("/","\\")) or re.match(r"^[A-Za-z]:",raw): raise UnsafeZipError("ZIP absolute/drive/UNC path")
@@ -39,6 +45,8 @@ def _prevalidate(archive, limits):
     if len(infos)>limits.max_files: raise UnsafeZipError("ZIP file count exceeded")
     seen={}; total=0; normalized=[]
     for info in infos:
+        if info.flag_bits & 0x1:
+            raise UnsupportedZipError("encrypted_zip_unsupported")
         name,key=_normalized_member(info)
         if key in seen: raise UnsafeZipError("ZIP duplicate or case-insensitive path collision")
         seen[key]=name; normalized.append((info,name,key))
