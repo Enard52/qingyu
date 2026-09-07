@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import DateTime, Integer, String, Text, UniqueConstraint, ForeignKey
+from sqlalchemy import DateTime, Integer, String, Text, UniqueConstraint, ForeignKey, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 from .db import Base
@@ -56,12 +56,12 @@ class ImportJob(Base):
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    discovered_count: Mapped[int] = mapped_column(Integer, default=0)
-    imported_count: Mapped[int] = mapped_column(Integer, default=0)
-    skipped_count: Mapped[int] = mapped_column(Integer, default=0)
-    failed_count: Mapped[int] = mapped_column(Integer, default=0)
-    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
-    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    discovered_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    imported_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    skipped_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3, server_default=text("3"))
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     lease_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
