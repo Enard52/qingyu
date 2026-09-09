@@ -13,3 +13,9 @@ The published historical migration is intentionally unchanged.
 Migration `0013_import_job_defaults` has a deterministic downgrade to
 the nullable/default contract established by `0005` and `0006`. It does not
 attempt to repair older destructive downgrade semantics.
+
+Migration `0015_attachment_observations` moves runtime attachment evidence into
+an immutable, attempt-scoped table. Its downgrade deterministically restores the
+legacy attachment columns from the latest observation for each attachment, but
+necessarily collapses multi-attempt history. The downgrade is therefore only
+supported for disposable development and migration-verification databases.

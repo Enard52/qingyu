@@ -82,7 +82,7 @@ class ImportService:
                         message = Message(conversation_id=conversation.id, external_message_id=item.node_id); self.db.add(message); self.db.flush(); report["messages"]["new"] += 1
                     else: report["messages"]["existing"] += 1
                     digest = compute_text_hash(item.content_text)
-                    fingerprint = compute_revision_fingerprint(role=item.role, content_text=item.content_text, content_json=item.content_json, model=item.model, raw_timestamp=item.raw_timestamp)
+                    fingerprint = compute_revision_fingerprint(role=item.role, content_text=item.content_text, content_json=item.content_json, model=item.model, raw_timestamp=item.raw_timestamp, attachments=item.attachments)
                     revision = self.db.scalar(select(MessageRevision).where(MessageRevision.message_id == message.id, MessageRevision.revision_fingerprint == fingerprint))
                     if revision is None:
                         latest = self.db.scalar(select(MessageRevision).where(MessageRevision.message_id == message.id).order_by(MessageRevision.revision_no.desc()))

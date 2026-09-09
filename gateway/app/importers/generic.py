@@ -11,6 +11,20 @@ class ParserValidationError(ValueError):
 
 
 @dataclass(frozen=True)
+class ParsedAttachment:
+    stable_attachment_key: str
+    external_attachment_id: str | None
+    original_reference: str | None
+    member_path: str | None
+    filename: str | None
+    media_type: str | None
+    size_bytes: int | None
+    metadata: Any
+    descriptor_json: dict[str, Any]
+    raw_json_pointer: str
+
+
+@dataclass(frozen=True)
 class ParsedMessage:
     node_id: str
     parent_node_id: str | None
@@ -20,6 +34,9 @@ class ParsedMessage:
     model: str | None
     raw_timestamp: str | None
     branch_key: str | None
+    # Keep this last, with a default, so existing positional construction remains
+    # compatible with the pre-attachment parser contract.
+    attachments: tuple[ParsedAttachment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -227,12 +244,23 @@ class GenericTreeParser:
 
     def parse(self, payload: dict[str, Any]) -> Iterator[ParsedConversation]:
         self.validate(payload)
-        for conversation in payload["conversations"]:
+        for conversation_index, conversation in enumerate(payload["conversations"]):
             nodes=[]
             for node_id,node in conversation["mapping"].items():
                 message=node["message"]; author=message.get("author") or {}; content=message.get("content") or {}; parts=content.get("parts")
                 text="\n".join(str(part) for part in parts) if isinstance(parts,list) else (str(content) if content else None)
-                nodes.append(ParsedMessage(str(node_id),node.get("parent"),str(author.get("role","unknown")),text,content,(message.get("metadata") or {}).get("model_slug"),str(message.get("create_time")) if message.get("create_time") is not None else None,None))
+                raw_attachments = message.get("attachments") or []
+                attachment_keys = stable_attachment_keys(raw_attachments)
+                node_pointer = f"/conversations/{conversation_index}/mapping/{pointer_escape(node_id)}/message"
+                attachments = tuple(
+                    parsed_attachment(
+                        attachment,
+                        stable_key=attachment_keys[index],
+                        raw_json_pointer=f"{node_pointer}/attachments/{index}",
+                    )
+                    for index, attachment in enumerate(raw_attachments)
+                )
+                nodes.append(ParsedMessage(str(node_id),node.get("parent"),str(author.get("role","unknown")),text,content,(message.get("metadata") or {}).get("model_slug"),str(message.get("create_time")) if message.get("create_time") is not None else None,None,attachments))
             yield ParsedConversation(conversation.get("id"),conversation.get("title"),tuple(nodes),conversation.get("current_node"))
 
 
@@ -292,9 +320,35 @@ def canonical_attachment_descriptor(attachment: dict) -> str:
         for field in sorted(GenericTreeParser.attachment_fields)
         if field in attachment
     }
+    if isinstance(descriptor.get("id"), str):
+        descriptor["id"] = descriptor["id"].strip()
+    if isinstance(descriptor.get("reference"), str):
+        descriptor["reference"] = normalize_attachment_reference(descriptor["reference"])
     if isinstance(descriptor.get("member_path"), str):
-        descriptor["member_path"] = descriptor["member_path"].replace("\\", "/")
+        descriptor["member_path"] = normalize_attachment_member_path(descriptor["member_path"])
     return json.dumps(descriptor, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def normalize_attachment_reference(value: str) -> str:
+    """Normalize a declared reference without applying URL-unsafe path folding."""
+    return value.strip().replace("\\", "/")
+
+
+def normalize_attachment_member_path(value: str) -> str:
+    """Return a safe relative ZIP member path with deterministic separators."""
+    raw = value.strip().replace("\\", "/")
+    if raw.startswith("/") or ":" in raw:
+        raise ValueError("invalid_attachment_member_path")
+    parts = []
+    for part in raw.split("/"):
+        if not part or part == ".":
+            continue
+        if part == "..":
+            raise ValueError("invalid_attachment_member_path")
+        parts.append(part)
+    if not parts:
+        raise ValueError("invalid_attachment_member_path")
+    return "/".join(parts)
 
 
 def attachment_identity_components(attachment: dict) -> tuple[str, bool, str]:
@@ -302,7 +356,12 @@ def attachment_identity_components(attachment: dict) -> tuple[str, bool, str]:
     for field, prefix in (("id", "external"), ("reference", "reference"), ("member_path", "member")):
         value = attachment.get(field)
         if isinstance(value, str):
-            normalized = value.strip().replace("\\", "/") if field == "member_path" else value.strip()
+            if field == "reference":
+                normalized = normalize_attachment_reference(value)
+            elif field == "member_path":
+                normalized = normalize_attachment_member_path(value)
+            else:
+                normalized = value.strip()
             if not normalized:
                 raise ValueError(f"invalid_attachment_{field}")
             return f"{prefix}:{normalized}", False, canonical
@@ -328,3 +387,31 @@ def stable_attachment_keys(attachments: list[dict]) -> list[str]:
         else:
             keys.append(base_key)
     return keys
+
+
+def parsed_attachment(attachment: dict, *, stable_key: str, raw_json_pointer: str) -> ParsedAttachment:
+    """Split stable source declarations from attempt-scoped raw provenance."""
+    return ParsedAttachment(
+        stable_attachment_key=stable_key,
+        external_attachment_id=(
+            attachment["id"].strip()
+            if isinstance(attachment.get("id"), str)
+            else None
+        ),
+        original_reference=(
+            normalize_attachment_reference(attachment["reference"])
+            if isinstance(attachment.get("reference"), str)
+            else None
+        ),
+        member_path=(
+            normalize_attachment_member_path(attachment["member_path"])
+            if isinstance(attachment.get("member_path"), str)
+            else None
+        ),
+        filename=attachment.get("filename"),
+        media_type=attachment.get("media_type"),
+        size_bytes=attachment.get("size_bytes"),
+        metadata=attachment.get("metadata"),
+        descriptor_json=json.loads(canonical_attachment_descriptor(attachment)),
+        raw_json_pointer=raw_json_pointer,
+    )

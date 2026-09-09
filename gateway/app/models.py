@@ -160,17 +160,67 @@ class MessageObservation(Base):
 
 class Attachment(Base):
     __tablename__ = "attachments"
+    __table_args__ = (
+        UniqueConstraint(
+            "message_revision_id",
+            "stable_attachment_key",
+            name="uq_attachments_revision_stable_key",
+        ),
+        CheckConstraint("length(btrim(stable_attachment_key)) > 0", name="ck_attachments_stable_key_not_blank"),
+        CheckConstraint("size_bytes IS NULL OR size_bytes >= 0", name="ck_attachments_size_nonnegative"),
+    )
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    message_revision_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("message_revisions.id"), nullable=False)
-    archive_object_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("archive_objects.id"), nullable=True)
+    message_revision_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("message_revisions.id"), nullable=False, index=True)
+    stable_attachment_key: Mapped[str] = mapped_column(Text, nullable=False)
     external_attachment_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     original_reference: Mapped[str | None] = mapped_column(Text, nullable=True)
     filename: Mapped[str | None] = mapped_column(Text, nullable=True)
     media_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
     size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    availability_status: Mapped[str] = mapped_column(String(32), nullable=False, default="referenced_only")
-    metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
+    descriptor_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
+
+class AttachmentObservation(Base):
+    __tablename__ = "attachment_observations"
+    __table_args__ = (
+        UniqueConstraint(
+            "import_job_id",
+            "attempt_number",
+            "attachment_id",
+            name="uq_attachment_observations_job_attempt_attachment",
+        ),
+        CheckConstraint("attempt_number > 0", name="ck_attachment_observations_attempt_positive"),
+        CheckConstraint(
+            "availability IN ('available','missing','referenced_only','failed')",
+            name="ck_attachment_observations_availability",
+        ),
+        CheckConstraint(
+            "observed_size_bytes IS NULL OR observed_size_bytes >= 0",
+            name="ck_attachment_observations_size_nonnegative",
+        ),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    import_job_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("import_jobs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    attachment_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("attachments.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    availability: Mapped[str] = mapped_column(String(32), nullable=False)
+    archive_object_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("archive_objects.id"), nullable=True, index=True
+    )
+    source_member: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attachment_member_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw_json_pointer: Mapped[str | None] = mapped_column(Text, nullable=True)
+    observed_filename: Mapped[str | None] = mapped_column(Text, nullable=True)
+    observed_media_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    observed_size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
 
 
