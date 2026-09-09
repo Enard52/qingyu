@@ -1,13 +1,15 @@
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
+import copy
 import uuid
-from sqlalchemy import exists, func, or_, select, update
+from sqlalchemy import and_, exists, func, or_, select, update
 from pathlib import Path
 
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..archive.manifest import sync_manifest_from_archive_object
 from ..models import ArchiveObject, AttachmentObservation, ImportBatchCommit, ImportJob
+from .report import empty_report
 from .status import COMPLETED, FAILED, PARTIAL, PENDING, RETRYABLE_STATUSES, RUNNING
 
 
@@ -23,6 +25,17 @@ class ClaimedJob:
     @property
     def id(self):
         return self.job_id
+
+
+@dataclass(frozen=True)
+class DurableJobState:
+    batches: tuple[ImportBatchCommit, ...]
+    counts: dict
+    report: dict
+
+
+class DurableLedgerInconsistent(RuntimeError):
+    pass
 
 class ImportWorker:
     def __init__(self, db: Session): self.db = db
@@ -60,24 +73,20 @@ class ImportWorker:
                     owned.error_summary = "retry_after_stale: lease_expired"
                     return True
 
-                batches = lifecycle.scalars(
-                    select(ImportBatchCommit)
-                    .where(ImportBatchCommit.import_job_id == job_id)
-                    .order_by(ImportBatchCommit.sequence_no)
-                ).all()
-                terminal, durable_counts, terminal_report = durable_terminal_state(
-                    batches, owned.report_json
+                snapshot = aggregate_durable_job_state(
+                    lifecycle,
+                    job_id,
+                    owned.attempt_count,
+                    terminal_report=owned.report_json,
                 )
-                _overlay_attachment_truth(
-                    lifecycle, terminal_report, job_id, owned.attempt_count
-                )
+                terminal = PARTIAL if snapshot.batches else FAILED
                 owned.status = terminal
                 owned.result_code = terminal
                 owned.error_code = "lease_expired"
                 owned.finished_at = database_wall_clock()
                 owned.error_summary = "worker_crash: lease_expired"
-                owned.report_json = terminal_report
-                apply_durable_counts(owned, batches, durable_counts)
+                owned.report_json = snapshot.report
+                apply_durable_counts(owned, snapshot)
                 return True
     def claim_next(self, lease_duration: int = 300) -> ClaimedJob | None:
         job = self.db.scalar(
@@ -171,10 +180,55 @@ class ImportWorker:
             raise ValueError("invalid_checkpoint_sequence")
         return self.advance_checkpoint(job, token, sequence, checkpoint.get("last_batch_key", ""))
     def mark_completed(self, job, token, report: dict | None = None, result_code: str = "imported", counts: dict | None = None) -> bool:
-        values = {"status": COMPLETED, "finished_at": database_wall_clock(), "report_json": report or {}, "result_code": result_code, "lease_token": None, "lease_expires_at": None}
-        values.update(counts or {})
-        return self._owned(job, token, values)
-    def mark_failed(self, job, token, error: str, report: dict | None = None, result_code: str | None = None) -> bool: return self._owned(job, token, {"status": FAILED, "finished_at": database_wall_clock(), "error_summary": error, "report_json": report or {}, "error_code": error, "result_code": result_code or FAILED, "lease_token": None, "lease_expires_at": None})
+        job_id = getattr(job, "id", job)
+        with self._fresh_session() as lifecycle:
+            with lifecycle.begin():
+                owned = lifecycle.scalar(select(ImportJob).where(ownership_predicate(job_id, token)).with_for_update())
+                if owned is None:
+                    return False
+                snapshot = aggregate_durable_job_state(
+                    lifecycle, job_id, owned.attempt_count, terminal_report=report
+                )
+                owned.status = COMPLETED
+                owned.finished_at = database_wall_clock()
+                owned.report_json = snapshot.report
+                owned.result_code = result_code
+                owned.lease_token = None
+                owned.lease_expires_at = None
+                if snapshot.batches:
+                    apply_durable_counts(owned, snapshot)
+                else:
+                    for key, value in (counts or {}).items():
+                        if key in snapshot.counts and value != snapshot.counts[key]:
+                            raise DurableLedgerInconsistent("inconsistent_terminal_counts")
+                    apply_durable_counts(owned, snapshot)
+        return True
+    def mark_failed(self, job, token, error: str, report: dict | None = None, result_code: str | None = None) -> bool:
+        job_id = getattr(job, "id", job)
+        with self._fresh_session() as lifecycle:
+            with lifecycle.begin():
+                owned = lifecycle.scalar(
+                    select(ImportJob).where(ownership_predicate(job_id, token)).with_for_update()
+                )
+                if owned is None:
+                    return False
+                snapshot = aggregate_durable_job_state(
+                    lifecycle,
+                    job_id,
+                    owned.attempt_count,
+                    terminal_report=report,
+                )
+                terminal = PARTIAL if snapshot.batches else FAILED
+                owned.status = terminal
+                owned.finished_at = database_wall_clock()
+                owned.error_summary = error
+                owned.report_json = snapshot.report
+                owned.error_code = error
+                owned.result_code = result_code or terminal
+                owned.lease_token = None
+                owned.lease_expires_at = None
+                apply_durable_counts(owned, snapshot)
+        return True
 
     def mark_failed_or_partial(self, job, token, error: str, report: dict | None = None, result_code: str | None = None) -> str:
         job_id = getattr(job, "id", job)
@@ -183,24 +237,22 @@ class ImportWorker:
                 owned = lifecycle.scalar(select(ImportJob).where(ownership_predicate(job_id, token)).with_for_update())
                 if owned is None:
                     raise LeaseLost("ownership_lost")
-                batches = lifecycle.scalars(
-                    select(ImportBatchCommit)
-                    .where(ImportBatchCommit.import_job_id == job_id)
-                    .order_by(ImportBatchCommit.sequence_no)
-                ).all()
-                terminal, durable_counts, terminal_report = durable_terminal_state(batches, report)
-                _overlay_attachment_truth(
-                    lifecycle, terminal_report, job_id, owned.attempt_count
+                snapshot = aggregate_durable_job_state(
+                    lifecycle,
+                    job_id,
+                    owned.attempt_count,
+                    terminal_report=report,
                 )
+                terminal = PARTIAL if snapshot.batches else FAILED
                 owned.status = terminal
                 owned.finished_at = database_wall_clock()
                 owned.error_summary = error
-                owned.report_json = terminal_report
+                owned.report_json = snapshot.report
                 owned.error_code = error
                 owned.result_code = result_code or terminal
                 owned.lease_token = None
                 owned.lease_expires_at = None
-                apply_durable_counts(owned, batches, durable_counts)
+                apply_durable_counts(owned, snapshot)
         return terminal
 
     def retry(
@@ -209,6 +261,13 @@ class ImportWorker:
         expected_parser_name: str | None = None,
         expected_parser_version: str | None = None,
     ) -> bool:
+        if (expected_parser_name is None) != (expected_parser_version is None):
+            raise ValueError("parser identity must include both name and version")
+        ledger_exists = exists(
+            select(ImportBatchCommit.id).where(
+                ImportBatchCommit.import_job_id == ImportJob.id
+            )
+        )
         retry_conditions = [
             ImportJob.id == job_id,
             ImportJob.status.in_(RETRYABLE_STATUSES),
@@ -223,26 +282,67 @@ class ImportWorker:
                 )
             ),
         ]
-        if expected_parser_name is not None:
-            retry_conditions.append(
-                or_(ImportJob.status != PARTIAL, ImportJob.parser_name == expected_parser_name)
+        if expected_parser_name is None:
+            # A direct caller cannot bypass parser pinning for any partial
+            # replay, even if its ledger is unexpectedly empty.
+            retry_conditions.extend((~ledger_exists, ImportJob.status != PARTIAL))
+        else:
+            matching_ledger = exists(
+                select(ImportBatchCommit.id).where(
+                    ImportBatchCommit.import_job_id == ImportJob.id,
+                    ImportBatchCommit.parser_name == expected_parser_name,
+                    ImportBatchCommit.contract_version == expected_parser_version,
+                )
             )
-        if expected_parser_version is not None:
+            conflicting_ledger = exists(
+                select(ImportBatchCommit.id).where(
+                    ImportBatchCommit.import_job_id == ImportJob.id,
+                    or_(
+                        ImportBatchCommit.parser_name != expected_parser_name,
+                        ImportBatchCommit.contract_version != expected_parser_version,
+                    ),
+                )
+            )
             retry_conditions.append(
-                or_(ImportJob.status != PARTIAL, ImportJob.parser_version == expected_parser_version)
+                or_(
+                    and_(
+                        ~ledger_exists,
+                        or_(
+                            ImportJob.status != PARTIAL,
+                            and_(
+                                ImportJob.parser_name == expected_parser_name,
+                                ImportJob.parser_version == expected_parser_version,
+                            ),
+                        ),
+                    ),
+                    and_(
+                        ImportJob.parser_name == expected_parser_name,
+                        ImportJob.parser_version == expected_parser_version,
+                        matching_ledger,
+                        ~conflicting_ledger,
+                    ),
+                )
+            )
+        values = dict(
+            status=PENDING,
+            result_code=None,
+            error_code=None,
+            error_summary=None,
+            finished_at=None,
+            lease_expires_at=None,
+        )
+        if expected_parser_name is not None:
+            # Ledger-free failed jobs adopt the parser selected by preflight;
+            # durable jobs simply re-assert their already-pinned identity.
+            values.update(
+                parser_name=expected_parser_name,
+                parser_version=expected_parser_version,
             )
         with self._fresh_session() as lifecycle:
             result = lifecycle.execute(
                 update(ImportJob)
                 .where(*retry_conditions)
-                .values(
-                    status=PENDING,
-                    result_code=None,
-                    error_code=None,
-                    error_summary=None,
-                    finished_at=None,
-                    lease_expires_at=None,
-                )
+                .values(**values)
             )
             if result.rowcount != 1:
                 lifecycle.rollback()
@@ -279,14 +379,22 @@ class ImportWorker:
                 archive.integrity_status = "integrity_failure"
                 archive.integrity_error = integrity_error
                 archive.integrity_checked_at = database_wall_clock()
-                owned_job.status = FAILED
+                snapshot = aggregate_durable_job_state(
+                    lifecycle,
+                    job_id,
+                    owned_job.attempt_count,
+                    terminal_report=report,
+                )
+                terminal = PARTIAL if snapshot.batches else FAILED
+                owned_job.status = terminal
                 owned_job.result_code = "archive_integrity_failure"
                 owned_job.error_code = "archive_integrity_failure"
                 owned_job.error_summary = "archive_integrity_failure"
-                owned_job.report_json = report
+                owned_job.report_json = snapshot.report
                 owned_job.finished_at = database_wall_clock()
                 owned_job.lease_token = None
                 owned_job.lease_expires_at = None
+                apply_durable_counts(owned_job, snapshot)
 
             archive = lifecycle.get(ArchiveObject, archive_object_id)
             lifecycle.refresh(archive)
@@ -332,27 +440,184 @@ def _overlay_attachment_truth(session, report, job_id, attempt_number) -> None:
     report["attachments"] = counts
 
 
-def durable_terminal_state(batches, report):
-    terminal = PARTIAL if batches else FAILED
-    durable_counts = {
-        key: sum(int(batch.counts_delta.get(key, 0)) for batch in batches)
-        for key in ("discovered_count", "imported_count", "skipped_count", "failed_count")
-    }
-    terminal_report = dict(report or {})
+def aggregate_durable_job_state(
+    session: Session,
+    job_id,
+    attempt_number: int,
+    *,
+    terminal_report: dict | None = None,
+) -> DurableJobState:
+    """Build the one authoritative summary from ordered committed evidence."""
+    batches = tuple(
+        session.scalars(
+            select(ImportBatchCommit)
+            .where(ImportBatchCommit.import_job_id == job_id)
+            .order_by(ImportBatchCommit.sequence_no, ImportBatchCommit.id)
+        ).all()
+    )
+    numeric_sections = ("conversations", "messages", "revisions")
+    list_sections = ("tree_anomalies", "unknown", "errors")
     if batches:
-        terminal_report["durable_batches"] = len(batches)
-        terminal_report["durable_counts"] = durable_counts
-    return terminal, durable_counts, terminal_report
+        identities = {(batch.parser_name, batch.contract_version) for batch in batches}
+        if len(identities) != 1:
+            raise DurableLedgerInconsistent("conflicting_durable_parser_identity")
+        parser_name, parser_version = next(iter(identities))
+        first_delta = _validate_durable_report_delta(batches[0])
+        parser = first_delta["parser"]
+        report = empty_report(
+            parser_name,
+            parser_version,
+            parser.get("detection", "matched"),
+        )
+    else:
+        supplied_parser = (terminal_report or {}).get("parser", {})
+        report = empty_report(
+            supplied_parser.get("name", ""),
+            supplied_parser.get("version", ""),
+            supplied_parser.get("detection", ""),
+        )
 
+    for batch in batches:
+        delta = _validate_durable_report_delta(batch)
+        expected_counts = _counts_from_report_delta(delta)
+        raw_counts = batch.counts_delta
+        if not isinstance(raw_counts, dict):
+            raise DurableLedgerInconsistent("invalid_durable_counts_delta")
+        actual_counts = {}
+        for key in expected_counts:
+            value = raw_counts.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise DurableLedgerInconsistent("invalid_durable_counts_delta")
+            actual_counts[key] = value
+        if actual_counts != expected_counts:
+            raise DurableLedgerInconsistent("inconsistent_durable_batch_counts")
+        for section in numeric_sections:
+            for key in report[section]:
+                report[section][key] += int(delta.get(section, {}).get(key, 0))
+        # Attachment deltas are deliberately excluded: retry history is not truth.
+        for section in list_sections:
+            report[section].extend(copy.deepcopy(delta.get(section, [])))
 
-def apply_durable_counts(job, batches, durable_counts):
+    supplied = terminal_report or {}
+    if not isinstance(supplied, dict):
+        supplied = {}
     if not batches:
-        return
-    job.discovered_count = durable_counts["discovered_count"]
-    job.imported_count = durable_counts["imported_count"]
-    job.skipped_count = durable_counts["skipped_count"]
-    job.failed_count = durable_counts["failed_count"]
-    job.items_discovered = durable_counts["discovered_count"]
-    job.items_imported = durable_counts["imported_count"]
-    job.items_skipped = durable_counts["skipped_count"]
-    job.items_failed = durable_counts["failed_count"]
+        for section in (*numeric_sections, "attachments"):
+            values = supplied.get(section)
+            if not isinstance(values, dict):
+                continue
+            for key in report[section]:
+                value = values.get(key, 0)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise DurableLedgerInconsistent("invalid_terminal_report")
+                report[section][key] = value
+    # Preserve terminal diagnostics and non-summary metadata without allowing a
+    # live/rolled-back report to overwrite committed ledger truth.
+    overlay_sections = ("errors",) if batches else list_sections
+    for section in overlay_sections:
+        for item in supplied.get(section, []):
+            if item not in report[section]:
+                report[section].append(copy.deepcopy(item))
+    if batches:
+        for item in supplied.get("unknown", []):
+            sanitized = _sanitize_terminal_unknown(item)
+            if sanitized is not None and sanitized not in report["unknown"]:
+                report["unknown"].append(sanitized)
+    protected = {"parser", *numeric_sections, "attachments", *list_sections,
+                 "items", "imported_messages", "imported_conversations",
+                 "durable_batches", "durable_counts"}
+    for key, value in supplied.items():
+        if key not in protected:
+            report[key] = copy.deepcopy(value)
+
+    counts = (
+        {
+            key: sum(int(batch.counts_delta[key]) for batch in batches)
+            for key in ("discovered_count", "imported_count", "skipped_count", "failed_count")
+        }
+        if batches
+        else _counts_from_report_delta(report)
+    )
+    _overlay_attachment_truth(session, report, job_id, attempt_number)
+    report["items"] = {
+        "conversations": sum(report["conversations"].values()),
+        "messages": sum(report["messages"].values()),
+    }
+    report["imported_messages"] = report["messages"]["new"]
+    report["imported_conversations"] = report["conversations"]["new"]
+    if batches:
+        report["durable_batches"] = len(batches)
+        report["durable_counts"] = counts
+    return DurableJobState(batches=batches, counts=counts, report=report)
+
+
+def _counts_from_report_delta(delta: dict) -> dict[str, int]:
+    messages = delta.get("messages", {})
+    normalized = {}
+    for key in ("new", "existing", "changed", "skipped", "failed"):
+        value = messages.get(key, 0)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise DurableLedgerInconsistent("invalid_durable_report_delta")
+        normalized[key] = value
+    return {
+        "discovered_count": sum(normalized.values()),
+        "imported_count": normalized["new"],
+        "skipped_count": normalized["existing"] + normalized["skipped"],
+        "failed_count": normalized["failed"],
+    }
+
+
+def _validate_durable_report_delta(batch: ImportBatchCommit) -> dict:
+    delta = batch.report_delta
+    if not isinstance(delta, dict):
+        raise DurableLedgerInconsistent("invalid_durable_report_delta")
+    parser = delta.get("parser")
+    if not isinstance(parser, dict) or (
+        parser.get("name"), parser.get("version")
+    ) != (batch.parser_name, batch.contract_version):
+        raise DurableLedgerInconsistent("inconsistent_durable_parser_identity")
+    if not isinstance(parser.get("detection", "matched"), str):
+        raise DurableLedgerInconsistent("invalid_durable_report_delta")
+    section_keys = {
+        "conversations": ("new", "existing", "changed", "skipped", "failed"),
+        "messages": ("new", "existing", "changed", "skipped", "failed"),
+        "revisions": ("new", "existing"),
+    }
+    for section, keys in section_keys.items():
+        values = delta.get(section)
+        if not isinstance(values, dict):
+            raise DurableLedgerInconsistent("invalid_durable_report_delta")
+        for key in keys:
+            value = values.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise DurableLedgerInconsistent("invalid_durable_report_delta")
+    for section in ("tree_anomalies", "unknown", "errors"):
+        if not isinstance(delta.get(section), list):
+            raise DurableLedgerInconsistent("invalid_durable_report_delta")
+    return delta
+
+
+def _sanitize_terminal_unknown(item) -> dict | None:
+    """Keep safe diagnostic text, never terminal summary or arbitrary metadata."""
+    if not isinstance(item, dict) or not isinstance(item.get("type"), str):
+        return None
+    sanitized = {"type": item["type"]}
+    for key in ("detail", "raw_pointer", "file", "field"):
+        value = item.get(key)
+        if isinstance(value, str):
+            sanitized[key] = value
+    severity = item.get("severity")
+    if severity in {"info", "warning", "error"}:
+        sanitized["severity"] = severity
+    return sanitized
+
+
+def apply_durable_counts(job, snapshot: DurableJobState):
+    job.discovered_count = snapshot.counts["discovered_count"]
+    job.imported_count = snapshot.counts["imported_count"]
+    job.skipped_count = snapshot.counts["skipped_count"]
+    job.failed_count = snapshot.counts["failed_count"]
+    job.items_discovered = snapshot.counts["discovered_count"]
+    job.items_imported = snapshot.counts["imported_count"]
+    job.items_skipped = snapshot.counts["skipped_count"]
+    job.items_failed = snapshot.counts["failed_count"]

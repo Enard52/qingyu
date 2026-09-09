@@ -46,9 +46,9 @@ class ImportService:
         archive_object_id = archive.id
         account_id = account.id
         archive_sha256 = archive.sha256
-        report = empty_report(GenericTreeParser.name, GenericTreeParser.version, "matched")
-        report["unknown"].extend(unknown_entries or [])
         parser = parser or GenericTreeParser()
+        report = empty_report(parser.name, parser.version, "matched")
+        initial_unknown = copy.deepcopy(unknown_entries or [])
         parsed_conversations = (
             tuple(parsed_conversations)
             if parsed_conversations is not None
@@ -81,6 +81,13 @@ class ImportService:
                     _merge_report(report, existing_batch.report_delta, include_attachments=False)
 
                 before = copy.deepcopy(report)
+                if existing_batch is None:
+                    # Parser-level warnings become part of the first newly
+                    # durable batch so crash/retry reconstruction cannot lose
+                    # warnings first observed on a later attempt.
+                    for item in initial_unknown:
+                        if item not in report["unknown"]:
+                            report["unknown"].append(copy.deepcopy(item))
                 if synthetic and existing_batch is None:
                     report["unknown"].append({"type": "missing_external_conversation_id", "severity": "warning", "conversation_identity": external_id, "detail": "generated deterministic synthetic identity", "archive_object_id": str(archive_object_id), "zip_member": source_member, "raw_pointer": f"/conversations/{conv_index}"})
                 conversation = self.db.scalar(select(Conversation).where(Conversation.source_account_id == account_id, Conversation.external_conversation_id == external_id))
@@ -173,6 +180,11 @@ class ImportService:
                     raise LeaseLost("ownership_lost")
                 if batch_has_failed_attachment:
                     break
+            # All-existing replays create no new ledger row. Preserve warnings
+            # rediscovered by the current parser for terminal overlay.
+            for item in initial_unknown:
+                if item not in report["unknown"]:
+                    report["unknown"].append(copy.deepcopy(item))
             report["attachments"] = self._attachment_counts(job.id, attempt_number)
             report["items"] = {"conversations": sum(report["conversations"].values()), "messages": sum(report["messages"].values())}
             counts = {"items_discovered": report["items"]["messages"], "items_imported": report["messages"]["new"], "discovered_count": report["items"]["messages"], "imported_count": report["messages"]["new"], "skipped_count": report["messages"]["existing"], "failed_count": report["messages"]["failed"]}

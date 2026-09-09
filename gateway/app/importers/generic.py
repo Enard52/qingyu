@@ -265,7 +265,12 @@ class GenericTreeParser:
 
 
 class ParserRegistry:
-    def __init__(self, parsers=None): self.parsers=list(parsers or [GenericTreeParser()])
+    def __init__(self, parsers=None):
+        self.parsers = list([GenericTreeParser()] if parsers is None else parsers)
+    def resolve(self, name: str, version: str):
+        """Resolve one exact installed parser contract without fallback."""
+        matches = [parser for parser in self.parsers if parser.name == name and parser.version == version]
+        return matches[0] if len(matches) == 1 else None
     def detect(self, payload) -> tuple[str, Any]:
         if not isinstance(payload,dict): return "unsupported_structure",None
         matches=[parser for parser in self.parsers if parser.can_parse(payload)]

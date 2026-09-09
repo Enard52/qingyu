@@ -6,6 +6,7 @@ from .status import PARTIAL
 
 ARCHIVE_INTEGRITY_FAILURE = "archive_integrity_failure"
 PARSER_CONTRACT_UNAVAILABLE = "parser_contract_unavailable"
+PARSER_CONTRACT_CONFLICT = "parser_contract_conflict"
 
 
 def supported_parser_identities(registry: ParserRegistry | None = None) -> frozenset[tuple[str, str]]:
@@ -44,3 +45,21 @@ def committed_parser_block_reason(
     if any(identity not in supported for identity in identities):
         return PARSER_CONTRACT_UNAVAILABLE
     return None
+
+
+def resolve_durable_parser_contract(job, identities, *, registry: ParserRegistry | None = None):
+    """Resolve the one parser contract proven by durable ledger rows."""
+    active = registry or ParserRegistry()
+    distinct = set(identities)
+    if not distinct:
+        return None, None
+    if len(distinct) != 1:
+        return None, PARSER_CONTRACT_CONFLICT
+    identity = next(iter(distinct))
+    job_identity = (getattr(job, "parser_name", None), getattr(job, "parser_version", None))
+    if identity != job_identity:
+        return None, PARSER_CONTRACT_CONFLICT
+    parser = active.resolve(*identity)
+    if parser is None:
+        return None, PARSER_CONTRACT_UNAVAILABLE
+    return parser, None

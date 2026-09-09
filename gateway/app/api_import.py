@@ -8,9 +8,10 @@ from sqlalchemy.orm import Session
 from .auth import require_token
 from .config import get_settings
 from .db import get_db
-from .models import ArchiveObservation, ImportJob, SourceAccount
+from .models import ArchiveObservation, ImportBatchCommit, ImportJob, SourceAccount
 from .archive.service import ArchiveService
-from .importers.generic import GenericTreeParser
+from .importers.generic import GenericTreeParser, ParserRegistry
+from .importers.retry_policy import resolve_durable_parser_contract
 from .importers.status import PENDING
 from .importers.worker import ImportWorker
 
@@ -69,11 +70,23 @@ def retry_import_job(job_id: uuid.UUID, db: Session = Depends(get_db)) -> dict:
     job = db.get(ImportJob, job_id)
     if job is None:
         raise HTTPException(404, "Import Job not found")
+    identities = db.execute(
+        select(ImportBatchCommit.parser_name, ImportBatchCommit.contract_version)
+        .where(ImportBatchCommit.import_job_id == job_id)
+        .distinct()
+    ).all()
+    registry = ParserRegistry()
+    pinned_parser, block_reason = resolve_durable_parser_contract(job, identities, registry=registry)
+    if block_reason is not None:
+        db.rollback()
+        raise HTTPException(409, block_reason)
+    expected_name = pinned_parser.name if pinned_parser is not None else GenericTreeParser.name
+    expected_version = pinned_parser.version if pinned_parser is not None else GenericTreeParser.version
     db.rollback()
     if not ImportWorker(db).retry(
         job_id,
-        expected_parser_name=GenericTreeParser.name,
-        expected_parser_version=GenericTreeParser.version,
+        expected_parser_name=expected_name,
+        expected_parser_version=expected_version,
     ):
         raise HTTPException(409, "Import Job is not retryable")
     return {"import_job_id": str(job_id), "status": PENDING}

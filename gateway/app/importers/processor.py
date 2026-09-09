@@ -9,13 +9,15 @@ from .service import BatchReplayIdentityError, ImportService
 from .generic import ParserRegistry, ParserValidationError, load_json_document
 from .retry_policy import (
     ARCHIVE_INTEGRITY_FAILURE,
-    committed_parser_block_reason,
+    resolve_durable_parser_contract,
 )
 from .worker import ImportWorker, LeaseLost
-from ..models import ArchiveObject, ImportBatchCommit, SourceAccount
+from ..models import ArchiveObject, ImportBatchCommit, ImportJob, SourceAccount
 
 class ImportProcessor:
-    def __init__(self, db, archive_root: Path, limits: ZipLimits = ZipLimits()): self.db, self.root, self.limits = db, archive_root, limits
+    def __init__(self, db, archive_root: Path, limits: ZipLimits = ZipLimits(), registry=None):
+        self.db, self.root, self.limits = db, archive_root, limits
+        self.registry = registry or ParserRegistry()
     def process(self, job, token, health_check=None) -> dict:
         health_check = health_check or (lambda: None)
         job_id = job.id
@@ -32,9 +34,20 @@ class ImportProcessor:
                 .where(ImportBatchCommit.import_job_id == job_id)
                 .distinct()
             ).all()
-            parser_block = committed_parser_block_reason(
-                (parser_name, contract_version)
-                for parser_name, contract_version in committed_identities
+            persisted_job = self.db.scalar(
+                select(ImportJob)
+                .where(ImportJob.id == job_id)
+                .execution_options(populate_existing=True)
+            )
+            if persisted_job is None:
+                raise ValueError('import_job_missing')
+            pinned_parser, parser_block = resolve_durable_parser_contract(
+                persisted_job,
+                (
+                    (parser_name, contract_version)
+                    for parser_name, contract_version in committed_identities
+                ),
+                registry=self.registry,
             )
             if parser_block is not None:
                 raise NonRetryablePreflightError(parser_block)
@@ -60,8 +73,12 @@ class ImportProcessor:
             if not candidates: raise UnsupportedStructure('unsupported_structure')
             if len(candidates) != 1: raise UnsupportedStructure('ambiguous_structure')
             source_member = candidates[0].relative_to(extract_root).as_posix()
-            payload=load_json_document(candidates[0].read_text(encoding='utf-8'), source_member); detection,parser=ParserRegistry().detect(payload)
-            if detection != 'matched': raise UnsupportedStructure(detection)
+            payload=load_json_document(candidates[0].read_text(encoding='utf-8'), source_member)
+            if pinned_parser is None:
+                detection,parser=self.registry.detect(payload)
+                if detection != 'matched': raise UnsupportedStructure(detection)
+            else:
+                parser = pinned_parser
             unknown_fields = parser.validate(payload, source_member)
             health_check()
             parsed_conversations = tuple(parser.parse(payload))
@@ -79,7 +96,13 @@ class ImportProcessor:
             )
             health_check()
             outcome=ImportService(self.db).import_fixture(payload, job.archive_object_id, job=job, lease_token=token, source_member=source_member, parser=parser, unknown_entries=unknown_fields, health_check=health_check, parsed_conversations=parsed_conversations, attachment_work=attachment_work, attachment_archive=attachment_archive)
-            result=dict(outcome.report); result.update({'scan':scan,'unknown':[{'type':'unknown_file','detail':x,'severity':'info','raw_pointer':str(x)} for x in unknown]}); result['imported_messages']=result.get('messages',{}).get('new',0); result['imported_conversations']=result.get('conversations',{}).get('new',0)
+            result=dict(outcome.report)
+            result['scan'] = scan
+            result['unknown'] = [
+                *result.get('unknown', []),
+                *[{'type':'unknown_file','detail':x,'severity':'info','raw_pointer':str(x)} for x in unknown],
+            ]
+            result['imported_messages']=result.get('messages',{}).get('new',0); result['imported_conversations']=result.get('conversations',{}).get('new',0)
             health_check()
             if result.get('attachments', {}).get('failed', 0):
                 worker.mark_failed_or_partial(job_id, token, 'attachment_processing_failed', result, 'attachment_processing_failed')

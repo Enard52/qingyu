@@ -80,6 +80,9 @@ def test_processor_preflight_failure_is_written_to_a_terminal_state(
         def get(self, _model, _identifier):
             return archive
 
+        def scalar(self, _statement):
+            return job
+
         def execute(self, _statement):
             return FakeResult()
 
@@ -103,7 +106,12 @@ def test_processor_preflight_failure_is_written_to_a_terminal_state(
             raise AssertionError("preflight failure must occur before staging")
 
     monkeypatch.setattr(processor_module, "ImportWorker", FakeWorker)
-    job = SimpleNamespace(id="job", archive_object_id="archive")
+    job = SimpleNamespace(
+        id="job",
+        archive_object_id="archive",
+        parser_name="retired-parser",
+        parser_version="1",
+    )
 
     with pytest.raises(NonRetryablePreflightError, match=expected):
         ImportProcessor(FakeDb(), tmp_path).process(job, "token")
