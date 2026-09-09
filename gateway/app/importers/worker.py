@@ -7,7 +7,7 @@ from pathlib import Path
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..archive.manifest import sync_manifest_from_archive_object
-from ..models import ArchiveObject, ImportBatchCommit, ImportJob
+from ..models import ArchiveObject, AttachmentObservation, ImportBatchCommit, ImportJob
 from .status import COMPLETED, FAILED, PARTIAL, PENDING, RETRYABLE_STATUSES, RUNNING
 
 
@@ -68,6 +68,9 @@ class ImportWorker:
                 terminal, durable_counts, terminal_report = durable_terminal_state(
                     batches, owned.report_json
                 )
+                _overlay_attachment_truth(
+                    lifecycle, terminal_report, job_id, owned.attempt_count
+                )
                 owned.status = terminal
                 owned.result_code = terminal
                 owned.error_code = "lease_expired"
@@ -112,12 +115,13 @@ class ImportWorker:
             lifecycle.commit()
             return True
 
-    def assert_ownership(self, job, token) -> None:
+    def assert_ownership(self, job, token):
         if token is None: raise LeaseRequired("lease_required")
         current = self.db.scalar(select(ImportJob).where(ownership_predicate(job.id, token)).with_for_update())
         if current is None:
             self.db.rollback()
             raise LeaseLost("ownership_lost")
+        return current
 
     def check_ownership(self, job, token) -> None:
         job_id = getattr(job, "id", job)
@@ -185,6 +189,9 @@ class ImportWorker:
                     .order_by(ImportBatchCommit.sequence_no)
                 ).all()
                 terminal, durable_counts, terminal_report = durable_terminal_state(batches, report)
+                _overlay_attachment_truth(
+                    lifecycle, terminal_report, job_id, owned.attempt_count
+                )
                 owned.status = terminal
                 owned.finished_at = database_wall_clock()
                 owned.error_summary = error
@@ -305,6 +312,24 @@ def ownership_predicate(job_id, token):
         & ImportJob.lease_expires_at.is_not(None)
         & (ImportJob.lease_expires_at > database_wall_clock())
     )
+
+
+def _overlay_attachment_truth(session, report, job_id, attempt_number) -> None:
+    """Use committed attempt evidence instead of historical batch deltas."""
+    rows = session.execute(
+        select(AttachmentObservation.availability, func.count(AttachmentObservation.id))
+        .where(
+            AttachmentObservation.import_job_id == job_id,
+            AttachmentObservation.attempt_number == attempt_number,
+        )
+        .group_by(AttachmentObservation.availability)
+    ).all()
+    if not rows:
+        return
+    counts = {key: 0 for key in ("available", "missing", "referenced_only", "failed")}
+    for availability, count in rows:
+        counts[availability] = int(count)
+    report["attachments"] = counts
 
 
 def durable_terminal_state(batches, report):

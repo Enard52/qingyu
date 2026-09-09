@@ -2,7 +2,9 @@ import hashlib, shutil, zipfile
 from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
+from ..archive.service import ArchiveService
 from .zip_staging import safe_extract, ZipLimits, UnsupportedZipError
+from .attachments import prepare_attachment_work
 from .service import BatchReplayIdentityError, ImportService
 from .generic import ParserRegistry, ParserValidationError, load_json_document
 from .retry_policy import (
@@ -10,7 +12,7 @@ from .retry_policy import (
     committed_parser_block_reason,
 )
 from .worker import ImportWorker, LeaseLost
-from ..models import ArchiveObject, ImportBatchCommit
+from ..models import ArchiveObject, ImportBatchCommit, SourceAccount
 
 class ImportProcessor:
     def __init__(self, db, archive_root: Path, limits: ZipLimits = ZipLimits()): self.db, self.root, self.limits = db, archive_root, limits
@@ -62,10 +64,27 @@ class ImportProcessor:
             if detection != 'matched': raise UnsupportedStructure(detection)
             unknown_fields = parser.validate(payload, source_member)
             health_check()
-            outcome=ImportService(self.db).import_fixture(payload, job.archive_object_id, job=job, lease_token=token, source_member=source_member, parser=parser, unknown_entries=unknown_fields, health_check=health_check)
+            parsed_conversations = tuple(parser.parse(payload))
+            account = self.db.get(SourceAccount, job.source_account_id)
+            if account is None:
+                raise ValueError('invalid_source_account')
+            attachment_archive = ArchiveService(self.root, self.db)
+            attachment_work = prepare_attachment_work(
+                parsed_conversations,
+                extract_root,
+                attachment_archive,
+                source_platform=account.platform,
+                source_member=source_member,
+                health_check=health_check,
+            )
+            health_check()
+            outcome=ImportService(self.db).import_fixture(payload, job.archive_object_id, job=job, lease_token=token, source_member=source_member, parser=parser, unknown_entries=unknown_fields, health_check=health_check, parsed_conversations=parsed_conversations, attachment_work=attachment_work, attachment_archive=attachment_archive)
             result=dict(outcome.report); result.update({'scan':scan,'unknown':[{'type':'unknown_file','detail':x,'severity':'info','raw_pointer':str(x)} for x in unknown]}); result['imported_messages']=result.get('messages',{}).get('new',0); result['imported_conversations']=result.get('conversations',{}).get('new',0)
             health_check()
-            if not worker.mark_completed(job_id, token, result, 'imported', outcome.counts): raise LeaseLost('ownership_lost')
+            if result.get('attachments', {}).get('failed', 0):
+                worker.mark_failed_or_partial(job_id, token, 'attachment_processing_failed', result, 'attachment_processing_failed')
+            elif not worker.mark_completed(job_id, token, result, 'imported', outcome.counts):
+                raise LeaseLost('ownership_lost')
             return result
         except LeaseLost:
             keep=True; self.db.rollback(); raise
