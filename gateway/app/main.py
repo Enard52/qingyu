@@ -8,12 +8,14 @@ from .errors import safe_database_error, safe_log_exception
 from .auth import require_token
 from .config import get_settings
 from .logging_config import configure_logging
+from .request_limits import ImportRequestSizeLimitMiddleware
 from .api_import import router as import_router
 from .api_archive import router as archive_router
 
 settings = get_settings()
 configure_logging(settings.log_level)
 app = FastAPI(title=settings.app_name, version="0.1.0")
+app.add_middleware(ImportRequestSizeLimitMiddleware)
 app.include_router(archive_router)
 app.include_router(import_router)
 

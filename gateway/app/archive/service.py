@@ -15,6 +15,14 @@ from .manifest import sync_manifest_from_archive_object
 
 SAFE_NAME = re.compile(r"^[^<>:\"/\\|?*\x00-\x1f]+$")
 
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
 @dataclass(frozen=True)
 class ArchiveResult:
     object_id: uuid.UUID
@@ -49,11 +57,7 @@ class ArchiveService:
         try:
             shutil.copyfile(source, staged)
             size = staged.stat().st_size
-            digest = hashlib.sha256()
-            with staged.open("rb") as fh:
-                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            sha = digest.hexdigest()
+            sha = _sha256_file(staged)
             rel = Path("archive") / "objects" / sha[:2] / sha
             target = self.root / rel
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -65,7 +69,7 @@ class ArchiveService:
             except FileExistsError:
                 duplicate = True
             if duplicate:
-                actual = hashlib.sha256(target.read_bytes()).hexdigest()
+                actual = _sha256_file(target)
                 if actual != sha:
                     existing_bad = self.db.scalar(select(ArchiveObject).where(ArchiveObject.sha256 == sha))
                     if existing_bad:
@@ -76,7 +80,7 @@ class ArchiveService:
                         self._write_manifest(existing_bad)
                     raise ArchiveIntegrityError(f"archive_integrity_failure: expected={sha} actual={actual}")
             else:
-                actual = hashlib.sha256(target.read_bytes()).hexdigest()
+                actual = _sha256_file(target)
                 if actual != sha:
                     raise ArchiveIntegrityError("archive_integrity_failure: post_write_digest_mismatch")
             self.fault_hook("file_published")

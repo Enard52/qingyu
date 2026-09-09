@@ -1,6 +1,6 @@
 from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import model_validator
+from pydantic import Field, model_validator
 
 class Settings(BaseSettings):
     app_name: str = "Qingyu Memory Gateway"
@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     archive_root: str = "<repo>/data"
     staging_failed_retention_days: int = 7
+    import_upload_max_bytes: int = Field(default=512 * 1024 * 1024, gt=0)
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     @model_validator(mode="after")

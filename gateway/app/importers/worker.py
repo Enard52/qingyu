@@ -1,7 +1,7 @@
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
 import uuid
-from sqlalchemy import case, exists, func, select, update
+from sqlalchemy import exists, func, or_, select, update
 from pathlib import Path
 
 from sqlalchemy.orm import Session, sessionmaker
@@ -36,24 +36,57 @@ class ImportWorker:
         return recovered
 
     def recover_observed(self, job_id, token, expiry, attempts, maximum) -> bool:
-        values = {"lease_token": None, "lease_expires_at": None, "error_summary": "retry_after_stale: lease_expired"}
-        if attempts < maximum:
-            values["status"] = PENDING
-        else:
-            durable = exists(select(ImportBatchCommit.id).where(ImportBatchCommit.import_job_id == job_id))
-            terminal = case((durable, PARTIAL), else_=FAILED)
-            values.update(
-                status=terminal,
-                result_code=terminal,
-                error_code="lease_expired",
-                finished_at=database_wall_clock(),
-                error_summary="worker_crash: lease_expired",
-            )
-        result = self.db.execute(update(ImportJob).where(ImportJob.id == job_id, ImportJob.status == RUNNING, ImportJob.lease_token == token, ImportJob.lease_expires_at == expiry, ImportJob.lease_expires_at <= database_wall_clock()).values(**values))
-        self.db.commit()
-        return result.rowcount == 1
+        with self._fresh_session() as lifecycle:
+            with lifecycle.begin():
+                owned = lifecycle.scalar(
+                    select(ImportJob)
+                    .where(
+                        ImportJob.id == job_id,
+                        ImportJob.status == RUNNING,
+                        ImportJob.lease_token == token,
+                        ImportJob.lease_expires_at == expiry,
+                        ImportJob.lease_expires_at <= database_wall_clock(),
+                        ImportJob.attempt_count == attempts,
+                        ImportJob.max_attempts == maximum,
+                    )
+                    .with_for_update()
+                )
+                if owned is None:
+                    return False
+                owned.lease_token = None
+                owned.lease_expires_at = None
+                if owned.attempt_count < owned.max_attempts:
+                    owned.status = PENDING
+                    owned.error_summary = "retry_after_stale: lease_expired"
+                    return True
+
+                batches = lifecycle.scalars(
+                    select(ImportBatchCommit)
+                    .where(ImportBatchCommit.import_job_id == job_id)
+                    .order_by(ImportBatchCommit.sequence_no)
+                ).all()
+                terminal, durable_counts, terminal_report = durable_terminal_state(
+                    batches, owned.report_json
+                )
+                owned.status = terminal
+                owned.result_code = terminal
+                owned.error_code = "lease_expired"
+                owned.finished_at = database_wall_clock()
+                owned.error_summary = "worker_crash: lease_expired"
+                owned.report_json = terminal_report
+                apply_durable_counts(owned, batches, durable_counts)
+                return True
     def claim_next(self, lease_duration: int = 300) -> ClaimedJob | None:
-        job = self.db.scalar(select(ImportJob).where(ImportJob.status == PENDING).order_by(ImportJob.created_at).limit(1).with_for_update(skip_locked=True))
+        job = self.db.scalar(
+            select(ImportJob)
+            .where(
+                ImportJob.status == PENDING,
+                ImportJob.attempt_count < ImportJob.max_attempts,
+            )
+            .order_by(ImportJob.created_at)
+            .limit(1)
+            .with_for_update(skip_locked=True)
+        )
         if job is None: return None
         now = datetime.now(timezone.utc)
         token = uuid.uuid4()
@@ -151,15 +184,7 @@ class ImportWorker:
                     .where(ImportBatchCommit.import_job_id == job_id)
                     .order_by(ImportBatchCommit.sequence_no)
                 ).all()
-                terminal = PARTIAL if batches else FAILED
-                durable_counts = {
-                    key: sum(int(batch.counts_delta.get(key, 0)) for batch in batches)
-                    for key in ("discovered_count", "imported_count", "skipped_count", "failed_count")
-                }
-                terminal_report = dict(report or {})
-                if batches:
-                    terminal_report["durable_batches"] = len(batches)
-                    terminal_report["durable_counts"] = durable_counts
+                terminal, durable_counts, terminal_report = durable_terminal_state(batches, report)
                 owned.status = terminal
                 owned.finished_at = database_wall_clock()
                 owned.error_summary = error
@@ -168,26 +193,41 @@ class ImportWorker:
                 owned.result_code = result_code or terminal
                 owned.lease_token = None
                 owned.lease_expires_at = None
-                if batches:
-                    owned.discovered_count = durable_counts["discovered_count"]
-                    owned.imported_count = durable_counts["imported_count"]
-                    owned.skipped_count = durable_counts["skipped_count"]
-                    owned.failed_count = durable_counts["failed_count"]
-                    owned.items_discovered = durable_counts["discovered_count"]
-                    owned.items_imported = durable_counts["imported_count"]
-                    owned.items_skipped = durable_counts["skipped_count"]
-                    owned.items_failed = durable_counts["failed_count"]
+                apply_durable_counts(owned, batches, durable_counts)
         return terminal
 
-    def retry(self, job_id) -> bool:
+    def retry(
+        self,
+        job_id,
+        expected_parser_name: str | None = None,
+        expected_parser_version: str | None = None,
+    ) -> bool:
+        retry_conditions = [
+            ImportJob.id == job_id,
+            ImportJob.status.in_(RETRYABLE_STATUSES),
+            ImportJob.lease_token.is_(None),
+            ImportJob.attempt_count < ImportJob.max_attempts,
+            ImportJob.error_code.is_distinct_from("archive_integrity_failure"),
+            ImportJob.result_code.is_distinct_from("archive_integrity_failure"),
+            exists(
+                select(ArchiveObject.id).where(
+                    ArchiveObject.id == ImportJob.archive_object_id,
+                    ArchiveObject.integrity_status == "verified",
+                )
+            ),
+        ]
+        if expected_parser_name is not None:
+            retry_conditions.append(
+                or_(ImportJob.status != PARTIAL, ImportJob.parser_name == expected_parser_name)
+            )
+        if expected_parser_version is not None:
+            retry_conditions.append(
+                or_(ImportJob.status != PARTIAL, ImportJob.parser_version == expected_parser_version)
+            )
         with self._fresh_session() as lifecycle:
             result = lifecycle.execute(
                 update(ImportJob)
-                .where(
-                    ImportJob.id == job_id,
-                    ImportJob.status.in_(RETRYABLE_STATUSES),
-                    ImportJob.lease_token.is_(None),
-                )
+                .where(*retry_conditions)
                 .values(
                     status=PENDING,
                     result_code=None,
@@ -265,3 +305,29 @@ def ownership_predicate(job_id, token):
         & ImportJob.lease_expires_at.is_not(None)
         & (ImportJob.lease_expires_at > database_wall_clock())
     )
+
+
+def durable_terminal_state(batches, report):
+    terminal = PARTIAL if batches else FAILED
+    durable_counts = {
+        key: sum(int(batch.counts_delta.get(key, 0)) for batch in batches)
+        for key in ("discovered_count", "imported_count", "skipped_count", "failed_count")
+    }
+    terminal_report = dict(report or {})
+    if batches:
+        terminal_report["durable_batches"] = len(batches)
+        terminal_report["durable_counts"] = durable_counts
+    return terminal, durable_counts, terminal_report
+
+
+def apply_durable_counts(job, batches, durable_counts):
+    if not batches:
+        return
+    job.discovered_count = durable_counts["discovered_count"]
+    job.imported_count = durable_counts["imported_count"]
+    job.skipped_count = durable_counts["skipped_count"]
+    job.failed_count = durable_counts["failed_count"]
+    job.items_discovered = durable_counts["discovered_count"]
+    job.items_imported = durable_counts["imported_count"]
+    job.items_skipped = durable_counts["skipped_count"]
+    job.items_failed = durable_counts["failed_count"]

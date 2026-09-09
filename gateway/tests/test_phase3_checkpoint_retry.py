@@ -245,6 +245,88 @@ def test_retry_api_rejects_non_retryable_statuses(clean_db, job_status):
     assert response.status_code == 409
 
 
+@pytest.mark.parametrize("initial_status", [FAILED, PARTIAL])
+def test_retry_api_rejects_exhausted_jobs(clean_db, initial_status):
+    db = clean_db
+    job = _pending_job(db, initial_status, attempt_count=3)
+    job.max_attempts = 3
+    db.commit()
+
+    response = TestClient(app).post(f"/api/v1/import-jobs/{job.id}/retry", headers=HEADERS)
+
+    assert response.status_code == 409
+    db.expire_all()
+    current = db.get(ImportJob, job.id)
+    assert current.status == initial_status
+    assert current.attempt_count == current.max_attempts == 3
+
+
+def test_claim_skips_pending_job_with_exhausted_attempts(clean_db):
+    db = clean_db
+    exhausted = _pending_job(db, attempt_count=3)
+    exhausted.max_attempts = 3
+    db.commit()
+
+    assert ImportWorker(db).claim_next(60) is None
+    db.expire_all()
+    current = db.get(ImportJob, exhausted.id)
+    assert current.status == PENDING
+    assert current.attempt_count == current.max_attempts == 3
+
+
+@pytest.mark.parametrize("failure_field", ["error_code", "result_code"])
+def test_retry_rejects_archive_integrity_failure_atomically(clean_db, failure_field):
+    db = clean_db
+    job = _pending_job(db, FAILED, attempt_count=1)
+    setattr(job, failure_field, "archive_integrity_failure")
+    db.commit()
+
+    assert not ImportWorker(db).retry(job.id)
+    db.expire_all()
+    assert db.get(ImportJob, job.id).status == FAILED
+
+
+def test_retry_rejects_job_whose_archive_is_no_longer_verified(clean_db):
+    db = clean_db
+    job = _pending_job(db, FAILED, attempt_count=1)
+    archive = db.get(ArchiveObject, job.archive_object_id)
+    archive.integrity_status = "integrity_failure"
+    db.commit()
+
+    assert not ImportWorker(db).retry(job.id)
+    db.expire_all()
+    assert db.get(ImportJob, job.id).status == FAILED
+
+
+@pytest.mark.parametrize("mismatch", ["name", "version"])
+def test_retry_rejects_parser_identity_mismatch_atomically(clean_db, mismatch):
+    db = clean_db
+    job = _pending_job(db, PARTIAL, attempt_count=1)
+
+    expected_name = "other-parser" if mismatch == "name" else job.parser_name
+    expected_version = "other-version" if mismatch == "version" else job.parser_version
+
+    assert not ImportWorker(db).retry(job.id, expected_name, expected_version)
+    db.expire_all()
+    assert db.get(ImportJob, job.id).status == PARTIAL
+
+
+def test_failed_job_without_durable_batches_can_retry_with_current_parser(clean_db):
+    db = clean_db
+    job = _pending_job(db, FAILED, attempt_count=1)
+    job.parser_name = "retired-parser"
+    job.parser_version = "retired-version"
+    db.commit()
+
+    assert ImportWorker(db).retry(
+        job.id,
+        GenericTreeParser.name,
+        GenericTreeParser.version,
+    )
+    db.expire_all()
+    assert db.get(ImportJob, job.id).status == PENDING
+
+
 def test_exhausted_stale_job_uses_ledger_for_partial(clean_db):
     db = clean_db; job = _pending_job(db); claim = ImportWorker(db).claim_next(60)
     ImportService(db).import_fixture(_payload("durable"), job.archive_object_id, job=claim, lease_token=claim.lease_token)
@@ -252,6 +334,17 @@ def test_exhausted_stale_job_uses_ledger_for_partial(clean_db):
     assert ImportWorker(db).recover_stale() == 1
     db.expire_all(); current = db.get(ImportJob, job.id)
     assert current.status == PARTIAL and current.result_code == PARTIAL
+    assert current.discovered_count == current.items_discovered == 1
+    assert current.imported_count == current.items_imported == 1
+    assert current.skipped_count == current.items_skipped == 0
+    assert current.failed_count == current.items_failed == 0
+    assert current.report_json["durable_batches"] == 1
+    assert current.report_json["durable_counts"] == {
+        "discovered_count": 1,
+        "imported_count": 1,
+        "skipped_count": 0,
+        "failed_count": 0,
+    }
 
 
 def test_stale_worker_cannot_checkpoint_or_finalize_partial(clean_db):

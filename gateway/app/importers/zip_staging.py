@@ -22,6 +22,14 @@ class UnsupportedZipError(ValueError):
         super().__init__(code)
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _normalized_member(info):
     raw=info.filename
     if raw.startswith(("/","\\")) or re.match(r"^[A-Za-z]:",raw): raise UnsafeZipError("ZIP absolute/drive/UNC path")
@@ -73,4 +81,4 @@ def safe_extract(zip_path: Path, destination: Path, limits: ZipLimits = ZipLimit
             if info.is_dir(): target.mkdir(parents=True,exist_ok=True); continue
             target.parent.mkdir(parents=True,exist_ok=True)
             with archive.open(info) as source, target.open("xb") as output: shutil.copyfileobj(source,output,1024*1024)
-    return {"file_count":len(normalized),"total_uncompressed_bytes":total,"sha256":hashlib.sha256(zip_path.read_bytes()).hexdigest()}
+    return {"file_count":len(normalized),"total_uncompressed_bytes":total,"sha256":_sha256_file(zip_path)}
