@@ -9,6 +9,9 @@
         "continuity_alias": {
           "maxLength": 128,
           "minLength": 1,
+          "not": {
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+          },
           "title": "Continuity Alias",
           "type": "string"
         },
@@ -20,6 +23,7 @@
         },
         "continuity_id": {
           "format": "uuid",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$",
           "title": "Continuity Id",
           "type": "string"
         },
@@ -31,6 +35,7 @@
         },
         "qingyu_identity_id": {
           "format": "uuid",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$",
           "title": "Qingyu Identity Id",
           "type": "string"
         },

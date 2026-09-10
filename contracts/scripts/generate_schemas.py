@@ -58,6 +58,17 @@ def main() -> None:
         "Qingyu Core Identity Contract v1",
         [IdentityContinuityEnvelope],
     )
+    identity_path = SCHEMA_DIR / "core-identity-v1.json"
+    identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    envelope = identity["properties"]["IdentityContinuityEnvelope"]["properties"]
+    uuid4_pattern = r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    for field in ("qingyu_identity_id", "continuity_id"):
+        envelope[field]["pattern"] = uuid4_pattern
+    alias_uuid_pattern = r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    envelope["continuity_alias"]["not"] = {"pattern": alias_uuid_pattern}
+    identity_path.write_text(
+        json.dumps(identity, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 if __name__ == "__main__":
