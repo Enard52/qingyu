@@ -83,13 +83,13 @@ class ImportProcessor:
             scan=safe_extract(verified_source, extract_root, self.limits)
             health_check()
             files=list(extract_root.rglob('*')); candidates=[p for p in files if p.is_file() and p.suffix.lower()=='.json' and p.name in {'fixture.json','conversations.json'}]
-            unknown=[str(p.relative_to(extract_root)) for p in files if p.is_file() and p not in candidates]
+            unknown_count=sum(1 for p in files if p.is_file() and p not in candidates)
             if not candidates: raise UnsupportedStructure('unsupported_structure')
             if len(candidates) != 1: raise UnsupportedStructure('ambiguous_structure')
             source_member = candidates[0].relative_to(extract_root).as_posix()
             payload=load_json_document(candidates[0].read_text(encoding='utf-8'), source_member)
             if pinned_parser is None:
-                detection,parser=self.registry.detect(payload)
+                detection,parser=self.registry.detect(payload, source_member)
                 if detection != 'matched': raise UnsupportedStructure(detection)
             else:
                 parser = pinned_parser
@@ -114,7 +114,7 @@ class ImportProcessor:
             result['scan'] = scan
             result['unknown'] = [
                 *result.get('unknown', []),
-                *[{'type':'unknown_file','detail':x,'severity':'info','raw_pointer':str(x)} for x in unknown],
+                *([{'type':'unparsed_archive_members','count':unknown_count,'severity':'info'}] if unknown_count else []),
             ]
             result['imported_messages']=result.get('messages',{}).get('new',0); result['imported_conversations']=result.get('conversations',{}).get('new',0)
             health_check()

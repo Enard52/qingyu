@@ -42,7 +42,10 @@ class PreparedObject:
     media_type: str
     original_filename: str
     source_platform: str
-    source_path: str
+    # Runtime filesystem paths are process-local implementation details, not
+    # durable source provenance. Source-native locators belong in logical_path
+    # and observation_metadata instead.
+    source_path: str | None
     logical_path: str
     observation_metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -222,7 +225,7 @@ class ArchiveService:
                 media_type=observed_media_type,
                 original_filename=filename,
                 source_platform=source_platform,
-                source_path=str(source),
+                source_path=None,
                 logical_path=logical_path or filename,
                 observation_metadata=metadata,
             )

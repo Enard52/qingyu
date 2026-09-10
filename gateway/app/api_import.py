@@ -10,7 +10,7 @@ from .archive.service import ArchiveService
 from .auth import require_token
 from .config import get_settings
 from .db import get_db
-from .importers.generic import GenericTreeParser, ParserRegistry
+from .importers.generic import ParserRegistry
 from .importers.retry_policy import resolve_durable_parser_contract
 from .importers.staging import create_prejob_generation
 from .importers.status import PENDING
@@ -21,6 +21,8 @@ router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_token)])
 logger = logging.getLogger(__name__)
 
 UPLOAD_CHUNK_BYTES = 1024 * 1024
+PENDING_PARSER_NAME = "pending-detection"
+PENDING_PARSER_VERSION = "1"
 
 
 def _write_upload_with_limit(file: UploadFile, destination: Path, max_bytes: int) -> None:
@@ -71,8 +73,8 @@ def create_import(
             job = ImportJob(
                 source_account_id=account.id,
                 archive_object_id=pending_archive.object_id,
-                parser_name=GenericTreeParser.name,
-                parser_version=GenericTreeParser.version,
+                parser_name=PENDING_PARSER_NAME,
+                parser_version=PENDING_PARSER_VERSION,
                 status=PENDING,
                 report_json={},
             )
@@ -117,8 +119,8 @@ def retry_import_job(job_id: uuid.UUID, db: Session = Depends(get_db)) -> dict:
     if block_reason is not None:
         db.rollback()
         raise HTTPException(409, block_reason)
-    expected_name = pinned_parser.name if pinned_parser is not None else GenericTreeParser.name
-    expected_version = pinned_parser.version if pinned_parser is not None else GenericTreeParser.version
+    expected_name = pinned_parser.name if pinned_parser is not None else job.parser_name
+    expected_version = pinned_parser.version if pinned_parser is not None else job.parser_version
     db.rollback()
     if not ImportWorker(db).retry(
         job_id,

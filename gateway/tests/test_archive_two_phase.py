@@ -19,6 +19,7 @@ def archive_two_phase_env(tmp_path: Path):
     ArchiveObject.__table__.create(engine, checkfirst=True)
     ArchiveObservation.__table__.create(engine, checkfirst=True)
     with Session(engine) as db:
+        preexisting_observation_ids = set(db.scalars(select(ArchiveObservation.id)))
         try:
             yield tmp_path, db
         finally:
@@ -26,12 +27,14 @@ def archive_two_phase_env(tmp_path: Path):
             object_ids = list(
                 db.scalars(
                     select(ArchiveObservation.archive_object_id).where(
-                        ArchiveObservation.source_path.like(f"{tmp_path}%")
+                        ArchiveObservation.id.not_in(preexisting_observation_ids)
                     )
                 )
             )
             db.execute(
-                delete(ArchiveObservation).where(ArchiveObservation.archive_object_id.in_(object_ids))
+                delete(ArchiveObservation).where(
+                    ArchiveObservation.id.not_in(preexisting_observation_ids)
+                )
             )
             db.execute(delete(ArchiveObject).where(ArchiveObject.id.in_(object_ids)))
             db.commit()
@@ -122,7 +125,7 @@ def test_persist_adds_exact_observation_without_commit(archive_two_phase_env):
     assert pending.observation.archive_object_id == pending.object_id
     assert pending.observation.original_filename == "export.bin"
     assert pending.observation.source_platform == "fixture"
-    assert pending.observation.source_path == str(source)
+    assert pending.observation.source_path is None
     assert pending.observation.logical_path == "attachments/export.bin"
     assert pending.observation.metadata_json == {
         "origin": "message-1",

@@ -37,3 +37,23 @@ def compute_revision_fingerprint(**kwargs) -> str:
 
 def compute_text_hash(text: str | None) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def compute_semantic_revision_fingerprint(evidence: dict[str, Any], version: str = "chatgpt-message-v1") -> str:
+    """Hash source-semantic message evidence, never runtime/observation fields."""
+    return hashlib.sha256(
+        canonical_revision_json({"version": version, "evidence": evidence}).encode("utf-8")
+    ).hexdigest()
+
+
+def compute_source_observation_fingerprint(evidence: dict[str, Any], version: str = "chatgpt-observation-v1") -> str:
+    return hashlib.sha256(
+        canonical_revision_json({"version": version, "evidence": evidence}).encode("utf-8")
+    ).hexdigest()
+
+
+def compute_canonical_fragment_fingerprint(value: Any, pointer: str, version: str = "canonical-json-v1") -> str:
+    """Hash canonical JSON semantics plus its RFC 6901 locator; not raw bytes."""
+    return hashlib.sha256(
+        canonical_revision_json({"version": version, "pointer": pointer, "value": value}).encode("utf-8")
+    ).hexdigest()

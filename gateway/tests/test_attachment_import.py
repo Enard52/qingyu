@@ -198,6 +198,21 @@ def test_declared_attachment_integrity_mismatch_is_failed(clean_db, tmp_path, de
     assert observation.observed_size_bytes == len(b"actual")
 
 
+def test_declared_media_type_cannot_be_verified_by_filename_extension(clean_db, tmp_path):
+    db = clean_db
+    root = tmp_path / "data"
+    descriptor = {"id": "forged", "member_path": "files/forged.png", "media_type": "image/png"}
+    claim, _account, _archive = _claim(db, root, _payload([descriptor]), {"files/forged.png": b"not a png"})
+
+    report = ImportProcessor(db, root).process(claim, claim.lease_token)
+
+    observation = db.query(AttachmentObservation).one()
+    assert report["attachments"]["failed"] == 1
+    assert observation.availability == "failed"
+    assert observation.observed_media_type == "application/octet-stream"
+    assert observation.archive_object_id is None
+
+
 def test_persist_failure_rolls_back_then_records_failed_observation(clean_db, tmp_path, monkeypatch):
     db = clean_db
     root = tmp_path / "data"

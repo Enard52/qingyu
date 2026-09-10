@@ -22,6 +22,9 @@ class ParsedAttachment:
     metadata: Any
     descriptor_json: dict[str, Any]
     raw_json_pointer: str
+    asset_id: str | None = None
+    source_references: tuple[dict[str, Any], ...] = ()
+    source_fragment_json: Any = None
 
 
 @dataclass(frozen=True)
@@ -37,6 +40,26 @@ class ParsedMessage:
     # Keep this last, with a default, so existing positional construction remains
     # compatible with the pre-attachment parser contract.
     attachments: tuple[ParsedAttachment, ...] = ()
+    external_message_id: str | None = None
+    raw_update_timestamp: Any = None
+    content_type: str | None = None
+    semantic_evidence_json: dict[str, Any] | None = None
+    observation_evidence_json: dict[str, Any] | None = None
+    raw_json_pointer: str | None = None
+    source_fragment_json: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class ParsedNode:
+    node_id: str
+    declared_node_id: str | None
+    parent_node_id: str | None
+    declared_children: tuple[str, ...] | None
+    message_presence: str
+    message: ParsedMessage | None
+    raw_json_pointer: str
+    source_node_json: dict[str, Any]
+    source_fragment_json: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -45,6 +68,12 @@ class ParsedConversation:
     title: str | None
     messages: tuple[ParsedMessage, ...]
     current_node_id: str | None
+    nodes: tuple[ParsedNode, ...] = ()
+    raw_json_pointer: str | None = None
+    source_conversation_json: dict[str, Any] | None = None
+    raw_create_timestamp: Any = None
+    raw_update_timestamp: Any = None
+    source_fragment_json: dict[str, Any] | None = None
 
 
 class GenericTreeParser:
@@ -266,16 +295,27 @@ class GenericTreeParser:
 
 class ParserRegistry:
     def __init__(self, parsers=None):
-        self.parsers = list([GenericTreeParser()] if parsers is None else parsers)
+        if parsers is None:
+            from .real_chatgpt import ChatGPTExportParser
+            parsers = [GenericTreeParser(), ChatGPTExportParser()]
+        self.parsers = list(parsers)
     def resolve(self, name: str, version: str):
         """Resolve one exact installed parser contract without fallback."""
         matches = [parser for parser in self.parsers if parser.name == name and parser.version == version]
         return matches[0] if len(matches) == 1 else None
-    def detect(self, payload) -> tuple[str, Any]:
-        if not isinstance(payload,dict): return "unsupported_structure",None
+    def detect(self, payload, member: str | None = None) -> tuple[str, Any]:
         matches=[parser for parser in self.parsers if parser.can_parse(payload)]
         if len(matches)>1: return "ambiguous_structure",None
-        if not matches: return ("unsupported_real_chatgpt_export" if "conversations" in payload else "unsupported_structure"),None
+        suspected_real_export = (
+            isinstance(payload, dict) and "conversations" in payload
+        ) or (
+            isinstance(payload, list)
+            and bool(payload)
+            and isinstance(payload[0], dict)
+            and bool({"id", "conversation_id", "mapping", "current_node"} & payload[0].keys())
+        )
+        if not matches:
+            return ("unsupported_real_chatgpt_export" if suspected_real_export else "unsupported_structure"),None
         return "matched",matches[0]
 
 

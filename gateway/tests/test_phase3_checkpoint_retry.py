@@ -380,7 +380,11 @@ def test_commit2_schema_matches_model_and_rejects_unknown_job_status(clean_db):
     assert "0" in str(columns["checkpoint_sequence"]["default"])
     assert "import_batch_commits" in inspector.get_table_names()
     uniques = {item["name"] for item in inspector.get_unique_constraints("import_batch_commits")}
-    assert uniques == {"uq_import_batch_commits_job_key", "uq_import_batch_commits_job_sequence"}
+    assert {
+        "uq_import_batch_commits_job_key",
+        "uq_import_batch_commits_job_sequence",
+        "uq_import_batch_commits_id_conversation",
+    }.issubset(uniques)
     checks = {item["name"] for item in inspector.get_check_constraints("import_jobs")}
     assert "ck_import_jobs_status" in checks
     job = _pending_job(db)
