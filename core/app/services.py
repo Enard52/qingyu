@@ -726,6 +726,23 @@ class CoreFoundationService:
             session.close()
 
     def activate_restore(self, request: RestoreRequest) -> RestoreVerification:
+        existing_session = self._session()
+        try:
+            existing = existing_session.get(RestoreRecord, request.request_id)
+            if existing is not None:
+                if existing.manifest_hash != request.manifest.manifest_hash:
+                    raise CoreError("RESTORE_REQUEST_CONFLICT")
+                state = existing_session.get(ControlPlaneState, request.manifest.continuity_id)
+                if existing.status == "ACTIVE" and state is not None:
+                    return RestoreVerification(
+                        same_identity=True,
+                        read_only=False,
+                        reason="RESTORE_ACTIVATED",
+                        continuity_epoch=state.current_epoch,
+                        audit=None,
+                    )
+        finally:
+            existing_session.close()
         verification = self.verify_restore(request)
         manifest = request.manifest
         claim = self.authority.claim_recovery(
