@@ -62,6 +62,12 @@ def session_factory(settings: Settings) -> sessionmaker[Session]:
     if not settings.core_database_url:
         raise CoreError("CORE_DATABASE_URL_REQUIRED")
     engine = get_engine(settings.core_database_url)
+    assert_database_safe(
+        settings,
+        engine,
+        operation="runtime",
+        require_write_safe_name=True,
+    )
     return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 

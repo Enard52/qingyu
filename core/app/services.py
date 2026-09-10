@@ -698,6 +698,13 @@ class CoreFoundationService:
                 raise CoreError("RESTORE_INITIAL_OWNER_MISMATCH")
             audit = verify_audit_chain(session)
             checkpoint = self.authority.export_checkpoint(manifest.continuity_id)
+            if (
+                checkpoint["trust_domain_id"] != str(manifest.trust_domain_id)
+                or checkpoint["continuity_id"] != str(manifest.continuity_id)
+                or checkpoint["storage_generation_id"] != str(manifest.storage_generation_id)
+                or checkpoint["control_plane_generation_id"] != str(manifest.control_plane_generation_id)
+            ):
+                raise CoreError("RESTORE_STATE_GAP")
             if checkpoint["audit_high_water"] != manifest.audit_high_water:
                 raise CoreError("RESTORE_STATE_GAP")
             if checkpoint["audit_head_hash"] != manifest.audit_head_hash:

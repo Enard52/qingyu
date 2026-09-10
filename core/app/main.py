@@ -61,7 +61,11 @@ def health() -> dict[str, str]:
     return {"status": "ok", "service": "qingyu-core"}
 
 
-@app.get("/api/v1/core/identity/status", response_model=IdentityStatus)
+@app.get(
+    "/api/v1/core/identity/status",
+    response_model=IdentityStatus,
+    dependencies=[Depends(_require_governance_capability)],
+)
 def identity_status(service: CoreFoundationService = Depends(get_service)) -> IdentityStatus:
     return service.identity_status()
 
