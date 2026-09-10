@@ -797,7 +797,7 @@ class CoreFoundationService:
             check = self._session()
             try:
                 genesis = check.scalar(select(GenesisRecord).limit(1))
-                if genesis is None or genesis.trust_domain_id != manifest.trust_domain_id or genesis.qingyu_identity_id != manifest.qingyu_identity_id or genesis.continuity_id != manifest.continuity_id or genesis.fingerprint != manifest.genesis_fingerprint or genesis.manifest_hash != manifest.manifest_hash:
+                if genesis is None or genesis.trust_domain_id != manifest.trust_domain_id or genesis.qingyu_identity_id != manifest.qingyu_identity_id or genesis.continuity_id != manifest.continuity_id or genesis.fingerprint != manifest.genesis_fingerprint or genesis.initial_owner_fingerprint != manifest.initial_owner_fingerprint or genesis.manifest_hash != manifest.manifest_hash:
                     raise CoreError("RESTORE_IDENTITY_MISMATCH")
                 audit = verify_audit_chain(check)
                 verification = RestoreVerification(
