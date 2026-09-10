@@ -782,6 +782,18 @@ class CoreFoundationService:
                 or request.current_owner_record_hash != expected_owner_record_hash
             ):
                 raise CoreError("RESTORE_OWNER_UNPROVEN")
+            if (
+                checkpoint["trust_domain_id"] != str(manifest.trust_domain_id)
+                or checkpoint["continuity_id"] != str(manifest.continuity_id)
+                or checkpoint["control_plane_generation_id"]
+                != str(manifest.control_plane_generation_id)
+                or checkpoint["storage_generation_id"]
+                != str(request.target_storage_generation_id)
+                or checkpoint["witness_set_version"] != manifest.witness_set_version
+                or checkpoint["audit_high_water"] != manifest.audit_high_water
+                or checkpoint["audit_head_hash"] != manifest.audit_head_hash
+            ):
+                raise CoreError("RESTORE_STATE_GAP")
             check = self._session()
             try:
                 genesis = check.scalar(select(GenesisRecord).limit(1))
