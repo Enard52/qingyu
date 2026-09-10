@@ -90,3 +90,35 @@ def test_governed_mutation_is_idempotent(foundation, genesis_request):
     assert first.status == "COMMITTED"
     assert second.local_commit_id == first.local_commit_id
     assert second.audit_seq == first.audit_seq
+
+
+def test_authority_commit_failure_quarantines_without_advancing_local_state(
+    foundation, genesis_request
+):
+    service, factory, authority = foundation
+    service.bootstrap_genesis(genesis_request)
+    lease = service.acquire_owner_lease(genesis_request.continuity_id)
+
+    original_commit = authority.commit_mutation
+
+    def fail_commit(**kwargs):
+        raise CoreError("CONTROL_PLANE_WITNESS_QUORUM_UNAVAILABLE")
+
+    authority.commit_mutation = fail_commit
+    with pytest.raises(CoreError, match="CONTROL_PLANE_WITNESS_QUORUM_UNAVAILABLE"):
+        service.governed_mutation(
+            MutationRequest(
+                continuity_id=genesis_request.continuity_id,
+                continuity_epoch=0,
+                lease_id=lease,
+                mutation_id="mutation-failure",
+                actor_principal_id="owner-1",
+                capability="core_writer",
+                payload={"x": 1},
+            )
+        )
+    authority.commit_mutation = original_commit
+    with factory() as session:
+        metadata = session.get(CoreMetadata, 1)
+        assert metadata.status == "RESTORE_QUARANTINED"
+        assert metadata.current_state_version == 0

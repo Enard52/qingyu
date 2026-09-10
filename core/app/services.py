@@ -110,6 +110,15 @@ class CoreFoundationService:
                 if existing.manifest_hash != manifest_hash:
                     raise CoreError("GENESIS_ALREADY_EXISTS")
                 metadata = precheck.get(CoreMetadata, 1)
+                reservation = self.authority.genesis_status(existing.trust_domain_id)
+                if (
+                    reservation is None
+                    or reservation.state.value != "COMMITTED"
+                    or metadata is None
+                    or reservation.claimed_storage_generation_id != metadata.active_storage_generation_id
+                ):
+                    self._quarantine(reason="GENESIS_OUTCOME_UNKNOWN")
+                    raise CoreError("GENESIS_OUTCOME_UNKNOWN")
                 return GenesisResult(
                     genesis_id=existing.genesis_id,
                     qingyu_identity_id=existing.qingyu_identity_id,
@@ -425,6 +434,8 @@ class CoreFoundationService:
                 state = session.get(ControlPlaneState, continuity_id, with_for_update=True)
                 if state is None:
                     raise CoreError("CONTINUITY_UNKNOWN")
+                if state.status != "READY":
+                    raise CoreError("RESTORE_FENCE_UNPROVEN")
                 lease = self.authority.acquire_lease(
                     continuity_id=continuity_id,
                     principal_id=state.owner_principal_id,
@@ -536,6 +547,8 @@ class CoreFoundationService:
             state = session.get(ControlPlaneState, continuity_id)
             if state is None:
                 raise CoreError("CONTINUITY_UNKNOWN")
+            if state.status != "READY":
+                raise CoreError("RESTORE_FENCE_UNPROVEN")
             storage_generation_id = state.active_storage_generation_id
             expected_state_version = state.state_version
             # Read-only inspection opened an implicit transaction; the local
@@ -571,7 +584,6 @@ class CoreFoundationService:
                     raise CoreError("CONTINUITY_UNKNOWN")
                 if state.current_epoch != permit.epoch:
                     raise CoreError("EPOCH_STALE")
-                state.state_version = permit.assigned_state_version
                 audit = append_audit(
                     session,
                     trust_domain_id=session.get(CoreMetadata, 1).trust_domain_id,
@@ -597,7 +609,7 @@ class CoreFoundationService:
                     assigned_state_version=permit.assigned_state_version,
                     audit_seq=audit.audit_seq,
                     local_commit_id=local_commit_id,
-                    status="LOCAL_COMMITTED",
+                    status="PREPARED",
                 )
                 session.add(receipt)
                 audit_head_hash = audit.record_hash
@@ -608,7 +620,11 @@ class CoreFoundationService:
                 audit_seq=audit.audit_seq,
             )
             with session.begin():
+                state = session.get(ControlPlaneState, continuity_id, with_for_update=True)
                 receipt = session.get(MutationReceipt, request.mutation_id)
+                state.state_version = permit.assigned_state_version
+                metadata = session.get(CoreMetadata, 1, with_for_update=True)
+                metadata.current_state_version = permit.assigned_state_version
                 receipt.status = committed.state.value
             return MutationResult(
                 mutation_id=request.mutation_id,
@@ -625,6 +641,21 @@ class CoreFoundationService:
                     self.authority.abort_mutation(request.mutation_id)
                 except CoreError:
                     pass
+            session.rollback()
+            cleanup = self._session()
+            try:
+                with cleanup.begin():
+                    metadata = cleanup.get(CoreMetadata, 1, with_for_update=True)
+                    receipt = cleanup.get(MutationReceipt, request.mutation_id)
+                    if receipt is not None and receipt.status == "PREPARED":
+                        receipt.status = "ABORTED"
+                    if metadata is not None:
+                        metadata.status = "RESTORE_QUARANTINED"
+                    state = cleanup.get(ControlPlaneState, continuity_id, with_for_update=True)
+                    if state is not None:
+                        state.status = "RESTORE_QUARANTINED"
+            finally:
+                cleanup.close()
             raise
         finally:
             session.close()
@@ -659,6 +690,12 @@ class CoreFoundationService:
                 raise CoreError("RESTORE_STATE_GAP")
             if checkpoint["audit_head_hash"] != manifest.audit_head_hash:
                 raise CoreError("AUDIT_HIGH_WATER_UNPROVEN")
+            state = session.get(ControlPlaneState, manifest.continuity_id, with_for_update=True)
+            state.status = "RESTORE_QUARANTINED"
+            state.lease_id = None
+            metadata.status = "RESTORE_QUARANTINED"
+            session.commit()
+            self.authority.quarantine_recovery(manifest.continuity_id)
             return RestoreVerification(
                 same_identity=True,
                 read_only=True,

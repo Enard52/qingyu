@@ -384,6 +384,28 @@ class InMemoryControlPlane:
             if previous is not None:
                 if previous.payload_hash != payload_hash:
                     raise CoreError("MUTATION_RETRY_CONFLICT")
+                if previous.state == MutationState.COMMITTED:
+                    return previous
+                if (
+                    previous.continuity_id != state.continuity_id
+                    or previous.epoch != state.epoch
+                    or previous.lease_id != uuid4_opaque(lease_id)
+                    or previous.storage_generation_id != state.storage_generation_id
+                    or previous.expected_state_version != expected_state_version
+                ):
+                    raise CoreError("MUTATION_RETRY_CONTEXT_CONFLICT")
+                if previous.state == MutationState.ABORTED:
+                    previous = MutationPermit(
+                        mutation_id=mutation_id,
+                        continuity_id=state.continuity_id,
+                        epoch=state.epoch,
+                        lease_id=state.lease.lease_id,
+                        storage_generation_id=state.storage_generation_id,
+                        payload_hash=payload_hash,
+                        expected_state_version=expected_state_version,
+                        assigned_state_version=state.state_version + 1,
+                    )
+                    self._mutations[mutation_id] = previous
                 return previous
             permit = MutationPermit(
                 mutation_id=mutation_id,
@@ -440,6 +462,13 @@ class InMemoryControlPlane:
                 raise CoreError("CONTROL_PLANE_ROLLBACK_DETECTED")
             state.audit_high_water = audit_seq
             state.audit_head_hash = audit_head_hash
+
+    def quarantine_recovery(self, continuity_id: uuid.UUID) -> None:
+        self._require_quorum()
+        with self._lock:
+            state = self.get_domain(continuity_id)
+            state.recovery_state = RecoveryState.QUARANTINED
+            state.lease = None
 
     def abort_mutation(self, mutation_id: str) -> MutationPermit:
         self._require_quorum()
