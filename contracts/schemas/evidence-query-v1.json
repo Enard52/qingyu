@@ -1,0 +1,1385 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "AttachmentObservationPage": {
+      "$defs": {
+        "AttachmentAttemptEvidence": {
+          "additionalProperties": false,
+          "properties": {
+            "archive_object_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Archive Object Id"
+            },
+            "attachment_observation_id": {
+              "format": "uuid",
+              "title": "Attachment Observation Id",
+              "type": "string"
+            },
+            "attempt_number": {
+              "minimum": 1,
+              "title": "Attempt Number",
+              "type": "integer"
+            },
+            "availability": {
+              "title": "Availability",
+              "type": "string"
+            },
+            "canonical_fragment_fingerprint": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Canonical Fragment Fingerprint"
+            },
+            "fragment_fingerprint_version": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Fragment Fingerprint Version"
+            },
+            "observed_at": {
+              "format": "date-time",
+              "title": "Observed At",
+              "type": "string"
+            },
+            "observed_filename": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Observed Filename"
+            },
+            "observed_media_type": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Observed Media Type"
+            },
+            "observed_size_bytes": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Observed Size Bytes"
+            },
+            "resolution_status": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Resolution Status"
+            }
+          },
+          "required": [
+            "attachment_observation_id",
+            "attempt_number",
+            "availability",
+            "archive_object_id",
+            "observed_filename",
+            "observed_media_type",
+            "observed_size_bytes",
+            "resolution_status",
+            "canonical_fragment_fingerprint",
+            "fragment_fingerprint_version",
+            "observed_at"
+          ],
+          "title": "AttachmentAttemptEvidence",
+          "type": "object"
+        },
+        "AttachmentEvidence": {
+          "additionalProperties": false,
+          "properties": {
+            "attachment_id": {
+              "format": "uuid",
+              "title": "Attachment Id",
+              "type": "string"
+            },
+            "filename": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Filename"
+            },
+            "media_type": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Media Type"
+            },
+            "size_bytes": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Size Bytes"
+            }
+          },
+          "required": [
+            "attachment_id",
+            "filename",
+            "media_type",
+            "size_bytes"
+          ],
+          "title": "AttachmentEvidence",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "attachment": {
+          "$ref": "#/$defs/AttachmentEvidence"
+        },
+        "consistency": {
+          "const": "bounded_high_water_enumeration_v1",
+          "default": "bounded_high_water_enumeration_v1",
+          "title": "Consistency",
+          "type": "string"
+        },
+        "contract_version": {
+          "const": "evidence-query-v1",
+          "default": "evidence-query-v1",
+          "title": "Contract Version",
+          "type": "string"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/AttachmentAttemptEvidence"
+          },
+          "title": "Items",
+          "type": "array"
+        },
+        "limit": {
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "meaning": {
+          "const": "gateway_recorded_historical_evidence",
+          "default": "gateway_recorded_historical_evidence",
+          "title": "Meaning",
+          "type": "string"
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Next Cursor"
+        }
+      },
+      "required": [
+        "attachment",
+        "items",
+        "next_cursor",
+        "limit"
+      ],
+      "title": "AttachmentObservationPage",
+      "type": "object"
+    },
+    "EvidenceCapability": {
+      "additionalProperties": false,
+      "description": "Logical auth contract for the Gateway Evidence read boundary.",
+      "properties": {
+        "allowed_methods": {
+          "default": [
+            "GET"
+          ],
+          "items": {
+            "const": "GET",
+            "type": "string"
+          },
+          "title": "Allowed Methods",
+          "type": "array"
+        },
+        "cache_control": {
+          "const": "private, no-store",
+          "default": "private, no-store",
+          "title": "Cache Control",
+          "type": "string"
+        },
+        "capability": {
+          "const": "gateway.evidence.read",
+          "default": "gateway.evidence.read",
+          "title": "Capability",
+          "type": "string"
+        },
+        "credential_scheme": {
+          "const": "Bearer",
+          "default": "Bearer",
+          "title": "Credential Scheme",
+          "type": "string"
+        },
+        "cursor_signing_key_is_bearer": {
+          "const": false,
+          "default": false,
+          "title": "Cursor Signing Key Is Bearer",
+          "type": "boolean"
+        },
+        "read_only": {
+          "const": true,
+          "default": true,
+          "title": "Read Only",
+          "type": "boolean"
+        },
+        "route_prefix": {
+          "const": "/api/v1/evidence",
+          "default": "/api/v1/evidence",
+          "title": "Route Prefix",
+          "type": "string"
+        }
+      },
+      "title": "EvidenceCapability",
+      "type": "object"
+    },
+    "EvidenceErrorResponse": {
+      "$defs": {
+        "EvidenceErrorDetail": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "enum": [
+                "evidence_cursor_invalid",
+                "authentication_required",
+                "evidence_observation_not_found",
+                "evidence_attachment_not_found",
+                "database_operation_failed",
+                "evidence_integrity_violation",
+                "evidence_operation_failed"
+              ],
+              "title": "Code",
+              "type": "string"
+            },
+            "request_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Request Id"
+            }
+          },
+          "required": [
+            "code"
+          ],
+          "title": "EvidenceErrorDetail",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "detail": {
+          "$ref": "#/$defs/EvidenceErrorDetail"
+        }
+      },
+      "required": [
+        "detail"
+      ],
+      "title": "EvidenceErrorResponse",
+      "type": "object"
+    },
+    "EvidenceRef": {
+      "$defs": {
+        "EvidenceLocator": {
+          "additionalProperties": false,
+          "description": "Closed v1 locator profile; there is intentionally no generic object_id.",
+          "properties": {
+            "attachment_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Attachment Id"
+            },
+            "attachment_observation_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Attachment Observation Id"
+            },
+            "conversation_observation_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Conversation Observation Id"
+            },
+            "mapping_node_observation_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Mapping Node Observation Id"
+            },
+            "message_revision_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Message Revision Id"
+            }
+          },
+          "title": "EvidenceLocator",
+          "type": "object"
+        },
+        "EvidenceVerification": {
+          "additionalProperties": false,
+          "description": "Material used to verify a scoped ref after API re-resolution.",
+          "properties": {
+            "canonical_fragment_fingerprint": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "minLength": 64,
+                  "pattern": "^[0-9a-fA-F]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Canonical Fragment Fingerprint"
+            },
+            "expected_fields": {
+              "anyOf": [
+                {
+                  "additionalProperties": {
+                    "$ref": "#/$defs/JsonValue"
+                  },
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Expected Fields"
+            },
+            "fingerprint_version": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Fingerprint Version"
+            },
+            "fragment_fingerprint_version": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Fragment Fingerprint Version"
+            },
+            "mode": {
+              "enum": [
+                "FINGERPRINT_AND_SCOPE",
+                "IDENTITY_AND_SCOPE"
+              ],
+              "title": "Mode",
+              "type": "string"
+            },
+            "observed_at": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Observed At"
+            },
+            "revision_fingerprint": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "minLength": 64,
+                  "pattern": "^[0-9a-fA-F]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Revision Fingerprint"
+            },
+            "semantic_revision_fingerprint": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "minLength": 64,
+                  "pattern": "^[0-9a-fA-F]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Semantic Revision Fingerprint"
+            },
+            "source_observation_fingerprint": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "minLength": 64,
+                  "pattern": "^[0-9a-fA-F]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Source Observation Fingerprint"
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "title": "EvidenceVerification",
+          "type": "object"
+        },
+        "JsonValue": {}
+      },
+      "additionalProperties": false,
+      "description": "A durable Gateway ref that can be re-resolved through Amendment #1.",
+      "properties": {
+        "layer": {
+          "const": "GATEWAY",
+          "default": "GATEWAY",
+          "title": "Layer",
+          "type": "string"
+        },
+        "locator": {
+          "$ref": "#/$defs/EvidenceLocator"
+        },
+        "object_type": {
+          "enum": [
+            "CONVERSATION_OBSERVATION",
+            "MAPPING_NODE_OBSERVATION",
+            "MESSAGE_REVISION",
+            "ATTACHMENT_OBSERVATION"
+          ],
+          "title": "Object Type",
+          "type": "string"
+        },
+        "verification": {
+          "$ref": "#/$defs/EvidenceVerification"
+        }
+      },
+      "required": [
+        "object_type",
+        "locator",
+        "verification"
+      ],
+      "title": "EvidenceRef",
+      "type": "object"
+    },
+    "NodePage": {
+      "$defs": {
+        "AttachmentEvidence": {
+          "additionalProperties": false,
+          "properties": {
+            "attachment_id": {
+              "format": "uuid",
+              "title": "Attachment Id",
+              "type": "string"
+            },
+            "filename": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Filename"
+            },
+            "media_type": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Media Type"
+            },
+            "size_bytes": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Size Bytes"
+            }
+          },
+          "required": [
+            "attachment_id",
+            "filename",
+            "media_type",
+            "size_bytes"
+          ],
+          "title": "AttachmentEvidence",
+          "type": "object"
+        },
+        "ConversationObservationSummary": {
+          "additionalProperties": false,
+          "properties": {
+            "archive_object_id": {
+              "format": "uuid",
+              "title": "Archive Object Id",
+              "type": "string"
+            },
+            "canonical_fragment_fingerprint": {
+              "title": "Canonical Fragment Fingerprint",
+              "type": "string"
+            },
+            "committed_at": {
+              "format": "date-time",
+              "title": "Committed At",
+              "type": "string"
+            },
+            "conversation_id": {
+              "format": "uuid",
+              "title": "Conversation Id",
+              "type": "string"
+            },
+            "conversation_observation_id": {
+              "format": "uuid",
+              "title": "Conversation Observation Id",
+              "type": "string"
+            },
+            "create_time_parse_status": {
+              "title": "Create Time Parse Status",
+              "type": "string"
+            },
+            "current_conversation_node_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Current Conversation Node Id"
+            },
+            "current_node_status": {
+              "title": "Current Node Status",
+              "type": "string"
+            },
+            "fragment_fingerprint_version": {
+              "title": "Fragment Fingerprint Version",
+              "type": "string"
+            },
+            "import_batch_commit_id": {
+              "format": "uuid",
+              "title": "Import Batch Commit Id",
+              "type": "string"
+            },
+            "normalized_created_at": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Normalized Created At"
+            },
+            "normalized_updated_at": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Normalized Updated At"
+            },
+            "observed_at": {
+              "format": "date-time",
+              "title": "Observed At",
+              "type": "string"
+            },
+            "observed_title": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Observed Title"
+            },
+            "parser_contract_version": {
+              "title": "Parser Contract Version",
+              "type": "string"
+            },
+            "parser_name": {
+              "title": "Parser Name",
+              "type": "string"
+            },
+            "source_account_id": {
+              "format": "uuid",
+              "title": "Source Account Id",
+              "type": "string"
+            },
+            "source_observation_fingerprint": {
+              "title": "Source Observation Fingerprint",
+              "type": "string"
+            },
+            "source_platform": {
+              "title": "Source Platform",
+              "type": "string"
+            },
+            "update_time_parse_status": {
+              "title": "Update Time Parse Status",
+              "type": "string"
+            }
+          },
+          "required": [
+            "conversation_observation_id",
+            "import_batch_commit_id",
+            "conversation_id",
+            "source_account_id",
+            "archive_object_id",
+            "source_platform",
+            "parser_name",
+            "parser_contract_version",
+            "committed_at",
+            "observed_at",
+            "observed_title",
+            "normalized_created_at",
+            "normalized_updated_at",
+            "create_time_parse_status",
+            "update_time_parse_status",
+            "current_conversation_node_id",
+            "current_node_status",
+            "source_observation_fingerprint",
+            "canonical_fragment_fingerprint",
+            "fragment_fingerprint_version"
+          ],
+          "title": "ConversationObservationSummary",
+          "type": "object"
+        },
+        "JsonValue": {},
+        "MessageRevisionEvidence": {
+          "additionalProperties": false,
+          "properties": {
+            "attachments": {
+              "items": {
+                "$ref": "#/$defs/AttachmentEvidence"
+              },
+              "title": "Attachments",
+              "type": "array"
+            },
+            "canonical_fragment_fingerprint": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Canonical Fragment Fingerprint"
+            },
+            "content_json": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/JsonValue"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "content_text": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Content Text"
+            },
+            "content_type": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Content Type"
+            },
+            "create_time_parse_status": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Create Time Parse Status"
+            },
+            "fingerprint_version": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Fingerprint Version"
+            },
+            "fragment_fingerprint_version": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Fragment Fingerprint Version"
+            },
+            "message_id": {
+              "format": "uuid",
+              "title": "Message Id",
+              "type": "string"
+            },
+            "message_observation_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Message Observation Id"
+            },
+            "message_revision_id": {
+              "format": "uuid",
+              "title": "Message Revision Id",
+              "type": "string"
+            },
+            "model": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Model"
+            },
+            "normalized_timestamp": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Normalized Timestamp"
+            },
+            "normalized_update_timestamp": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Normalized Update Timestamp"
+            },
+            "raw_timestamp": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Raw Timestamp"
+            },
+            "revision_fingerprint": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Revision Fingerprint"
+            },
+            "revision_no": {
+              "minimum": 1,
+              "title": "Revision No",
+              "type": "integer"
+            },
+            "role": {
+              "title": "Role",
+              "type": "string"
+            },
+            "semantic_revision_fingerprint": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Semantic Revision Fingerprint"
+            },
+            "source_observation_fingerprint": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source Observation Fingerprint"
+            },
+            "update_time_parse_status": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Update Time Parse Status"
+            }
+          },
+          "required": [
+            "message_id",
+            "message_revision_id",
+            "revision_no",
+            "role",
+            "content_text",
+            "content_json",
+            "content_type",
+            "model",
+            "raw_timestamp",
+            "normalized_timestamp",
+            "normalized_update_timestamp",
+            "create_time_parse_status",
+            "update_time_parse_status",
+            "semantic_revision_fingerprint",
+            "fingerprint_version",
+            "revision_fingerprint",
+            "message_observation_id",
+            "source_observation_fingerprint",
+            "canonical_fragment_fingerprint",
+            "fragment_fingerprint_version",
+            "attachments"
+          ],
+          "title": "MessageRevisionEvidence",
+          "type": "object"
+        },
+        "NodeEvidence": {
+          "additionalProperties": false,
+          "properties": {
+            "canonical_fragment_fingerprint": {
+              "title": "Canonical Fragment Fingerprint",
+              "type": "string"
+            },
+            "conversation_node_id": {
+              "format": "uuid",
+              "title": "Conversation Node Id",
+              "type": "string"
+            },
+            "declared_child_conversation_node_ids": {
+              "anyOf": [
+                {
+                  "items": {
+                    "format": "uuid",
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Declared Child Conversation Node Ids"
+            },
+            "fragment_fingerprint_version": {
+              "title": "Fragment Fingerprint Version",
+              "type": "string"
+            },
+            "mapping_node_observation_id": {
+              "format": "uuid",
+              "title": "Mapping Node Observation Id",
+              "type": "string"
+            },
+            "message": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/MessageRevisionEvidence"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "message_presence": {
+              "enum": [
+                "absent",
+                "null",
+                "object"
+              ],
+              "title": "Message Presence",
+              "type": "string"
+            },
+            "observation_order": {
+              "minimum": 0,
+              "title": "Observation Order",
+              "type": "integer"
+            },
+            "parent_conversation_node_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Parent Conversation Node Id"
+            },
+            "source_observation_fingerprint": {
+              "title": "Source Observation Fingerprint",
+              "type": "string"
+            }
+          },
+          "required": [
+            "mapping_node_observation_id",
+            "conversation_node_id",
+            "parent_conversation_node_id",
+            "declared_child_conversation_node_ids",
+            "message_presence",
+            "observation_order",
+            "source_observation_fingerprint",
+            "canonical_fragment_fingerprint",
+            "fragment_fingerprint_version",
+            "message"
+          ],
+          "title": "NodeEvidence",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "consistency": {
+          "const": "bounded_high_water_enumeration_v1",
+          "default": "bounded_high_water_enumeration_v1",
+          "title": "Consistency",
+          "type": "string"
+        },
+        "contract_version": {
+          "const": "evidence-query-v1",
+          "default": "evidence-query-v1",
+          "title": "Contract Version",
+          "type": "string"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/NodeEvidence"
+          },
+          "title": "Items",
+          "type": "array"
+        },
+        "limit": {
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "meaning": {
+          "const": "gateway_recorded_historical_evidence",
+          "default": "gateway_recorded_historical_evidence",
+          "title": "Meaning",
+          "type": "string"
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Next Cursor"
+        },
+        "observation": {
+          "$ref": "#/$defs/ConversationObservationSummary"
+        }
+      },
+      "required": [
+        "observation",
+        "items",
+        "next_cursor",
+        "limit"
+      ],
+      "title": "NodePage",
+      "type": "object"
+    },
+    "ObservationPage": {
+      "$defs": {
+        "ConversationObservationSummary": {
+          "additionalProperties": false,
+          "properties": {
+            "archive_object_id": {
+              "format": "uuid",
+              "title": "Archive Object Id",
+              "type": "string"
+            },
+            "canonical_fragment_fingerprint": {
+              "title": "Canonical Fragment Fingerprint",
+              "type": "string"
+            },
+            "committed_at": {
+              "format": "date-time",
+              "title": "Committed At",
+              "type": "string"
+            },
+            "conversation_id": {
+              "format": "uuid",
+              "title": "Conversation Id",
+              "type": "string"
+            },
+            "conversation_observation_id": {
+              "format": "uuid",
+              "title": "Conversation Observation Id",
+              "type": "string"
+            },
+            "create_time_parse_status": {
+              "title": "Create Time Parse Status",
+              "type": "string"
+            },
+            "current_conversation_node_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Current Conversation Node Id"
+            },
+            "current_node_status": {
+              "title": "Current Node Status",
+              "type": "string"
+            },
+            "fragment_fingerprint_version": {
+              "title": "Fragment Fingerprint Version",
+              "type": "string"
+            },
+            "import_batch_commit_id": {
+              "format": "uuid",
+              "title": "Import Batch Commit Id",
+              "type": "string"
+            },
+            "normalized_created_at": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Normalized Created At"
+            },
+            "normalized_updated_at": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Normalized Updated At"
+            },
+            "observed_at": {
+              "format": "date-time",
+              "title": "Observed At",
+              "type": "string"
+            },
+            "observed_title": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Observed Title"
+            },
+            "parser_contract_version": {
+              "title": "Parser Contract Version",
+              "type": "string"
+            },
+            "parser_name": {
+              "title": "Parser Name",
+              "type": "string"
+            },
+            "source_account_id": {
+              "format": "uuid",
+              "title": "Source Account Id",
+              "type": "string"
+            },
+            "source_observation_fingerprint": {
+              "title": "Source Observation Fingerprint",
+              "type": "string"
+            },
+            "source_platform": {
+              "title": "Source Platform",
+              "type": "string"
+            },
+            "update_time_parse_status": {
+              "title": "Update Time Parse Status",
+              "type": "string"
+            }
+          },
+          "required": [
+            "conversation_observation_id",
+            "import_batch_commit_id",
+            "conversation_id",
+            "source_account_id",
+            "archive_object_id",
+            "source_platform",
+            "parser_name",
+            "parser_contract_version",
+            "committed_at",
+            "observed_at",
+            "observed_title",
+            "normalized_created_at",
+            "normalized_updated_at",
+            "create_time_parse_status",
+            "update_time_parse_status",
+            "current_conversation_node_id",
+            "current_node_status",
+            "source_observation_fingerprint",
+            "canonical_fragment_fingerprint",
+            "fragment_fingerprint_version"
+          ],
+          "title": "ConversationObservationSummary",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "consistency": {
+          "const": "bounded_high_water_enumeration_v1",
+          "default": "bounded_high_water_enumeration_v1",
+          "title": "Consistency",
+          "type": "string"
+        },
+        "contract_version": {
+          "const": "evidence-query-v1",
+          "default": "evidence-query-v1",
+          "title": "Contract Version",
+          "type": "string"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/ConversationObservationSummary"
+          },
+          "title": "Items",
+          "type": "array"
+        },
+        "limit": {
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "meaning": {
+          "const": "gateway_recorded_historical_evidence",
+          "default": "gateway_recorded_historical_evidence",
+          "title": "Meaning",
+          "type": "string"
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Next Cursor"
+        }
+      },
+      "required": [
+        "items",
+        "next_cursor",
+        "limit"
+      ],
+      "title": "ObservationPage",
+      "type": "object"
+    }
+  },
+  "required": [
+    "ObservationPage",
+    "NodePage",
+    "AttachmentObservationPage",
+    "EvidenceRef",
+    "EvidenceCapability",
+    "EvidenceErrorResponse"
+  ],
+  "title": "Qingyu Gateway Evidence Query API v1",
+  "type": "object"
+}
