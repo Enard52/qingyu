@@ -209,9 +209,37 @@ def test_sample_001_normalized_evidence_reconstructs_complete_tree():
         selected_observation = next(
             item for item in attachment_observations if item.attachment_id == selected_attachment.id
         )
+
+        # A clean retry revalidates the earliest committed attachment evidence,
+        # succeeds, and does not append attempt-scoped replacement history.
+        clean_token = uuid.uuid4()
+        persisted_job = db.get(ImportJob, job.id)
+        persisted_job.status = "running"
+        persisted_job.lease_token = clean_token
+        persisted_job.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+        db.commit()
+        assert ImportWorker(db).mark_failed_or_partial(
+            job.id, clean_token, "forced_replay", {"errors": []}, "forced_replay"
+        ) == "partial"
+        assert ImportWorker(db).retry(job.id, "chatgpt-export", "1")
+        db.expire_all()
+        clean_replay_job = db.get(ImportJob, job.id)
+        clean_replay_job.status = "running"
+        clean_replay_job.attempt_count = 2
+        clean_replay_job.lease_token = clean_token
+        clean_replay_job.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+        db.commit()
+        clean_result = ImportProcessor(db, root).process(clean_replay_job, clean_token)
+        assert clean_result["attachments"]["available"] == 9
+        assert db.scalar(
+            select(__import__("sqlalchemy").func.count())
+            .select_from(AttachmentObservation)
+            .where(AttachmentObservation.import_job_id == job.id)
+        ) == 9
+
         db.add(AttachmentObservation(
             import_job_id=job.id,
-            attempt_number=2,
+            attempt_number=3,
             attachment_id=selected_attachment.id,
             availability="missing",
             resolution_status="missing",
@@ -237,7 +265,81 @@ def test_sample_001_normalized_evidence_reconstructs_complete_tree():
             if item["stable_attachment_key"] == selected_attachment.stable_attachment_key
         ]
         assert len(matching) == 1
-        assert matching[0]["availability"] == "missing"
+        # A committed batch reconstructs from its earliest durable attachment
+        # observation.  Later retry observations are operational history and
+        # must not rewrite the already-committed evidence tree.
+        assert matching[0]["availability"] == "available"
+
+        # Replaying the durable batch must validate against that same frozen
+        # observation.  If it has drifted, fail closed without appending yet
+        # another observation that would silently redefine history.
+        selected_observation.availability = "missing"
+        selected_observation.resolution_status = "missing"
+        db.commit()
+        replay_token = uuid.uuid4()
+        db.expire_all()
+        persisted_job = db.get(ImportJob, job.id)
+        persisted_job.status = "running"
+        persisted_job.lease_token = replay_token
+        persisted_job.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+        db.commit()
+        assert ImportWorker(db).mark_failed_or_partial(
+            job.id,
+            replay_token,
+            "forced_replay",
+            {"errors": []},
+            "forced_replay",
+        ) == "partial"
+        assert ImportWorker(db).retry(job.id, "chatgpt-export", "1")
+        db.expire_all()
+        replay_job = db.get(ImportJob, job.id)
+        replay_job.status = "running"
+        replay_job.attempt_count = 3
+        replay_job.lease_token = replay_token
+        replay_job.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+        db.commit()
+        observation_count = db.scalar(
+            select(__import__("sqlalchemy").func.count())
+            .select_from(AttachmentObservation)
+            .where(AttachmentObservation.import_job_id == job.id)
+        )
+        with pytest.raises(BatchReplayIdentityError, match="attachment_observation_replay_mismatch"):
+            ImportProcessor(db, root).process(replay_job, replay_token)
+        assert db.scalar(
+            select(__import__("sqlalchemy").func.count())
+            .select_from(AttachmentObservation)
+            .where(AttachmentObservation.import_job_id == job.id)
+        ) == observation_count
+
+        # If every durable observation for an attachment is missing, replay
+        # must fail before it can manufacture a replacement observation.
+        db.execute(
+            delete(AttachmentObservation).where(
+                AttachmentObservation.import_job_id == job.id,
+                AttachmentObservation.attachment_id == selected_attachment.id,
+            )
+        )
+        db.commit()
+        db.expire_all()
+        missing_replay_job = db.get(ImportJob, job.id)
+        missing_token = uuid.uuid4()
+        missing_replay_job.status = "running"
+        missing_replay_job.attempt_count = 4
+        missing_replay_job.lease_token = missing_token
+        missing_replay_job.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+        db.commit()
+        missing_count = db.scalar(
+            select(__import__("sqlalchemy").func.count())
+            .select_from(AttachmentObservation)
+            .where(AttachmentObservation.import_job_id == job.id)
+        )
+        with pytest.raises(BatchReplayIdentityError, match="attachment_observation_replay_missing"):
+            ImportProcessor(db, root).process(missing_replay_job, missing_token)
+        assert db.scalar(
+            select(__import__("sqlalchemy").func.count())
+            .select_from(AttachmentObservation)
+            .where(AttachmentObservation.import_job_id == job.id)
+        ) == missing_count
 
 
 def test_real_export_partial_retry_replays_snapshot_without_repair():

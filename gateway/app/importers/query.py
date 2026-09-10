@@ -78,7 +78,7 @@ class EvidenceTreeQuery:
                         (AttachmentObservation.attachment_id == Attachment.id)
                         & (AttachmentObservation.import_job_id == batch.import_job_id)
                         & (AttachmentObservation.attempt_number == (
-                            select(func.max(AttachmentObservation.attempt_number))
+                            select(func.min(AttachmentObservation.attempt_number))
                             .where(
                                 AttachmentObservation.import_job_id == batch.import_job_id,
                                 AttachmentObservation.attachment_id == Attachment.id,

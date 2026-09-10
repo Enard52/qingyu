@@ -1,5 +1,6 @@
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
+from collections import Counter
 import copy
 import uuid
 from sqlalchemy import and_, exists, func, or_, select, update
@@ -425,16 +426,19 @@ def ownership_predicate(job_id, token):
 
 def _overlay_attachment_truth(session, report, job_id, attempt_number) -> None:
     """Use committed attempt evidence instead of historical batch deltas."""
-    rows = session.execute(
-        select(AttachmentObservation.availability, func.count(AttachmentObservation.id))
-        .where(
-            AttachmentObservation.import_job_id == job_id,
-            AttachmentObservation.attempt_number == attempt_number,
-        )
-        .group_by(AttachmentObservation.availability)
-    ).all()
-    if not rows:
+    observations = session.scalars(
+        select(AttachmentObservation)
+        .where(AttachmentObservation.import_job_id == job_id)
+        .order_by(AttachmentObservation.attachment_id, AttachmentObservation.attempt_number)
+    )
+    chosen_by_attachment = {}
+    for observation in observations:
+        chosen_by_attachment.setdefault(observation.attachment_id, observation.availability)
+        if observation.attempt_number == attempt_number:
+            chosen_by_attachment[observation.attachment_id] = observation.availability
+    if not chosen_by_attachment:
         return
+    rows = Counter(chosen_by_attachment.values()).items()
     counts = {key: 0 for key in ("available", "missing", "referenced_only", "failed")}
     for availability, count in rows:
         counts[availability] = int(count)

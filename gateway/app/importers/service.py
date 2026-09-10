@@ -191,6 +191,7 @@ class ImportService:
                             work=work,
                             source_member=source_member,
                             archive_service=attachment_archive,
+                            durable_replay=real_export and existing_batch is not None,
                         )
                     except (ArchiveIntegrityError, OSError) as exc:
                         raise AttachmentPersistenceError(key, work.parsed) from exc
@@ -582,7 +583,10 @@ class ImportService:
         if actual_message_observations != expected_message_observations:
             raise BatchReplayIdentityError("batch_replay_message_observation_mismatch")
 
-    def _persist_attachment(self, *, job, attempt_number, revision, work, source_member, archive_service):
+    def _persist_attachment(
+        self, *, job, attempt_number, revision, work, source_member,
+        archive_service, durable_replay=False,
+    ):
         declared = work.parsed
         attachment = self.db.scalar(
             select(Attachment).where(
@@ -621,13 +625,19 @@ class ImportService:
         ):
             raise BatchReplayIdentityError("attachment_identity_mismatch")
 
-        existing = self.db.scalar(
-            select(AttachmentObservation).where(
-                AttachmentObservation.import_job_id == job.id,
-                AttachmentObservation.attempt_number == attempt_number,
-                AttachmentObservation.attachment_id == attachment.id,
-            )
+        existing_query = select(AttachmentObservation).where(
+            AttachmentObservation.import_job_id == job.id,
+            AttachmentObservation.attachment_id == attachment.id,
         )
+        if durable_replay:
+            existing_query = existing_query.order_by(AttachmentObservation.attempt_number)
+        else:
+            existing_query = existing_query.where(
+                AttachmentObservation.attempt_number == attempt_number
+            )
+        existing = self.db.scalar(existing_query)
+        if durable_replay and existing is None:
+            raise BatchReplayIdentityError("attachment_observation_replay_missing")
         if existing is not None:
             expected_references = list(declared.source_references) if declared.source_references else None
             expected_fragment = compute_canonical_fragment_fingerprint(
@@ -637,7 +647,13 @@ class ImportService:
             if (
                 existing.availability != work.availability
                 or existing.resolution_status != work.resolution_status
+                or existing.source_member != source_member
                 or existing.attachment_member_path != (work.resolved_member_path or declared.member_path)
+                or existing.raw_json_pointer != declared.raw_json_pointer
+                or existing.observed_filename != work.observed_filename
+                or existing.observed_media_type != work.observed_media_type
+                or existing.observed_size_bytes != work.observed_size_bytes
+                or existing.metadata_json != ({"error_code": work.error_code} if work.error_code else {})
                 or existing.source_references_json != expected_references
                 or existing.canonical_fragment_fingerprint != expected_fragment
                 or existing.fragment_fingerprint_version != (FRAGMENT_FINGERPRINT_VERSION if expected_fragment else None)
@@ -654,7 +670,7 @@ class ImportService:
                         ArchiveObservation.metadata_json["stable_attachment_key"].astext
                         == declared.stable_attachment_key,
                         ArchiveObservation.metadata_json["attempt_number"].astext
-                        == str(attempt_number),
+                        == str(existing.attempt_number),
                         ArchiveObservation.metadata_json["raw_json_pointer"].astext
                         == declared.raw_json_pointer,
                     ).order_by(ArchiveObservation.id)
@@ -718,16 +734,18 @@ class ImportService:
 
     def _attachment_counts(self, job_id, attempt_number):
         counts = {key: 0 for key in ("available", "missing", "referenced_only", "failed")}
-        rows = self.db.execute(
-            select(AttachmentObservation.availability, func.count(AttachmentObservation.id))
-            .where(
-                AttachmentObservation.import_job_id == job_id,
-                AttachmentObservation.attempt_number == attempt_number,
-            )
-            .group_by(AttachmentObservation.availability)
-        ).all()
-        for availability, count in rows:
-            counts[availability] = int(count)
+        observations = self.db.scalars(
+            select(AttachmentObservation)
+            .where(AttachmentObservation.import_job_id == job_id)
+            .order_by(AttachmentObservation.attachment_id, AttachmentObservation.attempt_number)
+        )
+        chosen_by_attachment = {}
+        for observation in observations:
+            chosen_by_attachment.setdefault(observation.attachment_id, observation.availability)
+            if observation.attempt_number == attempt_number:
+                chosen_by_attachment[observation.attachment_id] = observation.availability
+        for availability in chosen_by_attachment.values():
+            counts[availability] += 1
         return counts
 
 
