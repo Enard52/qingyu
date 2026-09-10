@@ -58,6 +58,7 @@ def test_epoch_and_old_lease_are_fenced_after_owner_transfer(foundation, genesis
                 payload={"x": 1},
             )
         )
+    assert service.identity_status().status == "READY"
     assert authority.get_domain(genesis_request.continuity_id).epoch == 1
 
 
