@@ -2,6 +2,7 @@ import logging
 import os
 import sys
 import threading
+import time
 
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -21,6 +22,13 @@ except DatabaseConfigurationError as exc:
 logger = logging.getLogger(__name__)
 
 
+def cleanup_failed_staging(*args, **kwargs):
+    """Lazy import preserves fail-closed startup diagnostics without DB side effects."""
+    from .cleanup import cleanup_failed_staging as cleanup
+
+    return cleanup(*args, **kwargs)
+
+
 class AttemptHealth:
     """Thread-safe heartbeat failure signal without retaining sensitive errors."""
     def __init__(self):
@@ -35,21 +43,83 @@ class AttemptHealth:
 
 
 class WorkerRuntime:
-    def __init__(self, archive_root, poll_interval=1.0, heartbeat_interval=10.0, lease_duration=30, error_backoff_max=5.0, session_factory=None):
+    def __init__(
+        self,
+        archive_root,
+        poll_interval=1.0,
+        heartbeat_interval=10.0,
+        lease_duration=30,
+        error_backoff_max=5.0,
+        session_factory=None,
+        staging_retention_days=7,
+        cleanup_interval_seconds=300.0,
+        cleanup_max_candidates=100,
+        monotonic=None,
+    ):
         self.archive_root = archive_root
         self.poll_interval = poll_interval
         self.heartbeat_interval = heartbeat_interval
         self.lease_duration = lease_duration
         self.error_backoff_max = error_backoff_max
+        self.staging_retention_days = staging_retention_days
+        self.cleanup_interval_seconds = cleanup_interval_seconds
+        self.cleanup_max_candidates = cleanup_max_candidates
+        self.monotonic = monotonic or time.monotonic
         if session_factory is None:
             from ..db import engine
             session_factory = lambda: Session(engine)
         self.session_factory = session_factory
         self.stop_event = threading.Event()
         self.last_iteration_failed = False
+        self._next_cleanup_at = None
+
+    def _maybe_run_cleanup(self) -> None:
+        now = self.monotonic()
+        if self._next_cleanup_at is not None and now < self._next_cleanup_at:
+            return
+
+        # Advance before cleanup so repeated failures cannot produce a tight loop.
+        self._next_cleanup_at = now + self.cleanup_interval_seconds
+        cleanup_db = None
+        try:
+            cleanup_db = self.session_factory()
+            result = cleanup_failed_staging(
+                self.archive_root,
+                cleanup_db,
+                retention_days=self.staging_retention_days,
+                max_candidates=self.cleanup_max_candidates,
+            )
+            if result.counts["failed"] or result.counts.get("quarantined", 0):
+                logger.warning(
+                    "staging cleanup completed with retained failures",
+                    extra={"cleanup_counts": result.counts},
+                )
+            elif result.counts["deleted"] or result.counts.get("quarantine_recovered", 0):
+                logger.info("staging cleanup completed", extra={"cleanup_counts": result.counts})
+        except Exception as exc:
+            if cleanup_db is not None:
+                try:
+                    cleanup_db.rollback()
+                except Exception:
+                    pass
+            safe_log_exception(
+                logger,
+                logging.ERROR,
+                "staging cleanup failed",
+                error_code="staging_cleanup_failed",
+                operation="cleanup_staging",
+                exception=exc,
+            )
+        finally:
+            if cleanup_db is not None:
+                try:
+                    cleanup_db.close()
+                except Exception:
+                    pass
 
     def run_once(self) -> bool:
         self.last_iteration_failed = False
+        self._maybe_run_cleanup()
         db = self.session_factory()
         heartbeat_stop = None
         heartbeat = None
@@ -174,6 +244,9 @@ def main() -> int:
             poll_interval=float(os.getenv("IMPORT_WORKER_POLL_SECONDS", "1")),
             heartbeat_interval=float(os.getenv("IMPORT_WORKER_HEARTBEAT_SECONDS", "10")),
             lease_duration=int(os.getenv("IMPORT_WORKER_LEASE_SECONDS", "30")),
+            staging_retention_days=settings.staging_failed_retention_days,
+            cleanup_interval_seconds=settings.staging_cleanup_interval_seconds,
+            cleanup_max_candidates=settings.staging_cleanup_max_candidates,
         )
         runtime.run_forever()
         return 0

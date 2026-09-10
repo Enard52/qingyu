@@ -1,10 +1,10 @@
 import hashlib
+import logging
 import mimetypes
 import os
 import re
 import shutil
 import stat
-import tempfile
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -14,11 +14,13 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from ..importers.staging import UnsafeStagingRoot, create_prejob_generation
 from ..models import ArchiveObject, ArchiveObservation
 from .manifest import sync_manifest_from_archive_object
 
 SAFE_NAME = re.compile(r"^[^<>:\"/\\|?*\x00-\x1f]+$")
 SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+logger = logging.getLogger(__name__)
 
 
 def _sha256_file(path: Path) -> str:
@@ -168,10 +170,13 @@ class ArchiveService:
         if not source.is_file():
             raise FileNotFoundError(source)
 
-        self._ensure_safe_directory("staging")
-        fd, staged_name = tempfile.mkstemp(prefix="incoming-", dir=self.staging)
-        os.close(fd)
-        staged = Path(staged_name)
+        try:
+            generation = create_prejob_generation(self.root, "archive-prepared")
+        except UnsafeStagingRoot as exc:
+            raise ArchiveIntegrityError(
+                "archive_integrity_failure: unsafe archive path"
+            ) from exc
+        staged = generation.payload_path()
         try:
             shutil.copyfile(source, staged)
             size = staged.stat().st_size
@@ -222,7 +227,12 @@ class ArchiveService:
                 observation_metadata=metadata,
             )
         finally:
-            staged.unlink(missing_ok=True)
+            cleanup = generation.close(remove=True)
+            if cleanup is not None and cleanup.status not in {"deleted", "missing"}:
+                logger.warning(
+                    "archive prepare staging cleanup incomplete",
+                    extra={"cleanup_outcome": cleanup.status},
+                )
 
     prepare_file = prepare
 

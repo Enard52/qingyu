@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from ..archive.manifest import sync_manifest_from_archive_object
 from ..models import ArchiveObject, AttachmentObservation, ImportBatchCommit, ImportJob
 from .report import empty_report
+from .staging import job_attempt_path
 from .status import COMPLETED, FAILED, PARTIAL, PENDING, RETRYABLE_STATUSES, RUNNING
 
 
@@ -141,7 +142,7 @@ class ImportWorker:
 
     def attempt_staging_path(self, root, job) -> str:
         self.check_ownership(job, job.lease_token)
-        return str(root / "staging" / str(job.id) / str(job.attempt_count) / str(job.lease_token))
+        return str(job_attempt_path(root, job.id, job.attempt_count, job.lease_token))
     def heartbeat(self, job, token, lease_duration: int = 300) -> bool:
         return self._owned(job, token, {"last_heartbeat_at": database_wall_clock(), "lease_expires_at": database_wall_clock() + timedelta(seconds=lease_duration)})
     def advance_checkpoint(self, job, token, sequence_no: int, batch_key: str) -> bool:

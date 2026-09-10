@@ -1,21 +1,24 @@
-import os
-import tempfile
+import logging
 import uuid
 from pathlib import Path
+
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+
+from .archive.service import ArchiveService
 from .auth import require_token
 from .config import get_settings
 from .db import get_db
-from .models import ArchiveObservation, ImportBatchCommit, ImportJob, SourceAccount
-from .archive.service import ArchiveService
 from .importers.generic import GenericTreeParser, ParserRegistry
 from .importers.retry_policy import resolve_durable_parser_contract
+from .importers.staging import create_prejob_generation
 from .importers.status import PENDING
 from .importers.worker import ImportWorker
+from .models import ImportBatchCommit, ImportJob, SourceAccount
 
 router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_token)])
+logger = logging.getLogger(__name__)
 
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 
@@ -32,31 +35,65 @@ def _write_upload_with_limit(file: UploadFile, destination: Path, max_bytes: int
                 )
             out.write(chunk)
 
+
 @router.post("/import/chatgpt", status_code=status.HTTP_202_ACCEPTED)
-def create_import(file: UploadFile = File(...), source_platform: str = Form("chatgpt"), db: Session = Depends(get_db)) -> dict:
+def create_import(
+    file: UploadFile = File(...),
+    source_platform: str = Form("chatgpt"),
+    db: Session = Depends(get_db),
+) -> dict:
     if not (file.filename or "").lower().endswith(".zip"):
         raise HTTPException(415, "仅支持 ZIP 导入")
     settings = get_settings()
     root = Path(settings.archive_root)
-    root.joinpath("staging").mkdir(parents=True, exist_ok=True)
-    fd, name = tempfile.mkstemp(prefix="import-upload-", dir=root / "staging")
-    os.close(fd)
-    temp = Path(name)
+    generation = create_prejob_generation(root, "uploads")
+    temp = generation.payload_path()
     try:
         _write_upload_with_limit(file, temp, settings.import_upload_max_bytes)
-        archived = ArchiveService(root, db).archive_file(temp, file.filename, source_platform, file.content_type)
-        account = db.scalar(select(SourceAccount).where(SourceAccount.platform == source_platform, SourceAccount.account_label == "default"))
-        if account is None:
-            account = SourceAccount(platform=source_platform, account_label="default", metadata_json={})
-            db.add(account); db.flush()
-        job = ImportJob(source_account_id=account.id, archive_object_id=archived.object_id, parser_name=GenericTreeParser.name, parser_version=GenericTreeParser.version, status=PENDING, report_json={})
-        db.add(job); db.flush()
-        observation = db.get(ArchiveObservation, archived.observation_id)
-        observation.import_job_id = job.id
-        db.commit()
-        return {"import_job_id": str(job.id)}
+        archive = ArchiveService(root, db)
+        prepared = archive.prepare(temp, file.filename, source_platform, file.content_type)
+        try:
+            pending_archive = archive.persist_prepared(prepared)
+            account = db.scalar(
+                select(SourceAccount).where(
+                    SourceAccount.platform == source_platform,
+                    SourceAccount.account_label == "default",
+                )
+            )
+            if account is None:
+                account = SourceAccount(
+                    platform=source_platform,
+                    account_label="default",
+                    metadata_json={},
+                )
+                db.add(account)
+                db.flush()
+            job = ImportJob(
+                source_account_id=account.id,
+                archive_object_id=pending_archive.object_id,
+                parser_name=GenericTreeParser.name,
+                parser_version=GenericTreeParser.version,
+                status=PENDING,
+                report_json={},
+            )
+            db.add(job)
+            db.flush()
+            job_id = job.id
+            pending_archive.observation.import_job_id = job.id
+            db.flush()
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        archive.finalize(pending_archive)
+        return {"import_job_id": str(job_id)}
     finally:
-        temp.unlink(missing_ok=True)
+        cleanup = generation.close(remove=True)
+        if cleanup is not None and cleanup.status not in {"deleted", "missing"}:
+            logger.warning(
+                "import upload staging cleanup incomplete",
+                extra={"cleanup_outcome": cleanup.status},
+            )
 
 @router.get("/import-jobs/{job_id}")
 def get_import_job(job_id: uuid.UUID, db: Session = Depends(get_db)) -> dict:

@@ -4,7 +4,10 @@ from .config import get_settings
 
 
 MULTIPART_OVERHEAD_BYTES = 1024 * 1024
-IMPORT_PATH = "/api/v1/import/chatgpt"
+UPLOAD_PATHS = frozenset({
+    "/api/v1/import/chatgpt",
+    "/api/v1/archive/objects",
+})
 
 
 class RequestBodyTooLarge(RuntimeError):
@@ -12,7 +15,7 @@ class RequestBodyTooLarge(RuntimeError):
 
 
 class ImportRequestSizeLimitMiddleware:
-    """Bound import request bodies before multipart parsing can spool them."""
+    """Bound upload request bodies before multipart parsing can spool them."""
 
     def __init__(self, app):
         self.app = app
@@ -21,7 +24,7 @@ class ImportRequestSizeLimitMiddleware:
         if (
             scope.get("type") != "http"
             or scope.get("method") != "POST"
-            or scope.get("path") != IMPORT_PATH
+            or scope.get("path") not in UPLOAD_PATHS
         ):
             await self.app(scope, receive, send)
             return

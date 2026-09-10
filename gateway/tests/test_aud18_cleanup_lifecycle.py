@@ -82,7 +82,16 @@ def test_terminal_orphan_recent_and_unknown_paths_are_classified(tmp_path):
         assert result.skipped_recent==[recent_path]
         assert {unknown.resolve(),active_upload.resolve()} <= set(result.skipped_unknown)
         assert active_upload.exists()
-        assert result.counts=={'deleted':3,'skipped_active':0,'skipped_recent':1,'skipped_unknown':2,'failed':0}
+        assert result.counts=={
+            'deleted':3,
+            'skipped_active':0,
+            'skipped_retention':1,
+            'skipped_recent':1,
+            'skipped_unknown':2,
+            'quarantined':0,
+            'quarantine_recovered':0,
+            'failed':0,
+        }
 
 
 def test_terminal_jobs_with_valid_ownership_are_protected_before_status(tmp_path):
@@ -125,11 +134,18 @@ def test_terminal_job_with_live_but_mismatched_ownership_fails_closed(tmp_path):
 def test_cleanup_delete_failure_is_reported_without_stopping_other_candidates(tmp_path,monkeypatch):
     with Session(engine) as db:
         _clear(db); path=_attempt(tmp_path,uuid.uuid4(),uuid.uuid4()); safe=_attempt(tmp_path,uuid.uuid4(),uuid.uuid4())
-        original=cleanup_module._quarantine_and_remove
-        monkeypatch.setattr(cleanup_module,'_quarantine_and_remove',lambda candidate,base: (_ for _ in ()).throw(PermissionError('busy')) if candidate==path else original(candidate,base))
+        original_move=cleanup_module._move_to_quarantine; original_remove=cleanup_module._remove_tree_without_links
+        quarantines={}
+        def observed_move(candidate,base):
+            quarantine=original_move(candidate,base); quarantines[candidate]=quarantine; return quarantine
+        def fail_selected(candidate):
+            if candidate==quarantines.get(path): raise PermissionError('busy')
+            return original_remove(candidate)
+        monkeypatch.setattr(cleanup_module,'_move_to_quarantine',observed_move)
+        monkeypatch.setattr(cleanup_module,'_remove_tree_without_links',fail_selected)
         result=cleanup_failed_staging(tmp_path,db,7)
-        assert result.failed==[path] and result.deleted==[safe]
-        assert path.exists() and not safe.exists()
+        assert result.quarantined==[quarantines[path]] and result.deleted==[safe]
+        assert quarantines[path].exists() and not path.exists() and not safe.exists()
 
 
 def test_directory_symlink_cannot_alias_and_delete_active_attempt(tmp_path):
@@ -244,10 +260,16 @@ def test_real_windows_file_lock_failure_does_not_stop_cleanup(tmp_path):
         assert handle not in (0,wintypes.HANDLE(-1).value)
         try:
             result=cleanup_failed_staging(tmp_path,db,7)
-            assert locked in result.failed and safe in result.deleted
+            # Windows may reject the atomic directory rename while a child was
+            # opened without FILE_SHARE_DELETE. This is an observable rename
+            # failure, so the source remains intact for the next pass.
+            assert result.failed==[locked] and safe in result.deleted
             assert locked.exists() and not safe.exists()
         finally:
             ctypes.windll.kernel32.CloseHandle(handle)
+        recovered=cleanup_failed_staging(tmp_path,db,7)
+        assert locked in recovered.deleted
+        assert not locked.exists()
 
 
 def test_expired_attempt_survives_cleanup_recovery_and_retry_claim(tmp_path):
@@ -277,7 +299,7 @@ def test_cleanup_cannot_delete_attempt_while_processor_is_copying(tmp_path,monke
         result=original(*args); entered.set(); assert release.wait(2); return result
     monkeypatch.setattr(processor_module,'copy_and_verify_archive',paused_copy)
     runtime=WorkerRuntime(root,poll_interval=.01,heartbeat_interval=.02,lease_duration=5); thread=threading.Thread(target=runtime.run_once); thread.start(); assert entered.wait(2)
-    attempt=next((root/'staging'/str(job_id)).glob('*/*')).resolve(); old=time.time()-10*86400; os.utime(attempt,(old,old))
+    attempt=next((root/'staging'/'jobs'/str(job_id)).glob('*/*')).resolve(); old=time.time()-10*86400; os.utime(attempt,(old,old))
     with Session(engine) as cleanup_db:
         result=cleanup_failed_staging(root,cleanup_db,7); assert result.skipped_active==[attempt] and attempt.exists()
     release.set(); thread.join(timeout=3); assert not thread.is_alive()

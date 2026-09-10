@@ -55,10 +55,30 @@ def test_oversized_import_returns_413_and_removes_temporary_file(tmp_path: Path,
 
     assert response.status_code == 413
     assert response.json()["detail"] == "上传文件超过 4 字节限制"
-    assert not list((tmp_path / "staging").glob("import-upload-*"))
+    assert not [path for path in (tmp_path / "staging" / "uploads").iterdir() if path.is_dir()]
 
 
-def test_request_body_limit_rejects_before_route_or_multipart_spooling(monkeypatch):
+def test_oversized_archive_returns_413_and_removes_temporary_file(tmp_path: Path, monkeypatch):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "archive_root", str(tmp_path))
+    monkeypatch.setattr(settings, "import_upload_max_bytes", 4)
+    app.dependency_overrides[get_db] = lambda: None
+    try:
+        response = TestClient(app).post(
+            "/api/v1/archive/objects",
+            headers=HEADERS,
+            files={"file": ("evidence.bin", b"12345", "application/octet-stream")},
+        )
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+    assert response.status_code == 413
+    assert response.json()["detail"] == "上传文件超过 4 字节限制"
+    assert not [path for path in (tmp_path / "staging" / "uploads").iterdir() if path.is_dir()]
+
+
+@pytest.mark.parametrize("path", ["/api/v1/import/chatgpt", "/api/v1/archive/objects"])
+def test_request_body_limit_rejects_before_route_or_multipart_spooling(monkeypatch, path: str):
     settings = get_settings()
     monkeypatch.setattr(settings, "import_upload_max_bytes", 4)
     route_called = False
@@ -84,7 +104,7 @@ def test_request_body_limit_rejects_before_route_or_multipart_spooling(monkeypat
         {
             "type": "http",
             "method": "POST",
-            "path": "/api/v1/import/chatgpt",
+            "path": path,
             "headers": [(b"content-length", str(5 + MULTIPART_OVERHEAD_BYTES).encode())],
         },
         receive,
@@ -95,7 +115,8 @@ def test_request_body_limit_rejects_before_route_or_multipart_spooling(monkeypat
     assert sent[0]["status"] == 413
 
 
-def test_chunked_request_body_is_limited_without_content_length(monkeypatch):
+@pytest.mark.parametrize("path", ["/api/v1/import/chatgpt", "/api/v1/archive/objects"])
+def test_chunked_request_body_is_limited_without_content_length(monkeypatch, path: str):
     settings = get_settings()
     monkeypatch.setattr(settings, "import_upload_max_bytes", 4)
     limit = 4 + MULTIPART_OVERHEAD_BYTES
@@ -119,7 +140,7 @@ def test_chunked_request_body_is_limited_without_content_length(monkeypatch):
     import asyncio
 
     asyncio.run(ImportRequestSizeLimitMiddleware(downstream)(
-        {"type": "http", "method": "POST", "path": "/api/v1/import/chatgpt", "headers": []},
+        {"type": "http", "method": "POST", "path": path, "headers": []},
         receive,
         send,
     ))

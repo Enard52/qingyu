@@ -1,8 +1,11 @@
-import hashlib, shutil, zipfile
+import hashlib, logging, zipfile
 from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from ..archive.service import ArchiveService
+from ..errors import safe_log_exception
+from .cleanup import cleanup_terminal_attempt
+from .staging import enqueue_staging_candidate
 from .zip_staging import safe_extract, ZipLimits, UnsupportedZipError
 from .attachments import prepare_attachment_work
 from .service import BatchReplayIdentityError, ImportService
@@ -14,6 +17,8 @@ from .retry_policy import (
 from .worker import ImportWorker, LeaseLost
 from ..models import ArchiveObject, ImportBatchCommit, ImportJob, SourceAccount
 
+logger = logging.getLogger(__name__)
+
 class ImportProcessor:
     def __init__(self, db, archive_root: Path, limits: ZipLimits = ZipLimits(), registry=None):
         self.db, self.root, self.limits = db, archive_root, limits
@@ -24,6 +29,7 @@ class ImportProcessor:
         worker=ImportWorker(self.db); health_check(); worker.check_ownership(job, token)
         attempt = None
         keep=False
+        cleanup_completed = False
         try:
             obj=self.db.get(ArchiveObject, job.archive_object_id)
             if obj is None: raise ValueError('archive_object_missing')
@@ -52,7 +58,15 @@ class ImportProcessor:
             if parser_block is not None:
                 raise NonRetryablePreflightError(parser_block)
             source=self.root/obj.relative_path
-            attempt=Path(worker.attempt_staging_path(self.root, job)); attempt.mkdir(parents=True, exist_ok=True)
+            attempt=Path(worker.attempt_staging_path(self.root, job))
+            jobs_root = (self.root / "staging" / "jobs").absolute()
+            attempt = attempt.absolute()
+            if attempt.is_relative_to(jobs_root):
+                enqueue_staging_candidate(
+                    jobs_root,
+                    attempt.relative_to(jobs_root).as_posix(),
+                )
+            attempt.mkdir(parents=True, exist_ok=False)
             verified_source = attempt / '_verified_input.zip'
             actual_size, actual_sha = copy_and_verify_archive(source, verified_source)
             health_check()
@@ -108,6 +122,8 @@ class ImportProcessor:
                 worker.mark_failed_or_partial(job_id, token, 'attachment_processing_failed', result, 'attachment_processing_failed')
             elif not worker.mark_completed(job_id, token, result, 'imported', outcome.counts):
                 raise LeaseLost('ownership_lost')
+            else:
+                cleanup_completed = True
             return result
         except LeaseLost:
             keep=True; self.db.rollback(); raise
@@ -171,7 +187,29 @@ class ImportProcessor:
             worker.mark_failed_or_partial(job_id, token, 'processor_error', {'errors':[{'type':'processor_error','detail':'processing failed','severity':'error'}]}, 'processor_error')
             raise
         finally:
-            if not keep and attempt is not None: shutil.rmtree(attempt, ignore_errors=True)
+            if cleanup_completed and not keep and attempt is not None:
+                try:
+                    cleanup = cleanup_terminal_attempt(
+                        self.root,
+                        self.db,
+                        job_id,
+                        job.attempt_count,
+                        token,
+                    )
+                    if cleanup.outcome not in {"deleted", "missing"}:
+                        logger.warning(
+                            "terminal attempt staging cleanup incomplete",
+                            extra={"cleanup_outcome": cleanup.outcome},
+                        )
+                except Exception as exc:
+                    safe_log_exception(
+                        logger,
+                        logging.ERROR,
+                        "terminal attempt staging cleanup failed",
+                        error_code="terminal_staging_cleanup_failed",
+                        operation="cleanup_terminal_staging",
+                        exception=exc,
+                    )
 
 class UnsupportedStructure(ValueError):
     def __init__(self, code: str):
