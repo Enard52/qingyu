@@ -384,15 +384,16 @@ class InMemoryControlPlane:
             if previous is not None:
                 if previous.payload_hash != payload_hash:
                     raise CoreError("MUTATION_RETRY_CONFLICT")
-                if previous.state == MutationState.COMMITTED:
-                    return previous
                 if (
                     previous.continuity_id != state.continuity_id
                     or previous.epoch != state.epoch
                     or previous.lease_id != uuid4_opaque(lease_id)
                     or previous.storage_generation_id != state.storage_generation_id
-                    or previous.expected_state_version != expected_state_version
                 ):
+                    raise CoreError("MUTATION_RETRY_CONTEXT_CONFLICT")
+                if previous.state == MutationState.COMMITTED:
+                    return previous
+                if previous.expected_state_version != expected_state_version:
                     raise CoreError("MUTATION_RETRY_CONTEXT_CONFLICT")
                 if previous.state == MutationState.ABORTED:
                     previous = MutationPermit(
