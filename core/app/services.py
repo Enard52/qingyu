@@ -769,6 +769,19 @@ class CoreFoundationService:
                 or claim.get("target_storage_generation_id") != str(request.target_storage_generation_id)
             ):
                 raise CoreError("RESTORE_REQUEST_CONFLICT")
+            checkpoint = self.authority.export_checkpoint(manifest.continuity_id)
+            expected_owner_record_hash = sha256_hex(
+                {
+                    "owner_version": checkpoint["owner_version"],
+                    "owner_principal_id": checkpoint["owner_principal_id"],
+                    "owner_key_fingerprint": checkpoint["owner_key_fingerprint"],
+                }
+            )
+            if (
+                request.current_owner_principal_id != checkpoint["owner_principal_id"]
+                or request.current_owner_record_hash != expected_owner_record_hash
+            ):
+                raise CoreError("RESTORE_OWNER_UNPROVEN")
             check = self._session()
             try:
                 genesis = check.scalar(select(GenesisRecord).limit(1))
