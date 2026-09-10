@@ -8,7 +8,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.responses import JSONResponse
 
 from .config import Settings, get_settings, require_capability_token
-from .control_plane import InMemoryControlPlane, UnavailableControlPlane
+from .control_plane import InMemoryControlPlane, PostgresControlPlane, UnavailableControlPlane
 from .db import get_db, session_factory
 from .errors import CoreError
 from .schemas import GenesisRequest, IdentityStatus, MutationRequest, MutationResult
@@ -20,17 +20,19 @@ app = FastAPI(title="Qingyu Core", version="0.1.0")
 
 
 @lru_cache
-def _authority_for(settings_key: tuple[str, str]) -> InMemoryControlPlane | UnavailableControlPlane:
-    backend, env = settings_key
+def _authority_for(settings_key: tuple[str, str, str | None]) -> InMemoryControlPlane | PostgresControlPlane | UnavailableControlPlane:
+    backend, env, store = settings_key
     if backend == "memory":
         return InMemoryControlPlane()
+    if backend == "postgres" and store:
+        return PostgresControlPlane(store)
     return UnavailableControlPlane()
 
 
 def get_service(settings: Settings = Depends(get_settings)) -> CoreFoundationService:
     if not settings.core_database_url:
         raise CoreError("CORE_DATABASE_URL_REQUIRED")
-    authority = _authority_for((settings.control_plane_backend, settings.app_env))
+    authority = _authority_for((settings.control_plane_backend, settings.app_env, settings.control_plane_store))
     return CoreFoundationService(session_factory(settings), authority)
 
 

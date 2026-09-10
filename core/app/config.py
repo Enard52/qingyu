@@ -66,12 +66,23 @@ class Settings(BaseSettings):
                 raise ValueError("CORE_DATABASE_URL database name is required")
             if parsed.database.lower() in FORBIDDEN_DATABASE_NAMES:
                 raise ValueError("CORE_DATABASE_URL targets a forbidden database")
-        if self.control_plane_backend not in {"unavailable", "memory"}:
+        if self.control_plane_backend not in {"unavailable", "memory", "postgres"}:
             raise ValueError("unsupported control-plane backend")
         if self.app_env not in {"test", "development"} and self.control_plane_backend == "memory":
             raise ValueError("memory control-plane backend is test/development only")
         if self.app_env == "production" and self.control_plane_backend == "unavailable":
             raise ValueError("production requires an external control-plane backend")
+        if self.control_plane_backend == "postgres":
+            if not self.control_plane_store:
+                raise ValueError("CORE_CONTROL_PLANE_STORE is required for postgres backend")
+            try:
+                cp_url = make_url(self.control_plane_store)
+            except ArgumentError as exc:
+                raise ValueError("CORE_CONTROL_PLANE_STORE is invalid") from exc
+            if not cp_url.database or cp_url.database.lower() in FORBIDDEN_DATABASE_NAMES:
+                raise ValueError("CORE_CONTROL_PLANE_STORE targets a forbidden database")
+            if self.core_database_url and cp_url.render_as_string(hide_password=True) == make_url(self.core_database_url).render_as_string(hide_password=True):
+                raise ValueError("control-plane store must be independent from Core database")
         return self
 
     @property

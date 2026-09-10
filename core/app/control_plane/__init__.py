@@ -4,6 +4,6 @@ from .authority import (
     InMemoryControlPlane,
     UnavailableControlPlane,
 )
+from .postgres import PostgresControlPlane
 
-__all__ = ["InMemoryControlPlane", "UnavailableControlPlane"]
-
+__all__ = ["InMemoryControlPlane", "UnavailableControlPlane", "PostgresControlPlane"]
