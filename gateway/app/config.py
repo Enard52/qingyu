@@ -1,4 +1,5 @@
 from functools import lru_cache
+import secrets
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field, model_validator
 
@@ -8,6 +9,8 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8000
     api_token: str = ""
+    evidence_read_api_token: str = ""
+    evidence_cursor_signing_key: str = ""
     database_url: str | None = None
     log_level: str = "INFO"
     archive_root: str = "<repo>/data"
@@ -20,9 +23,26 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def secure_api_token(self):
         normalized = self.api_token.strip().lower()
+        normalized_evidence = self.evidence_read_api_token.strip().lower()
+        normalized_cursor_key = self.evidence_cursor_signing_key.strip().lower()
         forbidden = {"", "changeme", "example", "change-this-local-token", "change-me"}
-        if self.app_env.lower() != "test" and normalized in forbidden:
-            raise ValueError("API_TOKEN must be a non-example secret")
+        if self.app_env.lower() != "test":
+            if normalized in forbidden:
+                raise ValueError("API_TOKEN must be a non-example secret")
+            if normalized_evidence in forbidden:
+                raise ValueError("EVIDENCE_READ_API_TOKEN must be a non-example secret")
+            if normalized_cursor_key in forbidden:
+                raise ValueError("EVIDENCE_CURSOR_SIGNING_KEY must be a non-example secret")
+            if secrets.compare_digest(self.api_token, self.evidence_read_api_token):
+                raise ValueError("EVIDENCE_READ_API_TOKEN must differ from API_TOKEN")
+            if secrets.compare_digest(self.evidence_cursor_signing_key, self.api_token):
+                raise ValueError("EVIDENCE_CURSOR_SIGNING_KEY must differ from API_TOKEN")
+            if secrets.compare_digest(
+                self.evidence_cursor_signing_key, self.evidence_read_api_token
+            ):
+                raise ValueError(
+                    "EVIDENCE_CURSOR_SIGNING_KEY must differ from EVIDENCE_READ_API_TOKEN"
+                )
         return self
 
 @lru_cache

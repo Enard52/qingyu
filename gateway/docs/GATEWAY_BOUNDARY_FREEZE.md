@@ -38,3 +38,17 @@ Changes to this boundary require an architecture review that proves the Source-o
 Privacy is part of this boundary: public DTOs and logs must not expose database URLs, tokens, server filesystem paths, raw exception strings, tracebacks, lease tokens, or process identifiers. The current Phase 3 review found no concrete disclosure of these protected values. Archive responses already use explicit public DTOs; Import Job responses still project a broad durable report and therefore require producer discipline. Replacing that broad projection with an explicit allow-list is recorded as P3 hardening, and any future report producer requires privacy review.
 
 Source-native ZIP member names and RFC 6901 locators may remain internal Evidence. Any API, UI, export, or log disclosure of those locators must be explicitly necessary, authorized for the requester, and minimized to the purpose.
+
+## Frozen Maintenance Amendment #1
+
+The GET-only, runtime-neutral Evidence Query API defined in
+`GATEWAY_FROZEN_MAINTENANCE_AMENDMENT_1.md` is an approved maintenance extension
+subject to Stage 0 review. It exposes explicit allow-list projections of already
+committed Evidence and creates no new historical authority. It does not reopen
+Phase 3, add a reverse authority path, or permit Core to connect to the Gateway
+database.
+
+The extension's pagination guarantee is bounded high-water keyset enumeration,
+not a database snapshot. Consumers periodically rescan from the first page and
+deduplicate immutable observation identifiers so concurrently late commits are
+eventually discovered.

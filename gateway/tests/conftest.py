@@ -33,6 +33,12 @@ validated_url = validate_test_database_url(TEST_DATABASE_URL)
 os.environ["DATABASE_URL"] = validated_url.render_as_string(hide_password=False)
 os.environ["APP_ENV"] = "test"
 os.environ["API_TOKEN"] = os.getenv("TEST_API_TOKEN", "qingyu-test-token-only")
+os.environ["EVIDENCE_READ_API_TOKEN"] = os.getenv(
+    "TEST_EVIDENCE_READ_API_TOKEN", "qingyu-test-evidence-read-token-only"
+)
+os.environ["EVIDENCE_CURSOR_SIGNING_KEY"] = os.getenv(
+    "TEST_EVIDENCE_CURSOR_SIGNING_KEY", "qingyu-test-server-only-cursor-signing-key"
+)
 
 
 @pytest.fixture(scope="session", autouse=True)

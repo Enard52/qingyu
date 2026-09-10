@@ -11,6 +11,7 @@ from .logging_config import configure_logging
 from .request_limits import ImportRequestSizeLimitMiddleware
 from .api_import import router as import_router
 from .api_archive import router as archive_router
+from .api_evidence import router as evidence_router
 
 settings = get_settings()
 configure_logging(settings.log_level)
@@ -18,6 +19,39 @@ app = FastAPI(title=settings.app_name, version="0.1.0")
 app.add_middleware(ImportRequestSizeLimitMiddleware)
 app.include_router(archive_router)
 app.include_router(import_router)
+app.include_router(evidence_router)
+
+
+@app.middleware("http")
+async def evidence_response_cache_policy(request, call_next):
+    is_evidence = request.url.path.startswith("/api/v1/evidence")
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        if not is_evidence:
+            raise
+        request_id = uuid.uuid4().hex
+        safe_log_exception(
+            logging.getLogger(__name__),
+            logging.ERROR,
+            "evidence request failed",
+            error_code="evidence_operation_failed",
+            operation="evidence_query",
+            exception=exc,
+            correlation_id=request_id,
+        )
+        response = JSONResponse(
+            status_code=500,
+            content={
+                "detail": {
+                    "code": "evidence_operation_failed",
+                    "request_id": request_id,
+                }
+            },
+        )
+    if is_evidence:
+        response.headers["Cache-Control"] = "private, no-store"
+    return response
 
 @app.exception_handler(SQLAlchemyError)
 async def database_error_handler(request, exc):

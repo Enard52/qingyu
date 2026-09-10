@@ -44,6 +44,18 @@ Back up one mutually consistent set containing:
 8. Query Conversation, Node, Revision, and Attachment evidence and reconstruct every Sample #001 batch.
 9. Compare reconstructed topology and evidence with the source export: 15 conversations, 944 nodes, 929 messages, 15 null structural nodes, 15 roots, 3 branch parents, 18 leaves, 15 current nodes, 941 current-path nodes, 9 resolved referenced bytes, and 3 raw-only blobs.
 10. Run validation with no staging directory and without a worker, runtime, memory engine, or model provider.
+11. With a dedicated read token, enumerate the restored conversation observations
+    and node pages through the Evidence Query API. Require the same immutable
+    references, topology, MessageRevision bindings, fingerprints, and attachment
+    observation attempts as direct restore validation. Run this only against the
+    isolated restored database and archive root.
+12. Verify API responses declare `bounded_high_water_enumeration_v1`; exercise a
+    fresh-from-first-page rescan and deduplicate by immutable conversation and
+    attachment observation IDs. Do not describe this enumeration as a database
+    snapshot.
+13. Restore `EVIDENCE_CURSOR_SIGNING_KEY` as protected server-only configuration,
+    distinct from both bearer tokens. Rotating it intentionally invalidates all
+    outstanding Evidence cursors; it does not alter Evidence records.
 
 The repository helper `scripts/phase3_sample_acceptance.py` imports or validates Sample #001 only in allowlisted disposable database names. The final acceptance record must include the exact commands, tool versions, counts, hashes, and cleanup confirmation.
 

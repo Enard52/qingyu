@@ -36,3 +36,16 @@ Every durable normalized fact must be traceable to an ArchiveObject and source-n
 ## Rebuild invariant
 
 A clean compatible Gateway plus the Evidence DB, raw archive objects, manifests, schema/version metadata, and configuration metadata must be sufficient to restore and query normalized evidence without staging data, the original worker process, Hermes, Mem0/Graphiti, a model provider, or network inference.
+
+## Evidence Query API interpretation
+
+The Amendment #1 Evidence Query API is a read-only projection of Raw Archive and
+Normalized Evidence records. Its `gateway_recorded_historical_evidence` marker is
+the mandatory interpretation: returned content proves what the Gateway recorded,
+not that a proposition is objectively true. Multiple observations remain distinct;
+the API does not synthesize a latest truth. Convenience values such as
+`Conversation.title` are not substituted for an observation's historical value.
+The consistency marker `bounded_high_water_enumeration_v1` is deliberately not a
+database-snapshot claim: a concurrent late commit may be absent from one pass.
+Consumers periodically restart enumeration and deduplicate immutable observation
+identifiers.

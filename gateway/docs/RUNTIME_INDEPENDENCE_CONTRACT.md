@@ -22,7 +22,7 @@ Qingyu Memory Gateway is runtime-neutral. Hermes and future runtimes are clients
 
 These are requirements, not Phase 3 APIs or schema:
 
-- `continuity_id`: stable cross-session continuity identity, independent of a vendor runtime; assignment and remapping are Gateway-governed, versioned, and provenanced, never unilaterally controlled by a runtime;
+- `continuity_id`: stable opaque cross-session identity owned by Qingyu Core, independent of a vendor runtime; Gateway does not create, assign, remap, rename, merge, retire, or determine equality for it, and runtimes may not control it;
 - `event_id`: idempotent append identity for a runtime event;
 - `runtime_session_id`: scoped execution-session correlation, never a history identity;
 - context retrieval: explicit query, authorization, evidence references, version/cursor, and deterministic result metadata;
@@ -32,3 +32,22 @@ These are requirements, not Phase 3 APIs or schema:
 - derived-memory provenance: algorithm/model/version, input evidence set, creation time, invalidation state, and rebuildability.
 
 Any future proposal must preserve replaceability: deleting a runtime, local journal, context cache, or derived-memory store cannot destroy Gateway Evidence.
+
+## Amendment #1 realization
+
+This amendment supersedes the earlier future-design statement that continuity
+assignment or remapping would be Gateway-governed. `continuity_id` and
+`continuity_alias` belong to Qingyu Core; a continuity identifier is immutable
+and cannot be remapped. Gateway remains an Evidence system and does not become an
+identity registry.
+
+The runtime-neutral requirements for authorized Evidence retrieval are realized by
+the GET-only API in `GATEWAY_FROZEN_MAINTENANCE_AMENDMENT_1.md`. Consumers use
+opaque Gateway Evidence references, versioned deterministic result metadata, and
+integrity-protected cursors. The API accepts no runtime or continuity identity and
+does not import a runtime dependency. Its dedicated bearer capability cannot call
+Gateway mutation routes.
+
+Enumeration is explicitly bounded high-water keyset pagination rather than a
+database snapshot. Runtime-neutral consumers must periodically rescan from the
+first page and deduplicate immutable Gateway observation IDs.
