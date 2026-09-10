@@ -170,6 +170,15 @@ class CoreFoundationService:
                 existing = session.scalar(select(GenesisRecord).limit(1))
                 if existing is not None:
                     if existing.manifest_hash == manifest_hash:
+                        reservation = self.authority.genesis_status(existing.trust_domain_id)
+                        if (
+                            reservation is None
+                            or reservation.state.value != "COMMITTED"
+                            or metadata.active_storage_generation_id is None
+                            or reservation.claimed_storage_generation_id != metadata.active_storage_generation_id
+                        ):
+                            metadata.status = "RESTORE_QUARANTINED"
+                            raise CoreError("GENESIS_OUTCOME_UNKNOWN")
                         return GenesisResult(
                             genesis_id=existing.genesis_id,
                             qingyu_identity_id=existing.qingyu_identity_id,
@@ -179,9 +188,7 @@ class CoreFoundationService:
                             status="COMMITTED",
                             fingerprint=existing.fingerprint,
                             manifest_hash=existing.manifest_hash,
-                            storage_generation_id=(
-                                metadata.active_storage_generation_id or storage_generation_id
-                            ),
+                            storage_generation_id=metadata.active_storage_generation_id,
                         )
                     raise CoreError("GENESIS_ALREADY_EXISTS")
                 identity_count = session.scalar(select(func.count()).select_from(IdentityRegistry)) or 0
@@ -543,6 +550,7 @@ class CoreFoundationService:
         continuity_id = self.require_canonical_continuity(request.continuity_id)
         session = self._session()
         permit: MutationPermit | None = None
+        commit_attempted = False
         try:
             state = session.get(ControlPlaneState, continuity_id)
             if state is None:
@@ -613,6 +621,7 @@ class CoreFoundationService:
                 )
                 session.add(receipt)
                 audit_head_hash = audit.record_hash
+            commit_attempted = True
             committed = self.authority.commit_mutation(
                 mutation_id=request.mutation_id,
                 local_commit_id=local_commit_id,
@@ -641,21 +650,22 @@ class CoreFoundationService:
                     self.authority.abort_mutation(request.mutation_id)
                 except CoreError:
                     pass
-            session.rollback()
-            cleanup = self._session()
-            try:
-                with cleanup.begin():
-                    metadata = cleanup.get(CoreMetadata, 1, with_for_update=True)
-                    receipt = cleanup.get(MutationReceipt, request.mutation_id)
-                    if receipt is not None and receipt.status == "PREPARED":
-                        receipt.status = "ABORTED"
-                    if metadata is not None:
-                        metadata.status = "RESTORE_QUARANTINED"
-                    state = cleanup.get(ControlPlaneState, continuity_id, with_for_update=True)
-                    if state is not None:
-                        state.status = "RESTORE_QUARANTINED"
-            finally:
-                cleanup.close()
+            if commit_attempted:
+                session.rollback()
+                cleanup = self._session()
+                try:
+                    with cleanup.begin():
+                        metadata = cleanup.get(CoreMetadata, 1, with_for_update=True)
+                        receipt = cleanup.get(MutationReceipt, request.mutation_id)
+                        if receipt is not None and receipt.status == "PREPARED":
+                            receipt.status = "ABORTED"
+                        if metadata is not None:
+                            metadata.status = "RESTORE_QUARANTINED"
+                        state = cleanup.get(ControlPlaneState, continuity_id, with_for_update=True)
+                        if state is not None:
+                            state.status = "RESTORE_QUARANTINED"
+                finally:
+                    cleanup.close()
             raise
         finally:
             session.close()
@@ -678,6 +688,8 @@ class CoreFoundationService:
                 or genesis.initial_owner_fingerprint != manifest.initial_owner_fingerprint
                 or genesis.manifest_hash != manifest.manifest_hash
                 or genesis.witness_set_version != manifest.witness_set_version
+                or metadata.active_storage_generation_id != manifest.storage_generation_id
+                or metadata.control_plane_generation_id != manifest.control_plane_generation_id
             ):
                 raise CoreError("RESTORE_IDENTITY_MISMATCH")
             if (

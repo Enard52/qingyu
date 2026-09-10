@@ -66,7 +66,7 @@ class Settings(BaseSettings):
                 raise ValueError("CORE_DATABASE_URL database name is required")
             if parsed.database.lower() in FORBIDDEN_DATABASE_NAMES:
                 raise ValueError("CORE_DATABASE_URL targets a forbidden database")
-        if self.control_plane_backend not in {"unavailable", "memory", "sqlite-quorum"}:
+        if self.control_plane_backend not in {"unavailable", "memory"}:
             raise ValueError("unsupported control-plane backend")
         if self.app_env not in {"test", "development"} and self.control_plane_backend == "memory":
             raise ValueError("memory control-plane backend is test/development only")
@@ -104,4 +104,3 @@ def require_capability_token(settings: Settings, supplied: str | None) -> None:
     expected = settings.control_plane_token
     if not expected or not supplied or not secrets.compare_digest(supplied, expected):
         raise PermissionError("governance_capability_required")
-

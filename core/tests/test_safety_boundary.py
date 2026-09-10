@@ -22,6 +22,11 @@ def test_settings_rejects_forbidden_core_database():
         Settings(CORE_DATABASE_URL="postgresql+psycopg://x:PASSWORD@localhost/qingyu")
 
 
+def test_settings_rejects_unimplemented_control_plane_backend():
+    with pytest.raises(ValidationError, match="unsupported control-plane backend"):
+        Settings(CORE_CONTROL_PLANE_BACKEND="sqlite-quorum")
+
+
 def test_database_safety_requires_explicit_core_name():
     settings = Settings(CORE_DATABASE_URL="sqlite+pysqlite:///:memory:")
     engine = create_engine("sqlite+pysqlite:///:memory:")
