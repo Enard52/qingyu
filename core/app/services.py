@@ -760,18 +760,42 @@ class CoreFoundationService:
                     )
         finally:
             existing_session.close()
-        verification = self.verify_restore(request)
         manifest = request.manifest
-        claim = self.authority.claim_recovery(
-            request_id=request.request_id,
-            trust_domain_id=manifest.trust_domain_id,
-            continuity_id=manifest.continuity_id,
-            current_owner_principal_id=request.current_owner_principal_id,
-            current_owner_record_hash=request.current_owner_record_hash,
-            target_storage_generation_id=request.target_storage_generation_id,
-            restore_manifest_hash=manifest.manifest_hash,
-        )
-        claim = self.authority.activate_recovery(request.request_id)
+        claim = self.authority.recovery_status(request.request_id)
+        if claim is not None and claim.get("status") == "ACTIVE":
+            if (
+                claim.get("restore_manifest_hash") != manifest.manifest_hash
+                or claim.get("continuity_id") != str(manifest.continuity_id)
+                or claim.get("target_storage_generation_id") != str(request.target_storage_generation_id)
+            ):
+                raise CoreError("RESTORE_REQUEST_CONFLICT")
+            check = self._session()
+            try:
+                genesis = check.scalar(select(GenesisRecord).limit(1))
+                if genesis is None or genesis.trust_domain_id != manifest.trust_domain_id or genesis.qingyu_identity_id != manifest.qingyu_identity_id or genesis.continuity_id != manifest.continuity_id or genesis.fingerprint != manifest.genesis_fingerprint or genesis.manifest_hash != manifest.manifest_hash:
+                    raise CoreError("RESTORE_IDENTITY_MISMATCH")
+                audit = verify_audit_chain(check)
+                verification = RestoreVerification(
+                    same_identity=True,
+                    read_only=True,
+                    reason="RESTORE_RECONCILIATION",
+                    continuity_epoch=int(claim["target_epoch"]),
+                    audit=audit,
+                )
+            finally:
+                check.close()
+        else:
+            verification = self.verify_restore(request)
+            claim = self.authority.claim_recovery(
+                request_id=request.request_id,
+                trust_domain_id=manifest.trust_domain_id,
+                continuity_id=manifest.continuity_id,
+                current_owner_principal_id=request.current_owner_principal_id,
+                current_owner_record_hash=request.current_owner_record_hash,
+                target_storage_generation_id=request.target_storage_generation_id,
+                restore_manifest_hash=manifest.manifest_hash,
+            )
+            claim = self.authority.activate_recovery(request.request_id)
         session = self._session()
         try:
             with session.begin():

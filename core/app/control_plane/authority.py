@@ -392,6 +392,8 @@ class InMemoryControlPlane:
                 ):
                     raise CoreError("MUTATION_RETRY_CONTEXT_CONFLICT")
                 if previous.state == MutationState.COMMITTED:
+                    if expected_state_version < previous.assigned_state_version:
+                        raise CoreError("MUTATION_RETRY_CONTEXT_CONFLICT")
                     return previous
                 if previous.expected_state_version != expected_state_version:
                     raise CoreError("MUTATION_RETRY_CONTEXT_CONFLICT")
@@ -575,6 +577,11 @@ class InMemoryControlPlane:
             claim["target_epoch"] = state.epoch
             claim["status"] = RecoveryState.ACTIVE.value
             return claim
+
+    def recovery_status(self, request_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            claim = self._recovery_claims.get(request_id)
+            return dict(claim) if claim is not None else None
 
     def export_checkpoint(self, continuity_id: uuid.UUID) -> dict[str, Any]:
         with self._lock:
