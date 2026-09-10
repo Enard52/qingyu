@@ -730,9 +730,26 @@ class CoreFoundationService:
         try:
             existing = existing_session.get(RestoreRecord, request.request_id)
             if existing is not None:
-                if existing.manifest_hash != request.manifest.manifest_hash:
+                state = existing_session.get(ControlPlaneState, existing.continuity_id)
+                if (
+                    existing.manifest_hash != request.manifest.manifest_hash
+                    or existing.trust_domain_id != request.manifest.trust_domain_id
+                    or existing.continuity_id != request.manifest.continuity_id
+                    or request.target_storage_generation_id != existing.target_storage_generation_id
+                    or state is None
+                    or state.active_storage_generation_id != existing.target_storage_generation_id
+                    or state.control_plane_generation_id != request.manifest.control_plane_generation_id
+                    or state.owner_principal_id != request.current_owner_principal_id
+                    or request.current_owner_record_hash
+                    != sha256_hex(
+                        {
+                            "owner_version": state.owner_version,
+                            "owner_principal_id": state.owner_principal_id,
+                            "owner_key_fingerprint": state.owner_key_fingerprint,
+                        }
+                    )
+                ):
                     raise CoreError("RESTORE_REQUEST_CONFLICT")
-                state = existing_session.get(ControlPlaneState, request.manifest.continuity_id)
                 if existing.status == "ACTIVE" and state is not None:
                     return RestoreVerification(
                         same_identity=True,
