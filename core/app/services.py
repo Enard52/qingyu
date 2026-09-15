@@ -8,7 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from .audit import append_audit, verify_audit_chain
+from .audit import append_audit, verify_audit_chain, verify_audit_row
 from .canonical import sha256_hex, uuid4_opaque
 from .control_plane.authority import (
     InMemoryControlPlane,
@@ -17,6 +17,7 @@ from .control_plane.authority import (
 )
 from .errors import CoreError
 from .models import (
+    AuditLedger,
     ContinuityAlias,
     ContinuityRegistry,
     ControlPlaneState,
@@ -65,7 +66,7 @@ class CoreFoundationService:
         return self.session_factory()
 
     @staticmethod
-    def _manifest(request: GenesisRequest) -> dict[str, object]:
+    def _manifest(request: GenesisRequest | GenesisRecord) -> dict[str, object]:
         return {
             "trust_domain_id": str(request.trust_domain_id),
             "qingyu_identity_id": str(request.qingyu_identity_id),
@@ -94,8 +95,129 @@ class CoreFoundationService:
                 ).scalar_one_or_none()
                 if metadata is not None:
                     metadata.status = "RESTORE_QUARANTINED"
+                for state in session.scalars(select(ControlPlaneState).with_for_update()):
+                    state.status = "RESTORE_QUARANTINED"
+                    state.lease_id = None
         finally:
             session.close()
+
+    def _local_projection(
+        self, session: Session, continuity_id: uuid.UUID, *, require_ready: bool = True,
+    ) -> tuple[CoreMetadata, ControlPlaneState, GenesisRecord]:
+        """Validate cloneable projections; none of these rows grants authority.
+
+        Reload locked rows at every boundary: expire_on_commit=False must not
+        let a pre-PREPARE identity-map value hide a newly persisted quarantine.
+        """
+        metadata = session.get(CoreMetadata, 1, with_for_update=True, populate_existing=True)
+        state = session.get(ControlPlaneState, continuity_id, with_for_update=True, populate_existing=True)
+        genesis = session.scalar(select(GenesisRecord).where(
+            GenesisRecord.continuity_id == continuity_id,
+        ).execution_options(populate_existing=True))
+        if metadata is None or state is None or genesis is None:
+            raise CoreError("GENESIS_NOT_INITIALIZED")
+        if require_ready and (metadata.status != "READY" or state.status != "READY"):
+            raise CoreError("RESTORE_FENCE_UNPROVEN")
+        identity = session.get(IdentityRegistry, genesis.qingyu_identity_id, populate_existing=True)
+        continuity = session.get(ContinuityRegistry, continuity_id, populate_existing=True)
+        if (
+            identity is None or identity.genesis_id != genesis.genesis_id or identity.retired_at is not None
+            or continuity is None or continuity.qingyu_identity_id != genesis.qingyu_identity_id
+            or continuity.retired_at is not None
+            or metadata.trust_domain_id != genesis.trust_domain_id
+            or metadata.genesis_fingerprint != genesis.fingerprint
+            or metadata.initial_owner_fingerprint != genesis.initial_owner_fingerprint
+            or metadata.witness_set_version != genesis.witness_set_version
+            or genesis.protocol_version != "control-plane-v1"
+            or genesis.id_scheme != "uuidv4"
+            or genesis.initial_epoch != 0 or genesis.quorum_threshold != 2
+            or genesis.witness_set_fingerprint != sha256_hex({
+                "witness_set_version": genesis.witness_set_version, "threshold": genesis.quorum_threshold,
+            })
+            or sha256_hex(self._manifest(genesis)) != genesis.manifest_hash
+        ):
+            raise CoreError("RESTORE_IDENTITY_MISMATCH")
+        if (
+            metadata.active_storage_generation_id != state.active_storage_generation_id
+            or metadata.control_plane_generation_id != state.control_plane_generation_id
+            or metadata.current_state_version != state.state_version
+            or metadata.owner_version != state.owner_version
+            or metadata.current_owner_principal_id != state.owner_principal_id
+            or metadata.current_owner_key_fingerprint != state.owner_key_fingerprint
+        ):
+            raise CoreError("RESTORE_STATE_GAP")
+        reservation = self.authority.genesis_status(genesis.trust_domain_id)
+        attempt = session.get(GenesisAttempt, reservation.request_id, populate_existing=True) if reservation else None
+        if (
+            reservation is None or reservation.state.value != "COMMITTED"
+            or reservation.manifest_hash != genesis.manifest_hash
+            or not reservation.anchor_hash or not reservation.local_commit_id
+            or attempt is None or attempt.state != "COMMITTED" or attempt.outcome_code != "COMMITTED"
+            or attempt.trust_domain_id != genesis.trust_domain_id
+            or attempt.manifest_hash != genesis.manifest_hash
+            or attempt.storage_generation_id != reservation.claimed_storage_generation_id
+            or attempt.local_commit_id != reservation.local_commit_id
+            or reservation.anchor_hash != sha256_hex({
+                **self._manifest(genesis), "genesis_fingerprint": genesis.fingerprint,
+                "storage_generation_id": str(attempt.storage_generation_id),
+                "control_plane_generation_id": str(state.control_plane_generation_id),
+            })
+        ):
+            raise CoreError("GENESIS_OUTCOME_UNKNOWN")
+        return metadata, state, genesis
+
+    def _checkpoint_matches(
+        self, session: Session, metadata: CoreMetadata, state: ControlPlaneState,
+        genesis: GenesisRecord, checkpoint: dict, *, state_version: int | None = None,
+        require_active: bool = True,
+    ) -> dict[str, object]:
+        if (
+            checkpoint.get("trust_domain_id") != str(genesis.trust_domain_id)
+            or checkpoint.get("identity_id") != str(genesis.qingyu_identity_id)
+            or checkpoint.get("continuity_id") != str(genesis.continuity_id)
+            or checkpoint.get("initial_owner_fingerprint") != genesis.initial_owner_fingerprint
+            or checkpoint.get("witness_set_version") != genesis.witness_set_version
+        ):
+            raise CoreError("RESTORE_IDENTITY_MISMATCH")
+        if require_active and checkpoint.get("recovery_state") != "ACTIVE":
+            raise CoreError("RESTORE_FENCE_UNPROVEN")
+        expected_version = state.state_version if state_version is None else state_version
+        if (
+            checkpoint.get("storage_generation_id") != str(state.active_storage_generation_id)
+            or checkpoint.get("control_plane_generation_id") != str(state.control_plane_generation_id)
+            or checkpoint.get("epoch") != state.current_epoch
+            or checkpoint.get("state_version") != expected_version
+            or checkpoint.get("owner_version") != state.owner_version
+            or checkpoint.get("owner_principal_id") != state.owner_principal_id
+            or checkpoint.get("owner_key_fingerprint") != state.owner_key_fingerprint
+        ):
+            raise CoreError("RESTORE_STATE_GAP")
+        audit = verify_audit_chain(session, refresh=True)
+        if audit["audit_seq"] != checkpoint.get("audit_high_water"):
+            raise CoreError("RESTORE_STATE_GAP")
+        if audit["audit_head_hash"] != checkpoint.get("audit_head_hash"):
+            raise CoreError("AUDIT_HIGH_WATER_UNPROVEN")
+        tip = verify_audit_row(session.get(
+            AuditLedger, metadata.audit_seq, with_for_update=True, populate_existing=True,
+        ))
+        if (
+            tip.trust_domain_id != genesis.trust_domain_id or tip.continuity_id != genesis.continuity_id
+            or tip.continuity_epoch != state.current_epoch or tip.state_version != expected_version
+        ):
+            raise CoreError("RESTORE_STATE_GAP")
+        return audit
+
+    def _require_write_eligibility(
+        self, session: Session, continuity_id: uuid.UUID, *, committed_permit: MutationPermit | None = None,
+    ) -> tuple[CoreMetadata, ControlPlaneState, GenesisRecord]:
+        projection = self._local_projection(session, continuity_id)
+        metadata, state, genesis = projection
+        checkpoint = self.authority.export_checkpoint(continuity_id)
+        self._checkpoint_matches(
+            session, metadata, state, genesis, checkpoint,
+            state_version=committed_permit.assigned_state_version if committed_permit else None,
+        )
+        return projection
 
     def bootstrap_genesis(self, request: GenesisRequest) -> GenesisResult:
         manifest = self._manifest(request)
@@ -109,16 +231,32 @@ class CoreFoundationService:
             if existing is not None:
                 if existing.manifest_hash != manifest_hash:
                     raise CoreError("GENESIS_ALREADY_EXISTS")
-                metadata = precheck.get(CoreMetadata, 1)
-                reservation = self.authority.genesis_status(existing.trust_domain_id)
-                if (
-                    reservation is None
-                    or reservation.state.value != "COMMITTED"
-                    or metadata is None
-                    or reservation.claimed_storage_generation_id != metadata.active_storage_generation_id
-                ):
+                try:
+                    attempt = precheck.get(GenesisAttempt, request.genesis_request_id, with_for_update=True)
+                    if attempt is not None and attempt.state == "CORE_COMMITTED" and attempt.outcome_code == "PENDING_AUTHORITY":
+                        # Reconcile only the exact unfinished bootstrap. A
+                        # terminal local receipt never clears later quarantine.
+                        attempt.state = "COMMITTED"
+                        attempt.outcome_code = "COMMITTED"
+                        precheck.flush()
+                        metadata, state, genesis = self._local_projection(precheck, existing.continuity_id, require_ready=False)
+                        if (
+                            metadata.audit_seq != 1 or state.state_version != 0 or state.current_epoch != 0
+                            or state.active_storage_generation_id != attempt.storage_generation_id
+                        ):
+                            raise CoreError("GENESIS_OUTCOME_UNKNOWN")
+                        self._checkpoint_matches(
+                            precheck, metadata, state, genesis, self.authority.export_checkpoint(existing.continuity_id),
+                        )
+                        metadata.status = "READY"
+                        state.status = "READY"
+                        precheck.commit()
+                    else:
+                        metadata, _, _ = self._require_write_eligibility(precheck, existing.continuity_id)
+                except CoreError:
+                    precheck.rollback()
                     self._quarantine(reason="GENESIS_OUTCOME_UNKNOWN")
-                    raise CoreError("GENESIS_OUTCOME_UNKNOWN")
+                    raise
                 return GenesisResult(
                     genesis_id=existing.genesis_id,
                     qingyu_identity_id=existing.qingyu_identity_id,
@@ -128,7 +266,7 @@ class CoreFoundationService:
                     status="COMMITTED",
                     fingerprint=existing.fingerprint,
                     manifest_hash=existing.manifest_hash,
-                    storage_generation_id=(metadata.active_storage_generation_id if metadata else uuid.uuid4()),
+                    storage_generation_id=metadata.active_storage_generation_id,
                 )
         finally:
             precheck.close()
@@ -170,15 +308,7 @@ class CoreFoundationService:
                 existing = session.scalar(select(GenesisRecord).limit(1))
                 if existing is not None:
                     if existing.manifest_hash == manifest_hash:
-                        reservation = self.authority.genesis_status(existing.trust_domain_id)
-                        if (
-                            reservation is None
-                            or reservation.state.value != "COMMITTED"
-                            or metadata.active_storage_generation_id is None
-                            or reservation.claimed_storage_generation_id != metadata.active_storage_generation_id
-                        ):
-                            metadata.status = "RESTORE_QUARANTINED"
-                            raise CoreError("GENESIS_OUTCOME_UNKNOWN")
+                        metadata, _, _ = self._require_write_eligibility(session, existing.continuity_id)
                         return GenesisResult(
                             genesis_id=existing.genesis_id,
                             qingyu_identity_id=existing.qingyu_identity_id,
@@ -267,7 +397,7 @@ class CoreFoundationService:
                         owner_key_fingerprint=request.initial_owner_fingerprint,
                         lease_id=None,
                         lease_generation=0,
-                        status="READY",
+                        status="RESTORE_QUARANTINED",
                         active_storage_generation_id=storage_generation_id,
                         control_plane_generation_id=control_plane_generation_id,
                     )
@@ -304,7 +434,7 @@ class CoreFoundationService:
                         outcome_code="PENDING_AUTHORITY",
                     )
                 )
-                metadata.status = "READY"
+                metadata.status = "RESTORE_QUARANTINED"
         except IntegrityError as exc:
             raise CoreError("GENESIS_ALREADY_EXISTS") from exc
         finally:
@@ -347,7 +477,7 @@ class CoreFoundationService:
                 request_id=request.genesis_request_id,
                 storage_generation_id=storage_generation_id,
             )
-        except CoreError:
+        except Exception:
             self._quarantine(reason="GENESIS_OUTCOME_UNKNOWN")
             raise
 
@@ -358,10 +488,17 @@ class CoreFoundationService:
                 if attempt:
                     attempt.state = "COMMITTED"
                     attempt.outcome_code = "COMMITTED"
-                metadata = session.execute(
-                    select(CoreMetadata).where(CoreMetadata.id == 1)
-                ).scalar_one()
+                session.flush()
+                metadata, state, genesis = self._local_projection(session, request.continuity_id, require_ready=False)
+                self._checkpoint_matches(
+                    session, metadata, state, genesis, self.authority.export_checkpoint(request.continuity_id),
+                )
                 metadata.status = "READY"
+                state.status = "READY"
+        except Exception:
+            session.rollback()
+            self._quarantine(reason="GENESIS_OUTCOME_UNKNOWN")
+            raise
         finally:
             session.close()
         return GenesisResult(
@@ -438,11 +575,7 @@ class CoreFoundationService:
         lease_id: uuid.UUID | None = None
         try:
             with session.begin():
-                state = session.get(ControlPlaneState, continuity_id, with_for_update=True)
-                if state is None:
-                    raise CoreError("CONTINUITY_UNKNOWN")
-                if state.status != "READY":
-                    raise CoreError("RESTORE_FENCE_UNPROVEN")
+                metadata, state, _ = self._require_write_eligibility(session, continuity_id)
                 lease = self.authority.acquire_lease(
                     continuity_id=continuity_id,
                     principal_id=state.owner_principal_id,
@@ -474,6 +607,10 @@ class CoreFoundationService:
                 audit_head_hash=audit_head_hash,
             )
             return lease_id
+        except Exception:
+            session.rollback()
+            self._quarantine(reason="LEASE_OUTCOME_UNKNOWN")
+            raise
         finally:
             session.close()
 
@@ -489,23 +626,21 @@ class CoreFoundationService:
     ) -> IdentityStatus:
         continuity_id = self.require_canonical_continuity(continuity_id)
         request_id = request_id or uuid.uuid4().hex
-        authority_state = self.authority.transfer_owner(
-            continuity_id=continuity_id,
-            expected_owner_version=expected_owner_version,
-            current_owner_principal_id=current_owner_principal_id,
-            target_principal_id=target_principal_id,
-            target_key_fingerprint=target_key_fingerprint,
-        )
         session = self._session()
         audit_seq = 0
         audit_head_hash: str | None = None
         try:
             with session.begin():
-                state = session.get(ControlPlaneState, continuity_id, with_for_update=True)
-                if state is None:
-                    raise CoreError("CONTINUITY_UNKNOWN")
+                metadata, state, _ = self._require_write_eligibility(session, continuity_id)
+                authority_state = self.authority.transfer_owner(
+                    continuity_id=continuity_id,
+                    expected_owner_version=expected_owner_version,
+                    current_owner_principal_id=current_owner_principal_id,
+                    target_principal_id=target_principal_id,
+                    target_key_fingerprint=target_key_fingerprint,
+                )
                 state.current_epoch = authority_state.epoch
-                state.state_version += 1
+                state.state_version = authority_state.state_version
                 state.owner_version = authority_state.owner_version
                 state.owner_principal_id = target_principal_id
                 state.owner_key_fingerprint = target_key_fingerprint
@@ -514,6 +649,7 @@ class CoreFoundationService:
                 metadata.current_owner_principal_id = target_principal_id
                 metadata.current_owner_key_fingerprint = target_key_fingerprint
                 metadata.owner_version = state.owner_version
+                metadata.current_state_version = state.state_version
                 audit = append_audit(
                     session,
                     trust_domain_id=metadata.trust_domain_id,
@@ -534,31 +670,69 @@ class CoreFoundationService:
                 )
                 audit_seq = audit.audit_seq
                 audit_head_hash = audit.record_hash
+            self.authority.sync_audit_checkpoint(
+                continuity_id=continuity_id, audit_seq=audit_seq, audit_head_hash=audit_head_hash,
+            )
         except Exception:
+            session.rollback()
             self._quarantine(reason="OWNER_TRANSFER_OUTCOME_UNKNOWN")
             raise
         finally:
             session.close()
-        self.authority.sync_audit_checkpoint(
-            continuity_id=continuity_id,
-            audit_seq=audit_seq,
-            audit_head_hash=audit_head_hash,
-        )
         return self.identity_status()
+
+    def _committed_mutation_receipt(
+        self, session: Session, request: MutationRequest, permit: MutationPermit,
+        trust_domain_id: uuid.UUID, *, local_status: str,
+    ) -> tuple[MutationReceipt, AuditLedger]:
+        """Validate fresh local evidence for both first completion and replay."""
+        receipt = session.get(
+            MutationReceipt, request.mutation_id, with_for_update=True, populate_existing=True,
+        )
+        if (
+            receipt is None or receipt.status != local_status or permit.state.value != "COMMITTED"
+            or receipt.mutation_id != permit.mutation_id or permit.mutation_id != request.mutation_id
+            or receipt.continuity_id != permit.continuity_id or permit.continuity_id != request.continuity_id
+            or receipt.continuity_epoch != permit.epoch or permit.epoch != request.continuity_epoch
+            or permit.lease_id != request.lease_id
+            or permit.actor_principal_id != request.actor_principal_id or permit.capability != request.capability
+            or receipt.storage_generation_id != permit.storage_generation_id
+            or receipt.payload_hash != permit.payload_hash or permit.payload_hash != sha256_hex(request.payload)
+            or receipt.expected_state_version != permit.expected_state_version
+            or receipt.assigned_state_version != permit.assigned_state_version
+            or receipt.local_commit_id != permit.local_commit_id
+            or receipt.audit_seq != permit.audit_seq
+        ):
+            raise CoreError("MUTATION_OUTCOME_UNKNOWN")
+        audit_row = verify_audit_row(session.get(
+            AuditLedger, receipt.audit_seq, with_for_update=True, populate_existing=True,
+        ))
+        if (
+            audit_row.record_hash != permit.audit_head_hash
+            or audit_row.trust_domain_id != trust_domain_id
+            or audit_row.mutation_id != receipt.mutation_id or audit_row.request_id != receipt.mutation_id
+            or audit_row.continuity_id != receipt.continuity_id
+            or audit_row.continuity_epoch != receipt.continuity_epoch
+            or audit_row.state_version != receipt.assigned_state_version
+            or audit_row.operation_type != "GOVERNED_MUTATION" or audit_row.result_code != "COMMITTED"
+            or audit_row.actor_principal_id != request.actor_principal_id
+            or audit_row.capability != request.capability
+            or audit_row.payload_hash != sha256_hex({"payload_hash": permit.payload_hash})
+        ):
+            raise CoreError("MUTATION_OUTCOME_UNKNOWN")
+        return receipt, audit_row
 
     def governed_mutation(self, request: MutationRequest) -> MutationResult:
         continuity_id = self.require_canonical_continuity(request.continuity_id)
         session = self._session()
         permit: MutationPermit | None = None
-        commit_attempted = False
+        local_prepared = False
         try:
-            state = session.get(ControlPlaneState, continuity_id)
-            if state is None:
-                raise CoreError("CONTINUITY_UNKNOWN")
-            if state.status != "READY":
-                raise CoreError("RESTORE_FENCE_UNPROVEN")
+            _, state, _ = self._require_write_eligibility(session, continuity_id)
             storage_generation_id = state.active_storage_generation_id
             expected_state_version = state.state_version
+            previous_receipt = session.get(MutationReceipt, request.mutation_id)
+            local_commit_id = previous_receipt.local_commit_id if previous_receipt else uuid.uuid4().hex
             # Read-only inspection opened an implicit transaction; the local
             # PREPARE transaction below must start from a clean boundary.
             session.rollback()
@@ -572,24 +746,24 @@ class CoreFoundationService:
                 capability=request.capability,
                 storage_generation_id=storage_generation_id,
                 expected_state_version=expected_state_version,
+                local_commit_id=local_commit_id,
             )
             if permit.state.value == "COMMITTED":
-                receipt = session.get(MutationReceipt, request.mutation_id)
-                if receipt is None:
-                    raise CoreError("MUTATION_OUTCOME_UNKNOWN")
+                metadata, _, _ = self._require_write_eligibility(session, continuity_id)
+                receipt, audit_row = self._committed_mutation_receipt(
+                    session, request, permit, metadata.trust_domain_id, local_status="COMMITTED",
+                )
                 return MutationResult(
                     mutation_id=receipt.mutation_id,
                     status=receipt.status,
                     continuity_epoch=receipt.continuity_epoch,
                     state_version=receipt.assigned_state_version,
                     audit_seq=receipt.audit_seq,
-                    audit_head_hash=session.get(CoreMetadata, 1).audit_head_hash,
+                    audit_head_hash=audit_row.record_hash,
                     local_commit_id=receipt.local_commit_id,
                 )
             with session.begin():
-                state = session.get(ControlPlaneState, continuity_id, with_for_update=True)
-                if state is None:
-                    raise CoreError("CONTINUITY_UNKNOWN")
+                _, state, _ = self._require_write_eligibility(session, continuity_id)
                 if state.current_epoch != permit.epoch:
                     raise CoreError("EPOCH_STALE")
                 audit = append_audit(
@@ -606,7 +780,6 @@ class CoreFoundationService:
                     result_code="COMMITTED",
                     payload={"payload_hash": permit.payload_hash},
                 )
-                local_commit_id = uuid.uuid4().hex
                 receipt = MutationReceipt(
                     mutation_id=request.mutation_id,
                     continuity_id=continuity_id,
@@ -621,16 +794,23 @@ class CoreFoundationService:
                 )
                 session.add(receipt)
                 audit_head_hash = audit.record_hash
-            commit_attempted = True
-            committed = self.authority.commit_mutation(
-                mutation_id=request.mutation_id,
-                local_commit_id=local_commit_id,
-                audit_head_hash=audit_head_hash,
-                audit_seq=audit.audit_seq,
-            )
+            local_prepared = True
             with session.begin():
-                state = session.get(ControlPlaneState, continuity_id, with_for_update=True)
-                receipt = session.get(MutationReceipt, request.mutation_id)
+                self._local_projection(session, continuity_id)
+                committed = self.authority.commit_mutation(
+                    mutation_id=request.mutation_id,
+                    local_commit_id=local_commit_id,
+                    audit_head_hash=audit_head_hash,
+                    audit_seq=audit.audit_seq,
+                    permit=permit,
+                    payload=request.payload,
+                )
+                metadata, state, _ = self._require_write_eligibility(
+                    session, continuity_id, committed_permit=committed,
+                )
+                receipt, audit_row = self._committed_mutation_receipt(
+                    session, request, committed, metadata.trust_domain_id, local_status="PREPARED",
+                )
                 state.state_version = permit.assigned_state_version
                 metadata = session.get(CoreMetadata, 1, with_for_update=True)
                 metadata.current_state_version = permit.assigned_state_version
@@ -641,176 +821,126 @@ class CoreFoundationService:
                 continuity_epoch=permit.epoch,
                 state_version=permit.assigned_state_version,
                 audit_seq=receipt.audit_seq,
-                audit_head_hash=audit_head_hash,
+                audit_head_hash=audit_row.record_hash,
                 local_commit_id=local_commit_id,
             )
-        except CoreError:
+        except Exception:
+            session.rollback()
             if permit is not None:
                 try:
                     self.authority.abort_mutation(request.mutation_id)
                 except CoreError:
                     pass
-            if commit_attempted:
-                session.rollback()
-                cleanup = self._session()
-                try:
-                    with cleanup.begin():
-                        metadata = cleanup.get(CoreMetadata, 1, with_for_update=True)
-                        receipt = cleanup.get(MutationReceipt, request.mutation_id)
-                        if receipt is not None and receipt.status == "PREPARED":
-                            receipt.status = "ABORTED"
-                        if metadata is not None:
-                            metadata.status = "RESTORE_QUARANTINED"
-                        state = cleanup.get(ControlPlaneState, continuity_id, with_for_update=True)
-                        if state is not None:
-                            state.status = "RESTORE_QUARANTINED"
-                finally:
-                    cleanup.close()
+            if local_prepared:
+                # A lost response may already be committed externally. Keep
+                # the pending receipt unchanged as reconciliation evidence.
+                self._quarantine(reason="MUTATION_OUTCOME_UNKNOWN")
             raise
         finally:
             session.close()
 
+    @staticmethod
+    def _manifest_checkpoint_matches(request: RestoreRequest, genesis: GenesisRecord, checkpoint: dict) -> None:
+        manifest = request.manifest
+        if (
+            genesis.trust_domain_id != manifest.trust_domain_id
+            or genesis.qingyu_identity_id != manifest.qingyu_identity_id
+            or genesis.continuity_id != manifest.continuity_id
+            or genesis.fingerprint != manifest.genesis_fingerprint
+            or genesis.initial_owner_fingerprint != manifest.initial_owner_fingerprint
+            or genesis.manifest_hash != manifest.manifest_hash
+            or genesis.witness_set_version != manifest.witness_set_version
+            or checkpoint.get("trust_domain_id") != str(manifest.trust_domain_id)
+            or checkpoint.get("identity_id") != str(manifest.qingyu_identity_id)
+            or checkpoint.get("continuity_id") != str(manifest.continuity_id)
+            or checkpoint.get("initial_owner_fingerprint") != manifest.initial_owner_fingerprint
+            or checkpoint.get("witness_set_version") != manifest.witness_set_version
+        ):
+            raise CoreError("RESTORE_IDENTITY_MISMATCH")
+        if (
+            checkpoint.get("storage_generation_id") != str(manifest.storage_generation_id)
+            or checkpoint.get("control_plane_generation_id") != str(manifest.control_plane_generation_id)
+            or checkpoint.get("audit_high_water") != manifest.audit_high_water
+        ):
+            raise CoreError("RESTORE_STATE_GAP")
+        if checkpoint.get("audit_head_hash") != manifest.audit_head_hash:
+            raise CoreError("AUDIT_HIGH_WATER_UNPROVEN")
+        owner_hash = sha256_hex({
+            "owner_version": checkpoint["owner_version"],
+            "owner_principal_id": checkpoint["owner_principal_id"],
+            "owner_key_fingerprint": checkpoint["owner_key_fingerprint"],
+        })
+        if request.current_owner_principal_id != checkpoint["owner_principal_id"] or request.current_owner_record_hash != owner_hash:
+            raise CoreError("RESTORE_OWNER_UNPROVEN")
+
+    def _verify_restore_source(self, session: Session, request: RestoreRequest, checkpoint: dict) -> dict[str, object]:
+        metadata, state, genesis = self._local_projection(session, request.manifest.continuity_id, require_ready=False)
+        self._manifest_checkpoint_matches(request, genesis, checkpoint)
+        # The hash-bound audit tip supplies the version absent from the legacy
+        # manifest model. Local chain consistency alone never proves currency.
+        return self._checkpoint_matches(session, metadata, state, genesis, checkpoint, require_active=False)
+
     def verify_restore(self, request: RestoreRequest) -> RestoreVerification:
+        self._quarantine(reason="RESTORE_VERIFICATION")
         session = self._session()
-        audit_seq = 0
-        audit_head_hash: str | None = None
         try:
-            genesis = session.scalar(select(GenesisRecord).limit(1))
-            metadata = session.get(CoreMetadata, 1)
-            if genesis is None or metadata is None:
-                raise CoreError("GENESIS_NOT_INITIALIZED")
-            manifest = request.manifest
-            if (
-                genesis.trust_domain_id != manifest.trust_domain_id
-                or genesis.qingyu_identity_id != manifest.qingyu_identity_id
-                or genesis.continuity_id != manifest.continuity_id
-                or genesis.fingerprint != manifest.genesis_fingerprint
-                or genesis.initial_owner_fingerprint != manifest.initial_owner_fingerprint
-                or genesis.manifest_hash != manifest.manifest_hash
-                or genesis.witness_set_version != manifest.witness_set_version
-                or metadata.active_storage_generation_id != manifest.storage_generation_id
-                or metadata.control_plane_generation_id != manifest.control_plane_generation_id
-            ):
-                raise CoreError("RESTORE_IDENTITY_MISMATCH")
-            if (
-                genesis.initial_owner_fingerprint != manifest.initial_owner_fingerprint
-            ):
-                raise CoreError("RESTORE_INITIAL_OWNER_MISMATCH")
-            audit = verify_audit_chain(session)
-            checkpoint = self.authority.export_checkpoint(manifest.continuity_id)
-            if (
-                checkpoint["trust_domain_id"] != str(manifest.trust_domain_id)
-                or checkpoint["continuity_id"] != str(manifest.continuity_id)
-                or checkpoint["storage_generation_id"] != str(manifest.storage_generation_id)
-                or checkpoint["control_plane_generation_id"] != str(manifest.control_plane_generation_id)
-            ):
-                raise CoreError("RESTORE_STATE_GAP")
-            if checkpoint["audit_high_water"] != manifest.audit_high_water:
-                raise CoreError("RESTORE_STATE_GAP")
-            if checkpoint["audit_head_hash"] != manifest.audit_head_hash:
-                raise CoreError("AUDIT_HIGH_WATER_UNPROVEN")
-            state = session.get(ControlPlaneState, manifest.continuity_id, with_for_update=True)
-            state.status = "RESTORE_QUARANTINED"
-            state.lease_id = None
-            metadata.status = "RESTORE_QUARANTINED"
-            session.commit()
-            self.authority.quarantine_recovery(manifest.continuity_id)
+            checkpoint = self.authority.export_checkpoint(request.manifest.continuity_id)
+            audit = self._verify_restore_source(session, request, checkpoint)
+            self.authority.quarantine_recovery(request.manifest.continuity_id)
             return RestoreVerification(
-                same_identity=True,
-                read_only=True,
+                same_identity=True, read_only=True,
                 reason="RESTORE_QUARANTINED_UNTIL_AUTHORITY_ACTIVATION",
-                continuity_epoch=checkpoint["epoch"],
-                audit=audit,
+                continuity_epoch=checkpoint["epoch"], audit=audit,
             )
         finally:
             session.close()
 
+    @staticmethod
+    def _restore_payload(request: RestoreRequest, claim: dict) -> dict:
+        return {
+            "previous_epoch": claim["previous_epoch"],
+            "target_epoch": claim["target_epoch"],
+            "target_storage_generation_id": claim["target_storage_generation_id"],
+            "source_manifest_hash": sha256_hex(request.manifest.model_dump(mode="json")),
+        }
+
+    def _restore_record_audit(
+        self, session: Session, request: RestoreRequest, claim: dict, *, local_status: str,
+    ) -> tuple[RestoreRecord, AuditLedger]:
+        record = session.get(
+            RestoreRecord, request.request_id, with_for_update=True, populate_existing=True,
+        )
+        if (
+            record is None or record.status != local_status
+            or record.trust_domain_id != request.manifest.trust_domain_id
+            or record.continuity_id != request.manifest.continuity_id
+            or record.manifest_hash != request.manifest.manifest_hash
+            or record.target_storage_generation_id != request.target_storage_generation_id
+        ):
+            raise CoreError("RESTORE_REQUEST_CONFLICT")
+        row = verify_audit_row(session.scalar(select(AuditLedger).where(
+            AuditLedger.request_id == request.request_id,
+            AuditLedger.operation_type == "CONTINUITY_REBASED",
+        ).with_for_update().execution_options(populate_existing=True)))
+        if (
+            row.trust_domain_id != record.trust_domain_id or row.continuity_id != record.continuity_id
+            or row.continuity_epoch != claim["target_epoch"]
+            or row.state_version != claim["target_state_version"]
+            or row.audit_seq != claim["source_checkpoint"]["audit_high_water"] + 1
+            or row.previous_record_hash != claim["source_checkpoint"]["audit_head_hash"]
+            or row.actor_principal_id != request.current_owner_principal_id
+            or row.capability != "core_governance" or row.mutation_id is not None
+            or row.payload_hash != sha256_hex(self._restore_payload(request, claim))
+            or row.result_code != "COMMITTED"
+        ):
+            raise CoreError("RESTORE_REQUEST_CONFLICT")
+        return record, row
+
     def activate_restore(self, request: RestoreRequest) -> RestoreVerification:
-        existing_session = self._session()
-        try:
-            existing = existing_session.get(RestoreRecord, request.request_id)
-            if existing is not None:
-                state = existing_session.get(ControlPlaneState, existing.continuity_id)
-                if (
-                    existing.manifest_hash != request.manifest.manifest_hash
-                    or existing.trust_domain_id != request.manifest.trust_domain_id
-                    or existing.continuity_id != request.manifest.continuity_id
-                    or request.target_storage_generation_id != existing.target_storage_generation_id
-                    or state is None
-                    or state.active_storage_generation_id != existing.target_storage_generation_id
-                    or state.control_plane_generation_id != request.manifest.control_plane_generation_id
-                    or state.owner_principal_id != request.current_owner_principal_id
-                    or request.current_owner_record_hash
-                    != sha256_hex(
-                        {
-                            "owner_version": state.owner_version,
-                            "owner_principal_id": state.owner_principal_id,
-                            "owner_key_fingerprint": state.owner_key_fingerprint,
-                        }
-                    )
-                ):
-                    raise CoreError("RESTORE_REQUEST_CONFLICT")
-                if existing.status == "ACTIVE" and state is not None:
-                    return RestoreVerification(
-                        same_identity=True,
-                        read_only=False,
-                        reason="RESTORE_ACTIVATED",
-                        continuity_epoch=state.current_epoch,
-                        audit=None,
-                    )
-        finally:
-            existing_session.close()
         manifest = request.manifest
         claim = self.authority.recovery_status(request.request_id)
-        if claim is not None and claim.get("status") == "ACTIVE":
-            if (
-                claim.get("restore_manifest_hash") != manifest.manifest_hash
-                or claim.get("continuity_id") != str(manifest.continuity_id)
-                or claim.get("target_storage_generation_id") != str(request.target_storage_generation_id)
-            ):
-                raise CoreError("RESTORE_REQUEST_CONFLICT")
-            checkpoint = self.authority.export_checkpoint(manifest.continuity_id)
-            expected_owner_record_hash = sha256_hex(
-                {
-                    "owner_version": checkpoint["owner_version"],
-                    "owner_principal_id": checkpoint["owner_principal_id"],
-                    "owner_key_fingerprint": checkpoint["owner_key_fingerprint"],
-                }
-            )
-            if (
-                request.current_owner_principal_id != checkpoint["owner_principal_id"]
-                or request.current_owner_record_hash != expected_owner_record_hash
-            ):
-                raise CoreError("RESTORE_OWNER_UNPROVEN")
-            if (
-                checkpoint["trust_domain_id"] != str(manifest.trust_domain_id)
-                or checkpoint["continuity_id"] != str(manifest.continuity_id)
-                or checkpoint["control_plane_generation_id"]
-                != str(manifest.control_plane_generation_id)
-                or checkpoint["storage_generation_id"]
-                != str(request.target_storage_generation_id)
-                or checkpoint["witness_set_version"] != manifest.witness_set_version
-                or checkpoint["audit_high_water"] != manifest.audit_high_water
-                or checkpoint["audit_head_hash"] != manifest.audit_head_hash
-            ):
-                raise CoreError("RESTORE_STATE_GAP")
-            check = self._session()
-            try:
-                genesis = check.scalar(select(GenesisRecord).limit(1))
-                if genesis is None or genesis.trust_domain_id != manifest.trust_domain_id or genesis.qingyu_identity_id != manifest.qingyu_identity_id or genesis.continuity_id != manifest.continuity_id or genesis.fingerprint != manifest.genesis_fingerprint or genesis.initial_owner_fingerprint != manifest.initial_owner_fingerprint or genesis.manifest_hash != manifest.manifest_hash:
-                    raise CoreError("RESTORE_IDENTITY_MISMATCH")
-                audit = verify_audit_chain(check)
-                verification = RestoreVerification(
-                    same_identity=True,
-                    read_only=True,
-                    reason="RESTORE_RECONCILIATION",
-                    continuity_epoch=int(claim["target_epoch"]),
-                    audit=audit,
-                )
-            finally:
-                check.close()
-        else:
-            verification = self.verify_restore(request)
+        if claim is None:
+            self.verify_restore(request)
             claim = self.authority.claim_recovery(
                 request_id=request.request_id,
                 trust_domain_id=manifest.trust_domain_id,
@@ -820,64 +950,111 @@ class CoreFoundationService:
                 target_storage_generation_id=request.target_storage_generation_id,
                 restore_manifest_hash=manifest.manifest_hash,
             )
-            claim = self.authority.activate_recovery(request.request_id)
+        if (
+            claim.get("trust_domain_id") != str(manifest.trust_domain_id)
+            or claim.get("continuity_id") != str(manifest.continuity_id)
+            or claim.get("restore_manifest_hash") != manifest.manifest_hash
+            or claim.get("target_storage_generation_id") != str(request.target_storage_generation_id)
+        ):
+            raise CoreError("RESTORE_REQUEST_CONFLICT")
+
         session = self._session()
         try:
+            genesis = session.scalar(select(GenesisRecord).where(GenesisRecord.continuity_id == manifest.continuity_id))
+            if genesis is None:
+                raise CoreError("GENESIS_NOT_INITIALIZED")
+            self._manifest_checkpoint_matches(request, genesis, claim["source_checkpoint"])
+            existing = session.get(RestoreRecord, request.request_id)
+            if existing is not None and existing.status == "ACTIVE":
+                _, state, _ = self._require_write_eligibility(session, manifest.continuity_id)
+                existing, row = self._restore_record_audit(session, request, claim, local_status="ACTIVE")
+                if claim["status"] != "ACTIVE" or claim.get("audit_seq") != row.audit_seq or claim.get("audit_head_hash") != row.record_hash:
+                    raise CoreError("RESTORE_FENCE_UNPROVEN")
+                if state.active_storage_generation_id != request.target_storage_generation_id:
+                    raise CoreError("RESTORE_REQUEST_CONFLICT")
+                return RestoreVerification(
+                    same_identity=True, read_only=False, reason="RESTORE_ACTIVATED",
+                    continuity_epoch=state.current_epoch, audit=None,
+                )
+            if existing is None:
+                if claim["status"] == "ACTIVE":
+                    # A terminal authority claim cannot recreate a lost local
+                    # hash-bound receipt with a freshly timestamped audit row.
+                    raise CoreError("RESTORE_STATE_GAP")
+                self._verify_restore_source(session, request, claim["source_checkpoint"])
+                session.rollback()
+                claim = self.authority.activate_recovery(request.request_id)
+                checkpoint = self.authority.export_checkpoint(manifest.continuity_id)
+                source = claim["source_checkpoint"]
+                expected = {
+                    **source, "epoch": claim["target_epoch"],
+                    "state_version": claim["target_state_version"],
+                    "storage_generation_id": claim["target_storage_generation_id"],
+                    "recovery_state": "RECOVERY_PREPARED",
+                    "recovery_claim_request_id": request.request_id,
+                }
+                if checkpoint != expected:
+                    raise CoreError("RESTORE_STATE_GAP")
+                with session.begin():
+                    metadata, state, genesis = self._local_projection(session, manifest.continuity_id, require_ready=False)
+                    self._checkpoint_matches(session, metadata, state, genesis, source, require_active=False)
+                    state.current_epoch = claim["target_epoch"]
+                    state.state_version = claim["target_state_version"]
+                    state.active_storage_generation_id = request.target_storage_generation_id
+                    state.lease_id = None
+                    state.status = "RESTORE_QUARANTINED"
+                    metadata.status = "RESTORE_QUARANTINED"
+                    metadata.current_state_version = state.state_version
+                    metadata.active_storage_generation_id = state.active_storage_generation_id
+                    append_audit(
+                        session, trust_domain_id=manifest.trust_domain_id,
+                        continuity_id=manifest.continuity_id, continuity_epoch=state.current_epoch,
+                        state_version=state.state_version, operation_type="CONTINUITY_REBASED",
+                        actor_principal_id=request.current_owner_principal_id,
+                        capability="core_governance", request_id=request.request_id, mutation_id=None,
+                        result_code="COMMITTED", payload=self._restore_payload(request, claim),
+                    )
+                    session.add(RestoreRecord(
+                        request_id=request.request_id, trust_domain_id=manifest.trust_domain_id,
+                        continuity_id=manifest.continuity_id, manifest_hash=manifest.manifest_hash,
+                        target_storage_generation_id=request.target_storage_generation_id,
+                        status="PREPARED", reason_code="AWAITING_AUTHORITY_CHECKPOINT",
+                    ))
+            else:
+                session.rollback()
+
             with session.begin():
-                state = session.get(ControlPlaneState, manifest.continuity_id, with_for_update=True)
-                metadata = session.get(CoreMetadata, 1, with_for_update=True)
-                state.current_epoch = int(claim["target_epoch"])
-                state.state_version += 1
-                state.active_storage_generation_id = uuid.UUID(claim["target_storage_generation_id"])
-                state.lease_id = None
+                metadata, state, genesis = self._local_projection(session, manifest.continuity_id, require_ready=False)
+                record, row = self._restore_record_audit(session, request, claim, local_status="PREPARED")
+                if (
+                    metadata.audit_seq != row.audit_seq or metadata.audit_head_hash != row.record_hash
+                    or state.state_version != claim["target_state_version"]
+                    or state.current_epoch != claim["target_epoch"]
+                    or state.active_storage_generation_id != request.target_storage_generation_id
+                ):
+                    raise CoreError("RESTORE_STATE_GAP")
+                verify_audit_chain(session, refresh=True)
+                completed = self.authority.complete_recovery(
+                    request.request_id, audit_seq=row.audit_seq, audit_head_hash=row.record_hash,
+                )
+                metadata, state, genesis = self._local_projection(session, manifest.continuity_id, require_ready=False)
+                self._checkpoint_matches(
+                    session, metadata, state, genesis, self.authority.export_checkpoint(manifest.continuity_id),
+                )
+                record, row = self._restore_record_audit(session, request, claim, local_status="PREPARED")
+                if completed.get("status") != "ACTIVE" or completed.get("audit_seq") != row.audit_seq or completed.get("audit_head_hash") != row.record_hash:
+                    raise CoreError("RESTORE_FENCE_UNPROVEN")
+                record.status = "ACTIVE"
+                record.reason_code = None
                 state.status = "READY"
                 metadata.status = "READY"
-                metadata.active_storage_generation_id = state.active_storage_generation_id
-                audit = append_audit(
-                    session,
-                    trust_domain_id=manifest.trust_domain_id,
-                    continuity_id=manifest.continuity_id,
-                    continuity_epoch=state.current_epoch,
-                    state_version=state.state_version,
-                    operation_type="CONTINUITY_REBASED",
-                    actor_principal_id=request.current_owner_principal_id,
-                    capability="core_governance",
-                    request_id=request.request_id,
-                    mutation_id=None,
-                    result_code="COMMITTED",
-                    payload={
-                        "previous_epoch": claim["previous_epoch"],
-                        "target_epoch": claim["target_epoch"],
-                        "target_storage_generation_id": claim["target_storage_generation_id"],
-                    },
-                )
-                audit_seq = audit.audit_seq
-                audit_head_hash = audit.record_hash
-                session.add(
-                    RestoreRecord(
-                        request_id=request.request_id,
-                        trust_domain_id=manifest.trust_domain_id,
-                        continuity_id=manifest.continuity_id,
-                        manifest_hash=manifest.manifest_hash,
-                        target_storage_generation_id=state.active_storage_generation_id,
-                        status="ACTIVE",
-                        reason_code=None,
-                    )
-                )
+            return RestoreVerification(
+                same_identity=True, read_only=False, reason="RESTORE_ACTIVATED",
+                continuity_epoch=claim["target_epoch"], audit=None,
+            )
         except Exception:
+            session.rollback()
             self._quarantine(reason="RESTORE_FENCE_UNPROVEN")
             raise
         finally:
             session.close()
-        self.authority.sync_audit_checkpoint(
-            continuity_id=manifest.continuity_id,
-            audit_seq=audit_seq,
-            audit_head_hash=audit_head_hash,
-        )
-        return RestoreVerification(
-            same_identity=verification.same_identity,
-            read_only=False,
-            reason="RESTORE_ACTIVATED",
-            continuity_epoch=int(claim["target_epoch"]),
-            audit=None,
-        )
