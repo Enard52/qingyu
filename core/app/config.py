@@ -39,6 +39,15 @@ class Settings(BaseSettings):
     control_plane_token: str | None = Field(
         default=None, validation_alias="CORE_CONTROL_PLANE_TOKEN"
     )
+    control_plane_api_base_url: str | None = Field(default=None, validation_alias="CORE_CONTROL_PLANE_API_BASE_URL")
+    control_plane_ca_file: str | None = Field(default=None, validation_alias="CORE_CONTROL_PLANE_CA_FILE")
+    control_plane_credential_reference: str | None = Field(default=None, validation_alias="CORE_CONTROL_PLANE_CREDENTIAL_REFERENCE")
+    control_plane_domain_id: str | None = Field(default=None, validation_alias="CORE_CONTROL_PLANE_DOMAIN_ID")
+    control_plane_instance_id: str | None = Field(default=None, validation_alias="CORE_CONTROL_PLANE_INSTANCE_ID")
+    control_plane_generation: int | None = Field(default=None, validation_alias="CORE_CONTROL_PLANE_GENERATION")
+    control_plane_spki_sha256: str | None = Field(default=None, validation_alias="CORE_CONTROL_PLANE_SPKI_SHA256")
+    control_plane_receipt_key_id: str | None = Field(default=None, validation_alias="CORE_CONTROL_PLANE_RECEIPT_KEY_ID")
+    control_plane_root_key_id: str | None = Field(default=None, validation_alias="CORE_CONTROL_PLANE_ROOT_KEY_ID")
     log_level: str = "INFO"
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -66,23 +75,24 @@ class Settings(BaseSettings):
                 raise ValueError("CORE_DATABASE_URL database name is required")
             if parsed.database.lower() in FORBIDDEN_DATABASE_NAMES:
                 raise ValueError("CORE_DATABASE_URL targets a forbidden database")
-        if self.control_plane_backend not in {"unavailable", "memory", "postgres"}:
+        if self.control_plane_backend not in {"unavailable", "memory", "r1_https"}:
             raise ValueError("unsupported control-plane backend")
         if self.app_env not in {"test", "development"} and self.control_plane_backend == "memory":
             raise ValueError("memory control-plane backend is test/development only")
         if self.app_env == "production" and self.control_plane_backend == "unavailable":
             raise ValueError("production requires an external control-plane backend")
-        if self.control_plane_backend == "postgres":
-            if not self.control_plane_store:
-                raise ValueError("CORE_CONTROL_PLANE_STORE is required for postgres backend")
-            try:
-                cp_url = make_url(self.control_plane_store)
-            except ArgumentError as exc:
-                raise ValueError("CORE_CONTROL_PLANE_STORE is invalid") from exc
-            if not cp_url.database or cp_url.database.lower() in FORBIDDEN_DATABASE_NAMES:
-                raise ValueError("CORE_CONTROL_PLANE_STORE targets a forbidden database")
-            if self.core_database_url and cp_url.render_as_string(hide_password=True) == make_url(self.core_database_url).render_as_string(hide_password=True):
-                raise ValueError("control-plane store must be independent from Core database")
+        if self.control_plane_store:
+            raise ValueError("Core must not hold a Control Plane database URL")
+        if self.control_plane_backend == "r1_https":
+            fields = ("control_plane_api_base_url", "control_plane_ca_file", "control_plane_credential_reference",
+                "control_plane_domain_id", "control_plane_instance_id", "control_plane_generation",
+                "control_plane_spki_sha256", "control_plane_receipt_key_id", "control_plane_root_key_id")
+            if any(getattr(self, field) in (None, "") for field in fields):
+                raise ValueError("complete R1 HTTPS trust configuration required; configuration is not admission")
+            if not self.control_plane_api_base_url.startswith("https://") or self.control_plane_generation != 1:
+                raise ValueError("R1 requires pinned HTTPS generation 1; later lifecycle is unsupported")
+            if not self.control_plane_credential_reference.startswith("secret://"):
+                raise ValueError("R1 outbound credential must be an explicit secret reference")
         return self
 
     @property
