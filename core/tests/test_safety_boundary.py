@@ -27,6 +27,14 @@ def test_settings_rejects_unimplemented_control_plane_backend():
         Settings(CORE_CONTROL_PLANE_BACKEND="sqlite-quorum")
 
 
+def test_core_rejects_legacy_direct_authority_database():
+    with pytest.raises(ValidationError, match="unsupported control-plane backend"):
+        Settings(CORE_CONTROL_PLANE_BACKEND="postgres",
+                 CORE_CONTROL_PLANE_STORE="postgresql+psycopg://x:PASSWORD@localhost/qingyu_control_r1_acceptance")
+    with pytest.raises(ValidationError, match="must not hold a Control Plane database URL"):
+        Settings(CORE_CONTROL_PLANE_STORE="postgresql+psycopg://x:PASSWORD@localhost/qingyu_control_r1_acceptance")
+
+
 def test_database_safety_requires_explicit_core_name():
     settings = Settings(CORE_DATABASE_URL="sqlite+pysqlite:///:memory:")
     engine = create_engine("sqlite+pysqlite:///:memory:")

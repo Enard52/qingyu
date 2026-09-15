@@ -1,9 +1,7 @@
-"""Non-cloned control-plane authority adapters."""
+"""Core-facing authority adapters; direct PostgreSQL access is excluded."""
 
 from .authority import (
     InMemoryControlPlane,
     UnavailableControlPlane,
 )
-from .postgres import PostgresControlPlane
-
-__all__ = ["InMemoryControlPlane", "UnavailableControlPlane", "PostgresControlPlane"]
+__all__ = ["InMemoryControlPlane", "UnavailableControlPlane"]

@@ -75,11 +75,8 @@ class PostgresControlPlane:
             raise CoreError("CONTROL_PLANE_WITNESS_QUORUM_UNAVAILABLE") from exc
 
     def migrate(self) -> None:
-        """Apply only the independent authority schema migration."""
-        with self._tx() as conn:
-            for statement in DDL.split(";"):
-                if statement.strip():
-                    conn.execute(statement)
+        """Refuse the unproven hand-written legacy schema path."""
+        raise CoreError("CONTROL_PLANE_LEGACY_MIGRATION_DISABLED")
 
     @staticmethod
     def _require_uuid(value: uuid.UUID) -> uuid.UUID:

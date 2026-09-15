@@ -1,21 +1,17 @@
-"""CLI for the independent control-plane schema.
+"""Legacy Control Plane migration entry point is intentionally disabled.
 
-Usage: ``python -m app.control_plane.migration --dsn <redacted-dsn>``.
-The DSN must point at a dedicated authority database; it is never read from
-Core's ``CORE_DATABASE_URL`` automatically.
+The unproven ``0001_control_plane`` marker is forensic-only. Canonical R1
+uses an independent Alembic lineage and a signed provisioning origin;
+a DSN-only migration command is unsafe.
 """
 from __future__ import annotations
 
-import argparse
-
-from .postgres import PostgresControlPlane
-
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="migrate Qingyu control-plane store")
-    parser.add_argument("--dsn", required=True)
-    args = parser.parse_args()
-    PostgresControlPlane(args.dsn).migrate()
+    raise SystemExit(
+        "legacy Control Plane migration is disabled; use the signed R1 "
+        "provisioning workflow and control_plane_alembic.ini"
+    )
 
 
 if __name__ == "__main__":

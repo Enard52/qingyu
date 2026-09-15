@@ -22,6 +22,12 @@ from app.config import FORBIDDEN_DATABASE_NAMES
 from app.errors import CoreError
 
 
+# This suite exercises the unproven direct-DB adapter and hand-written legacy
+# schema. It must never run against the CASE D forensic database or the new R1
+# Authority. R1 acceptance has a separate signed-origin test suite.
+pytestmark = pytest.mark.skip(reason="legacy direct-DB acceptance is forensic-only")
+
+
 def _database_url() -> str:
     value = os.environ.get("CONTROL_PLANE_DATABASE_URL")
     if not value:
