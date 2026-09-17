@@ -81,3 +81,10 @@ def create_scoped_core_finisher(store, *, trust, deployments, runtime_principal,
     return ScopedCoreFinisher(store, trust=trust, deployments=deployments,
                              runtime_principal=runtime_principal, source=source,
                              checkpoint_hook=checkpoint_hook)
+
+
+def create_scoped_core_coordinator(*, journal, finisher, client, source, checkpoint_hook=None):
+    """Explicit ordinary V2 service; production defaults gain no new route."""
+    from .r1_scoped_coordinator import ScopedCoreCoordinator
+    return ScopedCoreCoordinator(journal=journal, finisher=finisher, client=client,
+                                 source=source, checkpoint_hook=checkpoint_hook)

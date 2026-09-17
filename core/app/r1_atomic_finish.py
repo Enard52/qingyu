@@ -210,13 +210,33 @@ class ScopedCoreFinisher:
             start = 0
         for wire in wires[start:]:
             original = _unpack(wire)
-            engine.append(self._window(original.evidence), operation="TERMINAL_HISTORY")
+            self._append_terminal(engine, original)
         # Cache is strictly process-local, built only by verifying original
         # journal bytes, and matched against ALL of those bytes on every use.
         self._verified_cache = (seed, wires, engine.fork())
         if start == 0 and wires:
             self._hook("history_rebuilt")
         return engine
+
+    def _append_terminal(self, engine, item):
+        """Verify the full causal prefix, then the named operation's terminal.
+
+        A normal concurrent request may have legitimate qualification records
+        in this same Authority prefix while still unresolved. Those records
+        must be checked and retained, but are not an assertion that the other
+        request has terminated. The public whole-history verifier is unchanged.
+        """
+        from .control_plane._r1_validation_stream import RegistrySlice, WindowEvidence
+        window = self._window(item.evidence)
+        stats = engine.append(window, operation="REGISTRY_RELATIONS")
+        selected = tuple(w for w in window.request_wires
+                         if decode(w)["intent"]["operation_id"] == item.operation_id)
+        require(len(selected) == 1, "named original operation must occur exactly once")
+        proof = WindowEvidence(selected, RegistrySlice(window.authority.header_wire, (), ()), (),
+            source_admission_wires=tuple(w for w in window.source_admission_wires
+                                        if decode(w)["operation_id"] == item.operation_id))
+        engine.append(proof, operation="TERMINAL_HISTORY")
+        return stats
 
     def _validate(self, item):
         require(type(item) is FinishInput, "explicit finish input required")
@@ -229,7 +249,7 @@ class ScopedCoreFinisher:
                 self.deployments, chain_boundary=item.chain_boundary, restore_evidence=item.restore_evidence)
         with self.store.transaction(write=False) as db:
             engine = self._engine(db, item)
-            engine.append(self._window(item.evidence), operation="TERMINAL_HISTORY")
+            self._append_terminal(engine, item)
             if type(item.evidence) is not kernel.HistoryEvidence and item.chain_boundary is not None:
                 self._window_boundary(item, engine)
             return self._parts(item, engine)
@@ -317,7 +337,7 @@ class ScopedCoreFinisher:
 
     def _verify_context(self, db, item, context, metadata, engine):
         observed = self._context_input(item, context)
-        verification = engine.append(observed.evidence, operation="TERMINAL_HISTORY")
+        verification = self._append_terminal(engine, observed)
         parts = self._parts(item, engine)
         parts["verification"] = verification
         require(self.runtime_principal in engine.core_states, "target Core history missing")
@@ -399,13 +419,13 @@ class ScopedCoreFinisher:
             metadata = db.execute("SELECT * FROM metadata WHERE id=1").fetchone()
             engine = self._engine(db, item)
             before = self._mark(engine)
-            engine.append(self._window(item.evidence), operation="TERMINAL_HISTORY")
+            self._append_terminal(engine, item)
             context = supplied or self._capture(item, action, engine)
             observed, parts, core, local = self._verify_context(db, item, context, metadata, engine)
             # Save the supplied original window before any source-only extension.
             original_engine = self._engine(db, item)
             original_before = self._mark(original_engine)
-            original_stats = original_engine.append(self._window(item.evidence), operation="TERMINAL_HISTORY")
+            original_stats = self._append_terminal(original_engine, item)
             self._journal(db, item, original_before, original_engine, "ORIGINAL_EVIDENCE", original_stats)
             self._journal(db, observed, self._mark(original_engine), engine, "OBSERVATION", parts["verification"])
         return context
@@ -538,7 +558,7 @@ class ScopedCoreFinisher:
             # facts. The staged effect/journal must not authorize itself.
             late = self._capture(item, "APPLY_VERIFIED_TERMINAL", parts["engine"])
             late_engine = parts["engine"].fork()
-            late_engine.append(self._context_input(item, late).evidence, operation="TERMINAL_HISTORY")
+            self._append_terminal(late_engine, self._context_input(item, late))
             if self._mark(late_engine) != self._mark(parts["engine"]):
                 raise _Advanced(late)
             self._qualify(item, parts, core, local, late, actions)

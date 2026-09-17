@@ -392,3 +392,16 @@ Phase 0 状态 → 1 基线 → 2 缺口分类 → 3 必要发行流程 + 4 cont
 - 仍未验证生产来源/身份/时间/实际物理初始化、真实远端协作、任意长restore archive、任意clone/rollback自动检测、断电/磁盘损坏、完整现场集成或正式Acceptance。129只是有限样本，源可信前提沿用合同，未新增保证。Python3.12.10/SQLite3.49.1/cryptography50.0.1/rfc8785 0.1.4/pytest8.3.0未升级；未碰业务库/Gateway/Docker/网络/真实钥；未作Git写操作。
 - 状态：Design Gate保留原已接受范围PASS；第一切片COMPLETE（本轮内部改动及上述回归适用）；第二切片COMPLETE；第二切片独立代码审查PASS；整体Implementation Gate BLOCKED；Foundation Closure NOT ENTERED；全局C01 DEFERRED / REMOVED FROM R1 REQUIRED SCOPE。
 - 本轮结束，不自动进入第三切片、正式Acceptance、Foundation Closure或下一次返工。Resume Token：R1_ACCEPTANCE_CLOSURE_MARATHON。
+
+
+## 2026-09-17T04:04:15.028516+00:00 — R1_NORMAL_MUTATION_DURABLE_ROUNDTRIP_SLICE_03 / COMPLETE / 独立代码审查 PASS / 本轮结束
+
+- N：docs/evidence/r1-acceptance-marathon/normal-mutation-durable-roundtrip-slice-03-20260916T220000Z。实现说明、相对检查点source.diff、完整source-manifest、实际原日志、独立审查原文、白名单ZIP及保护清单位于N。
+- 已实际保存Slice01/02开发检查点 bdc6c3151275e809eb77e5dde4ec7b4ca8805cb1，tag r1/dev-slices-01-02-20260916；旧tag不变，Slice03不提交/不推送。
+- 显式普通mutation服务→原意图与精确授权/dispatch持久化→真实PG16 PREPARE/Ack/FIX/唯一签发terminal→真实固定pin回环HTTPS→原Slice01验证与Slice02原子finish→原IDquery/retry/进程恢复贯通，COMMIT与ABORT均实际执行。
+- 实际主库23终态/23完成，1个冲突原意图保持pending；11确定进程中断点恢复；签名失败、PG提交失败、资格变化、真实错误签名HTTP响应、同ID/不同ID竞争、未授权反向决定均分别记录。作者Authority10方法、作者最终Core8方法、受影响旧产品26方法、独立首5/最终2方法分别记录，历史129不算本轮。
+- 两轮集中修正关闭IR01/IR02/IR03。最终非作者审查N/code-review.md；主provider并发suffix局限及原失败均保留，未夸大为所有Coreworker成功进入Authority竞争。主原loser重试真实HTTP409及产品current predecessor differs，业务事实不变。
+- 两个全新owned PG16容器只绑定127.0.0.1，最终已停、卷保留；未操作既有业务资源。受控provider仍提供初始锚/source/资格/许可发行；没有预制业务Ack/FIX/terminal或补Core完成。生产GENESIS/生命周期/部署/正式Acceptance不在本轮完成宣称。
+- 原Core HEAD/9 dirty tracked/42981-byte diff object 9594b6b6f5374094a88bcb068d5bcd7afd875d18保持；旧规范/审查/STOP及无关脏文件原字节保留，本LRS原90581字节前缀不变。完整最终值见N/delivery-check.json。
+- 最终：Slice03 COMPLETE；独立代码审查PASS；Design Gate原范围PASS保留；Slice01/02 COMPLETE保留且受影响回归通过；整体Implementation Gate BLOCKED；Foundation Closure NOT ENTERED；C01 DEFERRED / REMOVED FROM R1 REQUIRED SCOPE。停止于本切片，不自动进入下一切片或部署。
+- Resume Token：R1_ACCEPTANCE_CLOSURE_MARATHON。
