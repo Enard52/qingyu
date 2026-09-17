@@ -460,3 +460,20 @@ class R1LocalStore:
             cp.next_authority_sequence, cp.authority_head_hash = message["authority_sequence"] + 1, digest
             cp.status = "READY"
             return record, intent
+
+
+def create_scoped_sqlite_store(path, *, scope_wire, checkpoint_wire, business_state_wire,
+                               busy_timeout_ms=5000):
+    """Explicit new scoped store; does not initialize or migrate the V1 store."""
+    from ._r1_scoped_sqlite import ScopedSQLiteStore
+    return ScopedSQLiteStore.create(path, scope_wire=scope_wire,
+                                    checkpoint_wire=checkpoint_wire,
+                                    business_state_wire=business_state_wire,
+                                    busy_timeout_ms=busy_timeout_ms)
+
+
+def open_scoped_sqlite_store(path, *, expected_scope_wire, busy_timeout_ms=5000):
+    """Open only an explicitly supplied, already initialized scoped store."""
+    from ._r1_scoped_sqlite import ScopedSQLiteStore
+    return ScopedSQLiteStore.open(path, expected_scope_wire=expected_scope_wire,
+                                  busy_timeout_ms=busy_timeout_ms)

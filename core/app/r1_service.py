@@ -74,3 +74,10 @@ class R1CoreConsumer:
         raise CoreError("R1_LIFECYCLE_NOT_IMPLEMENTED")
 
     bootstrap_genesis = acquire_owner_lease = transfer_owner = verify_restore = activate_restore = _unsupported
+def create_scoped_core_finisher(store, *, trust, deployments, runtime_principal,
+                               source=None, checkpoint_hook=None):
+    """Explicit V2 local-only integration. No default route or V1 alteration."""
+    from .r1_atomic_finish import ScopedCoreFinisher
+    return ScopedCoreFinisher(store, trust=trust, deployments=deployments,
+                             runtime_principal=runtime_principal, source=source,
+                             checkpoint_hook=checkpoint_hook)
