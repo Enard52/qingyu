@@ -96,7 +96,16 @@ class ScopedAuthorityClient:
                                    fingerprint=self._pin['server_spki_sha256'])
         try:
             conn.connect() # CA/hostname/TLS1.3/SPKI verified BEFORE credential acquisition.
-            headers=self._headers()
+            request_credential=getattr(self._credential_provider,'for_request',None)
+            if request_credential is None:
+                headers=self._headers()
+            else:
+                try:token=request_credential(method,path,body)
+                except Exception:raise ScopedTransportUncertain('operation credential unavailable') from None
+                require(type(token) is str and token and all(33<=ord(c)<=126 for c in token),
+                        'operation credential invalid')
+                headers={'Authorization':f'Bearer {token}','Content-Type':'application/json',
+                         'Accept':'application/json','Connection':'close'}
             conn.request(method,path,body=_encode(body) if body is not None else None,headers=headers)
             response=conn.getresponse()
             raw=response.read(MAX_FRAME+1)

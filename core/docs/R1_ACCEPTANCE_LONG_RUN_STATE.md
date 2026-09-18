@@ -405,3 +405,52 @@ Phase 0 状态 → 1 基线 → 2 缺口分类 → 3 必要发行流程 + 4 cont
 - 原Core HEAD/9 dirty tracked/42981-byte diff object 9594b6b6f5374094a88bcb068d5bcd7afd875d18保持；旧规范/审查/STOP及无关脏文件原字节保留，本LRS原90581字节前缀不变。完整最终值见N/delivery-check.json。
 - 最终：Slice03 COMPLETE；独立代码审查PASS；Design Gate原范围PASS保留；Slice01/02 COMPLETE保留且受影响回归通过；整体Implementation Gate BLOCKED；Foundation Closure NOT ENTERED；C01 DEFERRED / REMOVED FROM R1 REQUIRED SCOPE。停止于本切片，不自动进入下一切片或部署。
 - Resume Token：R1_ACCEPTANCE_CLOSURE_MARATHON。
+
+
+## 2026-09-17 — R1_DURABLE_AUTHORIZATION_PROVIDER_SLICE_04 / INCOMPLETE / 独立代码审查 NOT COMPLETED / 本轮结束
+
+- 第三切片已实际保存为开发检查点 `c94876c4b17241a7aa93684c1d60babfc2fd8a3f`，annotated tag `r1/dev-slice-03-20260917` 对象 `d9927965b61456682170f71f63e037dd5da99c7b` 指向同一提交；旧 tag 保留，无 push/amend/rebase。第四切片未提交。
+- 本轮实际产品新增持久普通授权 provider/schema、分离的 Runtime/Operator HTTPS 边界及 Core durable source；替换业务路径中 `ControlledProvider` 的逐操作 policy/session/inventory/grant/permit 构造、credential 文件、直接 `register_qualification` 和内存 registry 读取。Slice03 coordinator 与 Slice01/02 验证/SQLite 原子 finish 继续实际复用。
+- 离线测试 Operator/Root 仅在初始化进程构造并签署初始 policy；产品验证、登记并持久创建 session。在线 Authority 只加载固定 receipt key，在同一 PostgreSQL scope 锁和事务内构造、签署、追加并保存 grant/permit 原字节和位置。Runtime 凭据只映射 principal，operation 解析后从锁内历史推导 session/policy/inventory/grant。外部 Operator revocation 原字节另存，因为已接受 revocation wire 没有该字段；未新增协议字段、角色或摘要域。
+- grant 与 permit 分离：活动 grant 约束 PREPARE/FIX/terminal；permit 只在已验证 terminal 后发行并约束首次本地 APPLY。terminal 已提交后 grant 撤销仍可读取原 terminal 并依法取得 permit/finish，但不能授权新动作；该场景真实重启完成 COMMITTED。
+- 最终真实固定 pin HTTPS/PG16/文件 SQLite 集成 PASS：进程重启精确结果重放；grant/permit 提交后丢响应均返回原签名字节；提交前进程退出事件数保持6、无半份 issue，重试后为10；错误 credential/operation/generation 与 Runtime 调 Operator 路由均拒绝且事件数6→6；同 operation 异内容拒绝且10→10。
+- 确定屏障多进程竞态：同请求双进程只产生一个 GRANT_ISSUED，均得到 sequence6 和同 SHA；action-first 为 GRANT6/PREPARE7/REVOKE8；revoke-first 为 GRANT6/REVOKE7 且无 PREPARE。不是随机 sleep 排序或 Python 进程内锁。
+- 回归：durable unit 4/4；Slice02 atomic finish 作者及既有独立31/31（132.599s）；coordination journal/dependencies 8/8（4.382s）；最终 compile/diff-check通过。pytest统一入口因既有venv缺SQLAlchemy无法收集，未升级环境；同模块以unittest实际执行。
+- 两次最终独立审查代理均在启动时因同一 refresh token revoked 无法刷新 access token而失败，没有读取/复核修正后最终代码。先前非作者只完成集成前边界/测试计划，不能替代最终复核；作者测试不改名独立。因此 Slice04按明确完成标准为 **INCOMPLETE**，独立代码审查 **NOT COMPLETED**，不存在未披露的PASS。
+- 保留外部前提：测试锚/TLS、独立初始身份/来源/部署声明、离线治理授权；生产 custody、现场来源、GENESIS、restore/clone、换钥、部署和正式 Acceptance 均未完成。
+- 资源均为 `qingyu.slice04.owner` 标记、127.0.0.1 绑定的新实例；停止结果见 delivery-check。未接触 gateway-db-1、gateway_qingyu_postgres 或旧Slice03资源。原 `<repo>/core` 保持 HEAD `5d4133a71df69d6c7c51644cfb54b9e410e4ab11`、9 dirty tracked、42981-byte diff object `9594b6b6f5374094a88bcb068d5bcd7afd875d18`。本LRS原92984字节前缀 SHA256 `e017ef9a0d96211df0c675ddebe1aed8d975e145fe13842a11c26306cdb33cb3` 保留，仅追加本节。
+- 状态：已接受 Design Gate 保留原范围；Slice01/02/03 COMPLETE 保留；Slice04 INCOMPLETE；Slice04独立代码审查 NOT COMPLETED；整体 Implementation Gate BLOCKED；Foundation Closure NOT ENTERED；C01 DEFERRED / REMOVED FROM R1 REQUIRED SCOPE。
+- Resume Token：R1_ACCEPTANCE_CLOSURE_MARATHON。
+
+
+## 2026-09-17 — R1_SLICE04_FINAL_NONAUTHOR_REVIEW_COMPLETION / BLOCKED / Slice04 INCOMPLETE / 本轮结束
+
+- 新非作者 Reviewer `/root/slice04_nonauthor_final` 已实际响应后开始并完成 A–F 全范围审查；不是仅创建 agent ID。此前两次 refresh-token 启动失败原样保留，仍只算启动失败，不算审查或产品 Finding。
+- 最终受审版本为分支 `ai/task-r1-canonical-implementation`、HEAD/基线 `c94876c4b17241a7aa93684c1d60babfc2fd8a3f` 上的11文件未提交 Slice04 候选；受审清单 SHA256 `8798da9db20121e99effdfa1933df839949faea17e375a06ce29bd93497eb143`。开始与结束 freeze-check 均逐文件匹配，`candidate_unchanged=true`；产品、产品测试、旧证据及规范审查期间未改。
+- 最终非作者审查 **BLOCKED**，共 P0=0、P1=2、P2=1。P1-1：grant/permit提交后丢响应的延迟重试没有原issue-ID查询入口，进入5秒续期阈值后真实生成sequence2与不同签名字节；实测sequence1 SHA `1b128a1e...`、sequence2 SHA `66d08d9e...`。P1-2：permit HTTPS入口在校验调用principal和request_digest前先提交permit；真实wrong-digest请求HTTP409后数据库仍出现permit sequence1。P2-1：已有grant重放只核request/principal，变更`source_admission.session_expires_at`后真实HTTPS仍返回200；后续PREPARE会拒绝，但发行/查询边界违反同ID异内容拒绝。
+- Reviewer继续完成其余范围：普通产品链实际为Durable source→client→固定pin HTTPS→durable provider→ScopedAuthority；业务链无ControlledProvider实例化或register_qualification补资格。Root只在一次性初始化，在线只加载receipt signer；Runtime/Operator凭据路由分离。PostgreSQL scope锁覆盖发行、动作、撤销和issue元数据；event_sequence而非毫秒决定顺序；PG与SQLite通过验证历史cut连接而非伪称共享事务。前三切片实际复用未发现新增回归。
+- 必要独立复测使用新资源 `r1-s04-ab3caca098a5`：真实PG16、文件SQLite、固定pin回环HTTPS及一次性测试钥；三项反例均有原探针/输出。独立回归 durable unit 4/4、coordination 8/8、atomic finish 31/31，compile通过。未重跑所有历史用例或旧三项多进程竞态；Reviewer检查其最终版本代码和原始结果并用高风险真实反例补测，未用旧通过数字覆盖新缺陷。
+- 新资源按 `qingyu.slice04.owner=r1-s04-ab3caca098a5` 标签核验并已停止，卷/网络/私有测试目录保留；未重启或读取七个旧Slice04私有资源，未全局清理。未读取登录秘密、真实Root/Bearer/现场pin/业务数据。
+- 原 `<repo>/core` 保持HEAD `5d4133a71df69d6c7c51644cfb54b9e410e4ab11`、9 dirty tracked、完整diff object `9594b6b6f5374094a88bcb068d5bcd7afd875d18`。实现暂存区空，无Git写入。LRS原96936字节前缀SHA256 `c810e6c9065d6fd0f787ceef48ea1869e9fa4fc3224a001855dfc35a98a4d84c` 保留，仅追加本节。
+- 最终状态：Design Gate保留原适用范围；Slice01/02/03原完成记录保留；Slice04 **INCOMPLETE**；Slice04独立代码审查 **BLOCKED**；整体Implementation Gate **BLOCKED**；Foundation Closure **NOT ENTERED**；C01 **DEFERRED / REMOVED FROM R1 REQUIRED SCOPE**。本轮不修复、不进入Slice05、正式验收、部署或Foundation Closure。
+- Resume Token：R1_ACCEPTANCE_CLOSURE_MARATHON。
+
+## 2026-09-17 — R1_SLICE04_TARGETED_REWORK_01 / AUTHOR READY FOR NON-AUTHOR REVIEW
+
+- 本轮只处理 Slice04 最终非作者审查提出的三项定点 Finding：响应丢失/临期 replay 产生新 Grant 字节，Permit 路由在主体与 request digest 校验前提交副作用，既有 Grant replay 未绑定原始 source_admission。
+- 产品修复已落在 `app/control_plane/r1_durable_authorization.py` 与 `app/control_plane/r1_durable_transport.py`，新增探针在 `tests/r1_durable_targeted_rework.py`。历史 replay 返回原持久化签名字节；Permit 在提交前校验 principal/request digest；Grant replay 严格比较原始 source admission，并覆盖同请求/变异请求并发竞争。
+- Before probes 已复现三项旧失败；最终定向结果通过：near-expiry 与 expired historical replay exact bytes、当前过期使用拒绝、单一 GRANT row、错误 Permit digest/operation 零 PERMIT row、changed source rejected、并发 original/changed 只保留一条 original GRANT。
+- 新补跑 negative/crash 与 operator route 负向检查均通过：错误 runtime credential、错误 generation、pre-grant append crash/retry、错误 operator Bearer 均无未授权持久副作用。
+- 回归通过 durable unit 4/4、coordination 8/8、atomic finish 31/31、fresh integration acceptance、concurrent issue race、action-first race、revoke-first race。证据目录：`docs/evidence/r1-acceptance-marathon/slice04-targeted-rework-01-20260917T173814Z/`。
+- 保护更正：此前收尾误把 `<repo>/core` 的 Git blob ID `9594b6b6f5374094a88bcb068d5bcd7afd875d18` 与同一 diff 的 SHA256 `cc53c032c97a78727d62f7fc90e72417f5a66fc5b80c91b3c91664377c12186c` 当作同算法比较，这是错误的。重新以原始 `git diff --binary` 字节计算，Core 仍为 HEAD `5d4133a71df69d6c7c51644cfb54b9e410e4ab11`、9 tracked dirty、42,981 bytes、Git blob ID 匹配 `9594b6b6f5374094a88bcb068d5bcd7afd875d18`。
+- 作者 disposition：`TARGETED REWORK IMPLEMENTED - READY FOR NON-AUTHOR REVIEW`。Slice04 仍 INCOMPLETE，Implementation Gate 仍 BLOCKED，Foundation Closure 仍 NOT ENTERED，Slice05 仍 NOT STARTED。未 commit/tag/push，未 staging，未 reset/clean/stash/rebase，未覆盖旧非作者审查证据。
+- Resume Token：R1_ACCEPTANCE_CLOSURE_MARATHON。
+
+## 2026-09-17 — R1_SLICE04_TARGETED_REWORK_01_NONAUTHOR_REVIEW / PASS
+
+- Result: Independent Non-Author Review PASS; Slice04 COMPLETE.
+- Closed findings: P1 response-loss near-expiry replay; P1 Permit validate-before-commit; P2 changed source_admission replay.
+- Independent regression: durable 4/4, coordination 8/8, atomic-finish 31/31, negative/crash PASS, operator-route negative PASS.
+- Reviewer evidence: `docs/evidence/r1-acceptance-marathon/slice04-targeted-rework-01-nonauthor-review-20260917/`.
+- Current global state: Implementation Gate BLOCKED; Foundation Closure NOT ENTERED; Slice05 NOT STARTED.
+- Resume Token：R1_ACCEPTANCE_CLOSURE_MARATHON。

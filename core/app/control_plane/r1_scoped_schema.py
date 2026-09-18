@@ -15,14 +15,15 @@ def install_scoped_test_schema(owner_connection, *, test_database_name: str,
     This development candidate has no production migration/admission installer.
     Existing baseline/F3 migrations and digests remain unchanged.
     """
-    if not re.fullmatch(r"r1_(?:f3|slice03)_test_[a-z0-9_]{8,50}", test_database_name):
+    if not re.fullmatch(r"r1_(?:f3|slice03|slice04)_test_[a-z0-9_]{8,50}", test_database_name):
         raise ValueError("explicit isolated scoped test database required")
     if not re.fullmatch(r"[0-9a-f]{64}", configuration_digest):
         raise ValueError("fixed configuration digest required")
     row = owner_connection.execute("""SELECT current_database(),current_user,
         pg_catalog.shobj_description(oid,'pg_database') FROM pg_catalog.pg_database
         WHERE datname=current_database()""").fetchone()
-    labels = {f"R1_F3_TEST_ONLY:{test_database_name}", f"R1_SLICE03_TEST_ONLY:{test_database_name}"}
+    labels = {f"R1_F3_TEST_ONLY:{test_database_name}", f"R1_SLICE03_TEST_ONLY:{test_database_name}",
+              f"R1_SLICE04_TEST_ONLY:{test_database_name}"}
     if row is None or row[0] != test_database_name or row[1] != "control_plane_owner" or row[2] not in labels:
         raise ValueError("isolated database owner/label mismatch")
     if owner_connection.execute("SELECT to_regclass('control_plane.r1s_scopes')").fetchone()[0] is not None:
