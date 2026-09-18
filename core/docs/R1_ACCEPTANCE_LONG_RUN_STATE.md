@@ -466,3 +466,12 @@ Phase 0 状态 → 1 基线 → 2 缺口分类 → 3 必要发行流程 + 4 cont
 - Phase B NOT COMPLETE; Phase C NOT COMPLETE; Foundation Closure NOT COMPLETE; Implementation Gate BLOCKED; Slice05 NOT STARTED.
 - This checkpoint task does not start Batch06, Runtime, production Hermes, Foundation Closure, or Implementation Gate PASS.
 - Resume Token: `R1_ACCEPTANCE_CLOSURE_MARATHON`.
+
+## 2026-09-18T14:19:33.243166+00:00 — QINGYU_PHASE_B1_FOUNDATION_STAGE_CHECKPOINT_01 / FOUNDATION CANDIDATE DUAL REVIEW BINDING
+
+- Foundation Candidate manifest SHA256 3c4379d703236c509d2ace661538d2f8a9d5fbe43a7815306ad610be46d7cb3; candidate file count 61; frozen candidate drift 0.
+- Codex Independent Review PASS: docs/evidence/r1-acceptance-marathon/phase-b1-foundation-independent-review-20260918T135503Z/; Claude Code Independent Review PASS: docs/evidence/r1-acceptance-marathon/phase-b1-foundation-independent-review-20260918T140321Z/.
+- Current Foundation P0/P1/P2 = 0. Owner private config remains BLOCKED_BY_OWNER_CONFIG / owner-controlled external acceptance blocker, non-blocking for B1 technical closure but not PASS.
+- Engineering debt preserved: rehearsal authority pickle serialization; fragile mutating-method persistence whitelist; unregistered pytest integration marker; legacy 	est_r1_window_finish.py remains LONG_RUNNING_NOT_COMPLETED slow-tail debt.
+- Phase B NOT COMPLETE; Phase C NOT COMPLETE; B2 NOT STARTED; Production GENESIS NOT EXECUTED; Implementation Gate BLOCKED. This checkpoint does not declare Foundation Closure COMPLETE.
+- Resume Token: R1_ACCEPTANCE_CLOSURE_MARATHON.
