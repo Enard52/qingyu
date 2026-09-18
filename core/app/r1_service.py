@@ -7,9 +7,10 @@ import hashlib
 from .control_plane.r1_client import AuthorityClient, VerifiedPhase
 from .control_plane.r1_commands import AbortAuthorization, CommitAuthorization
 from .control_plane.r1_protocol import decode_canonical_wire
+from .canonical import sha256_hex
 from .errors import CoreError
 from .r1_local_store import R1LocalStore
-from .schemas import IdentityStatus, MutationResult
+from .schemas import CoreReadModel, IdentityStatus, MutationResult
 
 
 class R1CoreConsumer:
@@ -69,6 +70,54 @@ class R1CoreConsumer:
             continuity_epoch=scope.continuity_epoch, state_version=state["state_version"], owner_version=scope.owner_version,
             active_storage_generation_id=UUID(scope.storage_generation_id), audit_seq=state["audit_sequence"],
             audit_head_hash=state["audit_head_hash"])
+
+    def core_read_model(self):
+        state, scope = self.local.inspect(), self.local.scope
+        payload = {
+            "schema_version": "core-read-model-v1",
+            "status": state["status"],
+            "identity_reference": {
+                "trust_domain_id": scope.trust_domain_id,
+                "qingyu_identity_id": scope.qingyu_identity_id,
+                "continuity_id": scope.continuity_id,
+                "continuity_alias": None,
+                "genesis_operation_id": scope.genesis_operation_id,
+                "origin_digest": self.local.admission.origin.signed_provisioning_origin_digest,
+            },
+            "generation": {
+                "storage_generation_id": scope.storage_generation_id,
+                "control_plane_generation_id": scope.control_plane_generation_id,
+                "continuity_epoch": scope.continuity_epoch,
+                "state_version": state["state_version"],
+                "owner_version": scope.owner_version,
+            },
+            "governed_state": {
+                "status": state["status"],
+                "owner_principal_id": scope.owner_identity,
+                "audit_high_water": state["audit_sequence"],
+                "audit_head_hash": state["audit_head_hash"],
+                "next_authority_sequence": state["next_authority_sequence"],
+                "authority_head_hash": state["authority_head_hash"],
+            },
+            "lineage": {
+                "genesis_operation_id": scope.genesis_operation_id,
+                "continuity_epoch": scope.continuity_epoch,
+                "owner_version": scope.owner_version,
+            },
+            "provenance": {
+                "source": "r1-local-store",
+                "admission_origin_digest": self.local.admission.origin.signed_provisioning_origin_digest,
+                "authority_pin": {
+                    "authority_domain_id": self.local.admission.pin.authority_domain_id,
+                    "authority_instance_id": self.local.admission.pin.authority_instance_id,
+                    "authority_generation": self.local.admission.pin.authority_generation,
+                    "receipt_key_id": self.local.admission.pin.receipt_key_id,
+                },
+                "checkpoint": state,
+            },
+            "read_only": True,
+        }
+        return CoreReadModel(**payload, read_model_hash=sha256_hex(payload))
 
     def _unsupported(self, *args, **kwargs):
         raise CoreError("R1_LIFECYCLE_NOT_IMPLEMENTED")

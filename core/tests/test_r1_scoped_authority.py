@@ -4,7 +4,6 @@ Set R1_SLICE03_PRIVATE_CONFIG to the current isolated test config. No default
 database, environment DSN, prebuilt Ack/FIX/terminal or evidence import is used.
 """
 import json
-import os
 from pathlib import Path
 import unittest
 import time
@@ -28,21 +27,18 @@ from app.control_plane.r1_validation_codec import c2, decode, h2, obj, ContractE
 from app.control_plane.r1_validation_crypto import verify_signed
 from app.r1_scoped_coordinator import build_mutation_request
 from tests.r1_roundtrip_provider import ControlledProvider, material, trust, boundary, now_ms, scope_wire, event
+from tests.r1_private_config import resolve_slice03_private_config
 
 
 class ScopedAuthorityAuthorTests(unittest.TestCase):
     observations = []
     @classmethod
     def setUpClass(cls):
-        path = os.environ.get("R1_SLICE03_PRIVATE_CONFIG")
-        if not path:
-            raise RuntimeError("explicit owned Slice03 config path required")
-        cls.path = Path(path)
-        cls.config = json.loads(cls.path.read_text())
+        resolved = resolve_slice03_private_config()
+        cls.path = resolved.path
+        cls.config = dict(resolved.data)
         c = cls.config
-        if c["container"] != "r1-s03-ca100502580e-pg" or c["host"] != "127.0.0.1" or c["port"] != 49995:
-            raise RuntimeError("unexpected resource ownership")
-        cls.database = "r1_slice03_test_ca100502580e_author_" + uuid4().hex[:8]
+        cls.database = "r1_slice03_test_" + c["owner"].removeprefix("r1-s03-") + "_author_" + uuid4().hex[:8]
         with psycopg.connect(host=c["host"], port=c["port"], dbname=c["dbname"], user="postgres",
                              password=c["admin_password"], autocommit=True) as db:
             db.execute(sql.SQL("CREATE DATABASE {} OWNER control_plane_owner").format(sql.Identifier(cls.database)))

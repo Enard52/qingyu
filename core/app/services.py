@@ -29,6 +29,7 @@ from .models import (
     RestoreRecord,
 )
 from .schemas import (
+    CoreReadModel,
     GenesisRequest,
     IdentityStatus,
     MutationRequest,
@@ -543,6 +544,64 @@ class CoreFoundationService:
                 audit_seq=metadata.audit_seq if metadata else 0,
                 audit_head_hash=metadata.audit_head_hash if metadata else None,
             )
+        finally:
+            session.close()
+
+    def core_read_model(self) -> CoreReadModel:
+        session = self._session()
+        try:
+            continuity = session.scalar(select(ContinuityRegistry).limit(1))
+            if continuity is None:
+                raise CoreError("GENESIS_NOT_INITIALIZED")
+            metadata, state, genesis = self._local_projection(session, continuity.continuity_id)
+            checkpoint = self.authority.export_checkpoint(continuity.continuity_id)
+            audit = self._checkpoint_matches(session, metadata, state, genesis, checkpoint)
+            payload = {
+                "schema_version": "core-read-model-v1",
+                "status": metadata.status,
+                "identity_reference": {
+                    "trust_domain_id": str(genesis.trust_domain_id),
+                    "qingyu_identity_id": str(genesis.qingyu_identity_id),
+                    "continuity_id": str(genesis.continuity_id),
+                    "continuity_alias": genesis.continuity_alias,
+                    "genesis_id": str(genesis.genesis_id),
+                    "genesis_fingerprint": genesis.fingerprint,
+                    "manifest_hash": genesis.manifest_hash,
+                },
+                "generation": {
+                    "storage_generation_id": str(state.active_storage_generation_id),
+                    "control_plane_generation_id": str(state.control_plane_generation_id),
+                    "continuity_epoch": state.current_epoch,
+                    "state_version": state.state_version,
+                    "owner_version": state.owner_version,
+                },
+                "governed_state": {
+                    "status": state.status,
+                    "owner_principal_id": state.owner_principal_id,
+                    "owner_key_fingerprint": state.owner_key_fingerprint,
+                    "lease_generation": state.lease_generation,
+                    "audit_high_water": audit["audit_seq"],
+                    "audit_head_hash": audit["audit_head_hash"],
+                    "recovery_state": checkpoint["recovery_state"],
+                },
+                "lineage": {
+                    "initial_epoch": genesis.initial_epoch,
+                    "witness_set_version": genesis.witness_set_version,
+                    "witness_set_fingerprint": genesis.witness_set_fingerprint,
+                    "protocol_version": genesis.protocol_version,
+                    "constitution_genesis_ref": genesis.constitution_genesis_ref,
+                    "constitution_genesis_hash": genesis.constitution_genesis_hash,
+                },
+                "provenance": {
+                    "source": "core-foundation-service",
+                    "checkpoint": checkpoint,
+                    "checkpoint_hash": sha256_hex(checkpoint),
+                    "audit": audit,
+                    "governance_provenance": genesis.governance_provenance,
+                },
+                "read_only": True,
+            }
+            return CoreReadModel(**payload, read_model_hash=sha256_hex(payload))
         finally:
             session.close()
 

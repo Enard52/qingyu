@@ -4,8 +4,10 @@ from typing import Any
 import uuid
 
 import httpx
+from pydantic import ValidationError
 
 from .errors import CoreError
+from .value_poc import GatewayEvidence
 
 
 class GatewayEvidenceClient:
@@ -34,15 +36,25 @@ class GatewayEvidenceClient:
         self._client.close()
 
     def _get(self, path: str, **params: Any) -> dict[str, Any]:
-        response = self._client.get(path, params=params)
+        try:
+            response = self._client.get(path, params=params)
+        except httpx.HTTPError as exc:
+            raise CoreError("GATEWAY_EVIDENCE_QUERY_UNAVAILABLE") from exc
         if response.status_code >= 400:
             code = None
             try:
-                code = response.json().get("detail", {}).get("code")
+                detail = response.json().get("detail")
+                if isinstance(detail, dict):
+                    code = detail.get("code")
+                elif isinstance(response.json(), dict):
+                    code = response.json().get("code")
             except ValueError:
                 pass
             raise CoreError(code or "GATEWAY_EVIDENCE_QUERY_FAILED")
-        body = response.json()
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise CoreError("GATEWAY_EVIDENCE_RESPONSE_MALFORMED") from exc
         if body.get("contract_version") != self.contract_version:
             raise CoreError("GATEWAY_EVIDENCE_CONTRACT_MISMATCH")
         return body
@@ -91,4 +103,34 @@ class GatewayEvidenceClient:
             f"/attachments/{attachment_id}/observations",
             **params,
         )
+
+
+    def read_value_evidence_set(self, *, limit: int = 50) -> list[GatewayEvidence]:
+        """Read normalized Value PoC evidence items through the existing evidence query surface."""
+        body = self.list_conversation_observations(limit=limit)
+        items = body.get("items")
+        if not isinstance(items, list) or not items:
+            raise CoreError("GATEWAY_EVIDENCE_NOT_FOUND")
+        evidence: list[GatewayEvidence] = []
+        for item in items:
+            if not isinstance(item, dict):
+                raise CoreError("GATEWAY_EVIDENCE_RESPONSE_MALFORMED")
+            try:
+                evidence.append(GatewayEvidence.model_validate(item))
+            except ValidationError as exc:
+                raise CoreError("GATEWAY_EVIDENCE_RESPONSE_MALFORMED") from exc
+        return evidence
+    def read_value_evidence(self, *, limit: int = 1) -> GatewayEvidence:
+        """Read one Value PoC evidence item through the existing evidence query surface."""
+        body = self.list_conversation_observations(limit=limit)
+        items = body.get("items")
+        if not isinstance(items, list) or not items:
+            raise CoreError("GATEWAY_EVIDENCE_NOT_FOUND")
+        item = items[0]
+        if not isinstance(item, dict):
+            raise CoreError("GATEWAY_EVIDENCE_RESPONSE_MALFORMED")
+        try:
+            return GatewayEvidence.model_validate(item)
+        except ValidationError as exc:
+            raise CoreError("GATEWAY_EVIDENCE_RESPONSE_MALFORMED") from exc
 

@@ -4,6 +4,7 @@ import json
 import multiprocessing
 from pathlib import Path
 import tempfile
+import time
 import unittest
 
 from app.control_plane.r1_validation import FixedTrust
@@ -20,7 +21,10 @@ OBSERVATIONS = []
 class WindowFinishTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        started_at = time.monotonic()
+        print("window-finish fixture start generate_sequence=129", flush=True)
         cls.sequence = generate_sequence(129)
+        print(f"window-finish fixture complete elapsed={time.monotonic()-started_at:.3f}", flush=True)
 
     def setUp(self):
         from tests.r1_window_observation import observe_calls
@@ -157,10 +161,14 @@ class WindowFinishTests(unittest.TestCase):
         print("actual completed operation", completed, flush=True)
 
     def test_same_database_129_operations_with_boundary_processes_and_queries(self):
+        started_at = time.monotonic()
+        print("window-finish start operations=129", flush=True)
         s = self.sequence
         service = open_window_service(self.path, s, s.operations[0], create=True)
         completed_ops = []
         for op in s.operations:
+            if op.ordinal == 1 or op.ordinal % 16 == 0 or op.ordinal in (65, 66, 67, 127, 128, 129):
+                print(f"window-finish progress ordinal={op.ordinal} elapsed={time.monotonic()-started_at:.3f}", flush=True)
             service.source = WindowSource(s, op)
             if op.ordinal in (65, 67, 127, 128):
                 stage = {65: "evidence_saved", 67: "after_effect", 127: "before_history_commit", 128: "after_commit"}[op.ordinal]
@@ -241,8 +249,10 @@ class WindowFinishTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT count(*) FROM permit_consumptions").fetchone()[0], 129)
             expected_business = sum(decode(op.terminal_wire)["decision"] == "COMMIT" for op in completed_ops)
             self.assertEqual(db.execute("SELECT count(*) FROM business_records").fetchone()[0], expected_business)
+        elapsed = round(time.monotonic() - started_at, 3)
+        print(f"window-finish complete operations=129 elapsed={elapsed}", flush=True)
         OBSERVATIONS.append({"kind": "actual_persisted_validation_windows", "database": str(self.path),
-            "business_operations": 129, "windows": [{"sequence": row["sequence"], "verification": json.loads(row["verification_wire"])} for row in all_windows]})
+            "business_operations": 129, "elapsed_seconds": elapsed, "windows": [{"sequence": row["sequence"], "verification": json.loads(row["verification_wire"])} for row in all_windows]})
 
 
 if __name__ == "__main__":

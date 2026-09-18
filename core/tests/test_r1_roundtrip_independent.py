@@ -7,7 +7,6 @@ Ack, FIX, terminal or local completion. Private test files are not evidence outp
 from dataclasses import replace
 import hashlib
 import json
-import os
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -26,17 +25,18 @@ from app.control_plane.r1_validation_codec import ContractError, c2, decode, h2
 from app.control_plane.r1_validation_crypto import FixedTrust, verify_signed
 from tests.r1_roundtrip_provider import bootstrap, trust, material, boundary
 from tests.r1_roundtrip_run import core, request_for, start_server
+from tests.r1_private_config import resolve_slice03_private_config
 
 
 ROOT = Path(__file__).resolve().parents[1]
-OWNED = ROOT / '.tmp/r1-s03-ca100502580e'
+OWNED = ROOT / '.tmp/r1-s03-harness-local'
 OBSERVATIONS = []
 
 
 class IndependentJournalChecks(unittest.TestCase):
     def test_unsupported_schema_names_cannot_hide_behind_sqlite_wildcard(self):
         folder = OWNED / ('review-journal-' + uuid4().hex)
-        folder.mkdir()
+        folder.mkdir(parents=True)
         for kind in ('table', 'trigger'):
             path = folder / (kind + '.sqlite')
             journal = CoordinationJournal.create(path, scope_wire=b'owned scope', checkpoint_wire=b'owned checkpoint')
@@ -55,16 +55,12 @@ class IndependentJournalChecks(unittest.TestCase):
 class IndependentRoundtripChecks(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        path = Path(os.environ['R1_SLICE03_PRIVATE_CONFIG']).resolve(strict=True)
-        if path != (OWNED / 'private-config.json').resolve():
-            raise RuntimeError('explicit current-task resource required')
-        cls.base = json.loads(path.read_text())
+        resolved = resolve_slice03_private_config()
+        cls.base = dict(resolved.data)
         c = cls.base
-        if c['host'] != '127.0.0.1' or c['port'] != 49995 or c['container'] != 'r1-s03-ca100502580e-pg':
-            raise RuntimeError('owned instance boundary mismatch')
         labels = json.loads(subprocess.check_output(['docker', 'inspect', '--format', '{{json .Config.Labels}}', c['container']]))
         ports = json.loads(subprocess.check_output(['docker', 'inspect', '--format', '{{json .NetworkSettings.Ports}}', c['container']]))
-        if labels.get('qingyu.slice03.owner') != 'r1-s03-ca100502580e' or ports['5432/tcp'] != [{'HostIp': '127.0.0.1', 'HostPort': '49995'}]:
+        if labels.get('qingyu.slice03.owner') != c['owner'] or ports['5432/tcp'] != [{'HostIp': '127.0.0.1', 'HostPort': str(c['port'])}]:
             raise RuntimeError('owned Docker labels/loopback mapping mismatch')
 
     def connect(self, role='control_plane_app', *, autocommit=False):
@@ -78,7 +74,7 @@ class IndependentRoundtripChecks(unittest.TestCase):
         self.folder = OWNED / ('review-' + suffix)
         self.folder.mkdir()
         self.path = self.folder / 'private-config.json'
-        self.database = 'r1_slice03_test_ca100502580e_review_' + suffix
+        self.database = 'r1_slice03_test_' + self.base['owner'].removeprefix('r1-s03-') + '_review_' + suffix
         c = self.base
         with psycopg.connect(host=c['host'], port=c['port'], dbname=c['dbname'], user='postgres',
                              password=c['admin_password'], autocommit=True) as db:

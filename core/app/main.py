@@ -12,7 +12,7 @@ from .config import Settings, get_settings, require_capability_token
 from .control_plane import InMemoryControlPlane, UnavailableControlPlane
 from .db import get_db, session_factory
 from .errors import CoreError
-from .schemas import GenesisRequest, IdentityStatus, MutationRequest, MutationResult
+from .schemas import CoreReadModel, GenesisRequest, IdentityStatus, MutationRequest, MutationResult
 from .services import CoreFoundationService
 from .service_factory import build_core_service, CoreRuntimeDependencies
 from .control_plane.r1_admission import AdmissionError
@@ -103,6 +103,15 @@ def readiness(service=Depends(get_service)):
 )
 def identity_status(service: CoreFoundationService = Depends(get_service)) -> IdentityStatus:
     return service.identity_status()
+
+
+@app.get(
+    "/api/v1/core/read-model",
+    response_model=CoreReadModel,
+    dependencies=[Depends(_require_governance_capability)],
+)
+def core_read_model(service: CoreFoundationService = Depends(get_service)) -> CoreReadModel:
+    return service.core_read_model()
 
 
 @app.post(

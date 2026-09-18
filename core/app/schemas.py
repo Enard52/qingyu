@@ -70,6 +70,18 @@ class IdentityStatus(CoreModel):
     audit_head_hash: str | None
 
 
+class CoreReadModel(CoreModel):
+    schema_version: str = "core-read-model-v1"
+    status: str
+    identity_reference: dict[str, Any]
+    generation: dict[str, Any]
+    governed_state: dict[str, Any]
+    lineage: dict[str, Any]
+    provenance: dict[str, Any]
+    read_model_hash: str
+    read_only: bool = True
+
+
 class RestoreManifest(CoreModel):
     trust_domain_id: uuid.UUID
     qingyu_identity_id: uuid.UUID
