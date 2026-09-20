@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from app.b2_activation_readiness import (
     B1_FOUNDATION_CHECKPOINT_COMMIT,
@@ -25,11 +26,59 @@ from app.b2_activation_readiness import (
     validate_target_observation,
 )
 from app.errors import CoreError
+from app.b2_signer_trust import (
+    InMemoryEd25519SignerProvider,
+    SignerProviderClassification,
+    TrustRecord,
+    TrustStore,
+    sign_smi_payload,
+)
 from app.foundation_rehearsal import REHEARSAL_ENVIRONMENT, assert_rehearsal_genesis_request
 from app.schemas import GenesisRequest
 import uuid
 
 NOW = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+_TEST_TRUST_CACHE = {}
+
+
+def signed_test_trust(
+    *,
+    trust_reference: str = "production-root-trust-ref-001",
+    environment: str = "qingyu-production-primary",
+    target_reference: str = "prod-target-ref-001",
+    classification: SignerProviderClassification = SignerProviderClassification.TEST_ONLY,
+):
+    cache_key = (trust_reference, environment, target_reference, classification.value)
+    if cache_key not in _TEST_TRUST_CACHE:
+        provider = InMemoryEd25519SignerProvider(
+            provider_reference=f"test-provider:{trust_reference}",
+            private_key=Ed25519PrivateKey.generate(),
+            classification=classification,
+        )
+        record = TrustRecord.from_provider(
+            trust_reference=trust_reference,
+            provider=provider,
+            environment=environment,
+            target_reference=target_reference,
+            generation=1,
+            created_at=NOW,
+        )
+        _TEST_TRUST_CACHE[cache_key] = (provider, record)
+    provider, record = _TEST_TRUST_CACHE[cache_key]
+    return TrustStore({trust_reference: record}), provider, record
+
+
+def _sign_intent_data(data: dict, provider: InMemoryEd25519SignerProvider) -> dict:
+    placeholder = dict(data)
+    placeholder["signature_metadata"] = {"signature_ref": "test-signature-reference", "signature": "0" * 128}
+    payload = SignedMigrationIntent(**placeholder).canonical_payload()
+    signed = dict(data)
+    signed["signature_metadata"] = {
+        **signed.get("signature_metadata", {}),
+        "signature_ref": signed.get("signature_metadata", {}).get("signature_ref", "test-signature-reference"),
+        "signature": sign_smi_payload(provider, payload),
+    }
+    return signed
 
 
 def target(**updates):
@@ -71,9 +120,21 @@ def intent(**updates):
         "valid_from": NOW - timedelta(minutes=5),
         "expires_at": NOW + timedelta(hours=1),
         "owner_approval_reference": "owner-approval-ref-required",
-        "signature_metadata": {"signature_ref": "owner-signature-reference", "key_fingerprint": "owner-key-fingerprint"},
+        "signature_metadata": {"signature_ref": "owner-signature-reference"},
     }
     data.update(updates)
+    signer_key_id_overridden = "signer_key_id" in updates
+    store, provider, record = signed_test_trust(
+        trust_reference=data["authority_trust_reference"],
+        environment=data["target_environment"],
+        target_reference=data["target_reference"],
+    )
+    data["signer_key_id"] = data.get("signer_key_id", record.key_id)
+    if "signature_metadata" not in updates or "signature" not in data["signature_metadata"]:
+        signing_data = dict(data)
+        if signer_key_id_overridden:
+            signing_data["signer_key_id"] = record.key_id
+        data = _sign_intent_data(signing_data, provider) | {"signer_key_id": data["signer_key_id"]}
     return SignedMigrationIntent(**data)
 
 
@@ -134,15 +195,25 @@ def test_target_contract_and_commit_tag_binding():
 def test_signed_migration_intent_hash_and_negative_cases():
     i = intent()
     assert len(i.canonical_payload_hash) == 64
-    validate_signed_migration_intent(i, now=NOW)
+    validate_signed_migration_intent(i, now=NOW, trust_store=signed_test_trust()[0])
     changed = intent(intent_id="intent-002")
     assert changed.canonical_payload_hash != i.canonical_payload_hash
     with pytest.raises(CoreError, match="B2_INTENT_NOT_VALID_NOW"):
-        validate_signed_migration_intent(intent(valid_from=NOW - timedelta(hours=2), expires_at=NOW - timedelta(hours=1)), now=NOW)
+        validate_signed_migration_intent(intent(valid_from=NOW - timedelta(hours=2), expires_at=NOW - timedelta(hours=1)), now=NOW, trust_store=signed_test_trust()[0])
     with pytest.raises(CoreError, match="B2_WRONG_IMPLEMENTATION_TAG"):
         intent(source_tag="wrong-tag")
     with pytest.raises(CoreError, match="B2_REHEARSAL_ARTIFACT_FORBIDDEN"):
         intent(authority_trust_reference="PostgresAuthorityStateStore")
+    with pytest.raises(CoreError, match="SMI_SIGNATURE_INVALID"):
+        bad = intent(signature_metadata={"signature_ref": "bad", "signature": "1" * 128})
+        validate_signed_migration_intent(bad, now=NOW, trust_store=signed_test_trust()[0])
+    with pytest.raises(CoreError, match="SMI_SIGNER_KEY_ID_MISMATCH"):
+        validate_signed_migration_intent(intent(signer_key_id="0" * 64), now=NOW, trust_store=signed_test_trust()[0])
+    with pytest.raises(CoreError, match="SMI_SIGNER_TRUST_NOT_FOUND"):
+        validate_signed_migration_intent(i, now=NOW, trust_store=TrustStore())
+    for forbidden in ["raw_private_key", "private_key", "private_key_bytes", "seed", "secret_key", "secret_scalar", "passphrase", "unknown"]:
+        with pytest.raises(Exception):
+            intent(signature_metadata={"signature_ref": "x", "signature": "0" * 128, forbidden: "secret"})
 
 
 def test_owner_approval_is_independent_gate_and_scope_bound():
@@ -189,18 +260,23 @@ def test_activation_dry_run_is_blocked_by_missing_production_authority():
     a = approval(t, i)
     assert production_authority_decision()["decision"] == "MISSING_AND_BLOCKS_ACTIVATION"
     with pytest.raises(CoreError, match="B2_PRODUCTION_AUTHORITY_BLOCKED"):
-        build_activation_dry_run(target=t, observation=o, intent=i, approval=a, evidence_refs=["b1-checkpoint"], now=NOW)
+        build_activation_dry_run(target=t, observation=o, intent=i, approval=a, evidence_refs=["b1-checkpoint"], now=NOW, trust_store=signed_test_trust()[0])
 
 
 def test_plan_builder_is_deterministic_and_read_only_for_review_artifact():
     t, i, o = target(), intent(), observation()
     a = approval(t, i)
-    first = build_activation_plan_without_execution(target=t, observation=o, intent=i, approval=a, evidence_refs=["b1-checkpoint"])
-    second = build_activation_plan_without_execution(target=t, observation=o, intent=i, approval=a, evidence_refs=["b1-checkpoint"])
+    trust_store = signed_test_trust()[0]
+    first = build_activation_plan_without_execution(target=t, observation=o, intent=i, approval=a, evidence_refs=["b1-checkpoint"], trust_store=trust_store, now=NOW)
+    second = build_activation_plan_without_execution(target=t, observation=o, intent=i, approval=a, evidence_refs=["b1-checkpoint"], trust_store=trust_store, now=NOW)
     assert first.plan_hash == second.plan_hash
     assert first.planned_mutations == 0
     assert first.dry_run_read_only is True
     assert first.rollback_recovery_semantics == "AFTER_DURABLE_GENESIS_RECOVERY_OR_CONTINUATION_ONLY"
+    bad = intent(intent_id="plan-bad-signature", signature_metadata={"signature_ref": "bad", "signature": "1" * 128})
+    bad_approval = approval(t, bad)
+    with pytest.raises(CoreError, match="SMI_SIGNATURE_INVALID"):
+        build_activation_plan_without_execution(target=t, observation=o, intent=bad, approval=bad_approval, evidence_refs=["b1-checkpoint"], trust_store=trust_store, now=NOW)
 
 
 def test_activation_attempt_guard_allows_same_attempt_and_rejects_concurrent_attempt():

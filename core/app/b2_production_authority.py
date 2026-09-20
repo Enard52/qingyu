@@ -19,14 +19,17 @@ from .b2_activation_readiness import (
     activation_candidate_hash,
     build_activation_plan_without_execution,
     reject_rehearsal_artifact_reuse,
+    validate_activation_request_without_mutation,
     validate_owner_approval,
     validate_signed_migration_intent,
     validate_target_observation,
 )
 from .canonical import sha256_hex
 from .errors import CoreError
+from .b2_signer_trust import AuthorityEnvironmentMode, ProductionSignerAdmissionStore, SignerProvider, TrustRecord, TrustStore
 
 SYNTHETIC_PRODUCTION_TEST = "SYNTHETIC_PRODUCTION_TEST"
+REAL_PRODUCTION = "REAL_PRODUCTION"
 PRODUCTION_AUTHORITY_SCHEMA_VERSION = "qingyu-b2-production-authority-candidate-v1"
 PRODUCTION_AUTHORITY_ENVIRONMENT_CLASS = "synthetic-production-test"
 EXPECTED_RESERVATION_CONSTRAINTS = {
@@ -95,6 +98,12 @@ class ProductionAuthorityStore:
                     state TEXT NOT NULL,
                     target_reference TEXT NOT NULL,
                     trust_reference TEXT NOT NULL,
+                    trust_algorithm TEXT,
+                    trust_key_id TEXT,
+                    trust_public_key_fingerprint TEXT,
+                    trust_schema_version TEXT,
+                    trust_environment TEXT,
+                    trust_target_reference TEXT,
                     source_checkpoint TEXT NOT NULL,
                     source_tag TEXT NOT NULL,
                     activation_candidate_hash TEXT,
@@ -121,6 +130,12 @@ class ProductionAuthorityStore:
                     owner_approval_hash TEXT NOT NULL,
                     target_reference TEXT NOT NULL,
                     trust_reference TEXT NOT NULL,
+                    trust_algorithm TEXT,
+                    trust_key_id TEXT,
+                    trust_public_key_fingerprint TEXT,
+                    trust_schema_version TEXT,
+                    trust_environment TEXT,
+                    trust_target_reference TEXT,
                     status TEXT NOT NULL,
                     request_binding_hash TEXT NOT NULL,
                     result_payload TEXT,
@@ -142,16 +157,32 @@ class ProductionAuthorityStore:
                     activation_candidate_hash TEXT NOT NULL,
                     target_reference TEXT NOT NULL,
                     trust_reference TEXT NOT NULL,
+                    trust_algorithm TEXT,
+                    trust_key_id TEXT,
+                    trust_public_key_fingerprint TEXT,
+                    trust_schema_version TEXT,
+                    trust_environment TEXT,
+                    trust_target_reference TEXT,
                     payload_hash TEXT NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
             """))
+            for table_name in ("b2_production_authority_domains", "b2_production_authority_attempts", "b2_production_authority_audit"):
+                for column_name in (
+                    "trust_algorithm",
+                    "trust_key_id",
+                    "trust_public_key_fingerprint",
+                    "trust_schema_version",
+                    "trust_environment",
+                    "trust_target_reference",
+                ):
+                    connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS {column_name} TEXT"))
 
     def counts_and_hash(self) -> dict[str, Any]:
         with self.engine.begin() as connection:
             domains = [dict(row) for row in connection.execute(text("SELECT * FROM b2_production_authority_domains ORDER BY environment_identity")).mappings()]
             attempts = [dict(row) for row in connection.execute(text("SELECT * FROM b2_production_authority_attempts ORDER BY attempt_id")).mappings()]
-            audit = [dict(row) for row in connection.execute(text("SELECT environment_identity, attempt_id, event_type, state_before, state_after, intent_hash, owner_approval_hash, activation_candidate_hash, target_reference, trust_reference, payload_hash FROM b2_production_authority_audit ORDER BY audit_id")).mappings()]
+            audit = [dict(row) for row in connection.execute(text("SELECT environment_identity, attempt_id, event_type, state_before, state_after, intent_hash, owner_approval_hash, activation_candidate_hash, target_reference, trust_reference, trust_algorithm, trust_key_id, trust_public_key_fingerprint, trust_schema_version, trust_environment, trust_target_reference, payload_hash FROM b2_production_authority_audit ORDER BY audit_id")).mappings()]
         payload = {"domains": domains, "attempts": attempts, "audit": audit}
         return {
             "domain_count": len(domains),
@@ -162,9 +193,22 @@ class ProductionAuthorityStore:
 
 
 class ProductionAuthorityCandidate:
-    def __init__(self, store: ProductionAuthorityStore, *, reservation_race_hook: Callable[[], None] | None = None):
+    def __init__(
+        self,
+        store: ProductionAuthorityStore,
+        *,
+        reservation_race_hook: Callable[[], None] | None = None,
+        trust_store: TrustStore | None = None,
+        environment_mode: AuthorityEnvironmentMode = AuthorityEnvironmentMode.SYNTHETIC_PRODUCTION_TEST,
+        admission_store: ProductionSignerAdmissionStore | None = None,
+        signer_provider: SignerProvider | None = None,
+    ):
         self.store = store
         self._reservation_race_hook = reservation_race_hook
+        self.trust_store = trust_store
+        self.environment_mode = environment_mode
+        self.admission_store = admission_store
+        self.signer_provider = signer_provider
 
     @property
     def schema_version(self) -> str:
@@ -172,6 +216,21 @@ class ProductionAuthorityCandidate:
 
     def _owner_approval_hash(self, approval: OwnerApproval) -> str:
         return sha256_hex(approval.model_dump(mode="json"))
+
+    def _trust_record_for_intent(self, intent: SignedMigrationIntent) -> TrustRecord:
+        if self.trust_store is None:
+            raise CoreError("SMI_SIGNER_TRUST_NOT_FOUND")
+        return self.trust_store.resolve(intent.authority_trust_reference)
+
+    def _trust_binding_values(self, trust_record: TrustRecord) -> dict[str, str]:
+        return {
+            "trust_algorithm": trust_record.algorithm,
+            "trust_key_id": trust_record.key_id,
+            "trust_public_key_fingerprint": trust_record.public_key_fingerprint,
+            "trust_schema_version": trust_record.schema_version,
+            "trust_environment": trust_record.environment,
+            "trust_target_reference": trust_record.target_reference,
+        }
 
     def _request_binding_hash(
         self,
@@ -182,6 +241,7 @@ class ProductionAuthorityCandidate:
         approval: OwnerApproval,
         attempt_id: str,
     ) -> str:
+        trust_record = self._trust_record_for_intent(intent)
         return sha256_hex({
             "attempt_id": attempt_id,
             "target": target.model_dump(mode="json"),
@@ -189,7 +249,15 @@ class ProductionAuthorityCandidate:
             "intent_hash": intent.canonical_payload_hash,
             "approval_hash": self._owner_approval_hash(approval),
             "activation_candidate_hash": activation_candidate_hash(target=target, intent=intent),
+            "trust_binding": self._trust_binding_values(trust_record),
         })
+
+    def _assert_persisted_trust_binding(self, row: Any, trust_record: TrustRecord) -> None:
+        if row is None:
+            return
+        for field, expected in self._trust_binding_values(trust_record).items():
+            if row[field] != expected:
+                raise CoreError("B2_PERSISTED_TRUST_BINDING_MISMATCH")
 
     def _validate_all(
         self,
@@ -201,8 +269,14 @@ class ProductionAuthorityCandidate:
         attempt_id: str,
         now: datetime | None = None,
     ) -> OwnerApproval:
-        if target.environment_identity != SYNTHETIC_PRODUCTION_TEST:
-            raise CoreError("B2_SYNTHETIC_PRODUCTION_MARKER_REQUIRED")
+        if self.environment_mode == AuthorityEnvironmentMode.SYNTHETIC_PRODUCTION_TEST:
+            if target.environment_identity != SYNTHETIC_PRODUCTION_TEST:
+                raise CoreError("B2_SYNTHETIC_PRODUCTION_MARKER_REQUIRED")
+        elif self.environment_mode == AuthorityEnvironmentMode.REAL_PRODUCTION:
+            if target.environment_identity in (SYNTHETIC_PRODUCTION_TEST, REAL_PRODUCTION):
+                raise CoreError("B2_REAL_PRODUCTION_TARGET_DESCRIPTOR_REQUIRED")
+        else:
+            raise CoreError("B2_AUTHORITY_ENVIRONMENT_MODE_INVALID")
         if target.environment_class != "production":
             raise CoreError("B2_PRODUCTION_TARGET_CONTRACT_REQUIRED")
         reject_rehearsal_artifact_reuse({
@@ -211,10 +285,17 @@ class ProductionAuthorityCandidate:
             "intent": intent.model_dump(mode="json"),
             "approval": approval.model_dump(mode="json") if approval else None,
         })
-        validate_signed_migration_intent(intent, now=now)
-        validate_target_observation(target, observation)
-        validate_owner_approval(approval=approval, target=target, intent=intent)
-        assert approval is not None
+        approval = validate_activation_request_without_mutation(
+            target=target,
+            observation=observation,
+            intent=intent,
+            approval=approval,
+            now=now,
+            trust_store=self.trust_store,
+            environment_mode=self.environment_mode,
+            admission_store=self.admission_store,
+            signer_provider=self.signer_provider,
+        )
         if not attempt_id or len(attempt_id) > 128:
             raise CoreError("B2_ACTIVATION_ATTEMPT_INVALID")
         if intent.authority_trust_reference != target.signer_trust_reference:
@@ -236,6 +317,7 @@ class ProductionAuthorityCandidate:
                                       approval=approval, attempt_id=attempt_id, now=now)
         if simulate_failure_before_commit:
             raise CoreError("B2_SIMULATED_FAILURE_BEFORE_COMMIT")
+        trust_record = self._trust_record_for_intent(intent)
         candidate_hash = activation_candidate_hash(target=target, intent=intent)
         owner_hash = self._owner_approval_hash(approval)
         binding_hash = self._request_binding_hash(target=target, observation=observation, intent=intent,
@@ -250,6 +332,7 @@ class ProductionAuthorityCandidate:
                     candidate_hash=candidate_hash,
                     owner_hash=owner_hash,
                     binding_hash=binding_hash,
+                    trust_record=trust_record,
                 )
         except IntegrityError as exc:
             if not self._is_expected_reservation_integrity_error(exc):
@@ -259,6 +342,7 @@ class ProductionAuthorityCandidate:
                 attempt_id=attempt_id,
                 candidate_hash=candidate_hash,
                 binding_hash=binding_hash,
+                trust_record=trust_record,
                 original_error=exc,
             )
 
@@ -272,6 +356,7 @@ class ProductionAuthorityCandidate:
         candidate_hash: str,
         owner_hash: str,
         binding_hash: str,
+        trust_record: TrustRecord,
     ) -> dict[str, Any]:
         domain = connection.execute(text("""
             SELECT * FROM b2_production_authority_domains
@@ -279,6 +364,7 @@ class ProductionAuthorityCandidate:
             FOR UPDATE
         """), {"environment_identity": target.environment_identity}).mappings().first()
         if domain is not None:
+            self._assert_persisted_trust_binding(domain, trust_record)
             if domain["activation_candidate_hash"] == candidate_hash and domain["attempt_id"] == attempt_id:
                 attempt = connection.execute(text("SELECT * FROM b2_production_authority_attempts WHERE attempt_id = :attempt_id FOR UPDATE"), {"attempt_id": attempt_id}).mappings().first()
                 if attempt is None or attempt["request_binding_hash"] != binding_hash:
@@ -290,11 +376,17 @@ class ProductionAuthorityCandidate:
         connection.execute(text("""
             INSERT INTO b2_production_authority_domains (
                 environment_identity, schema_version, authority_version, environment_class, state,
-                target_reference, trust_reference, source_checkpoint, source_tag,
+                target_reference, trust_reference,
+                trust_algorithm, trust_key_id, trust_public_key_fingerprint,
+                trust_schema_version, trust_environment, trust_target_reference,
+                source_checkpoint, source_tag,
                 activation_candidate_hash, intent_hash, owner_approval_hash, attempt_id
             ) VALUES (
                 :environment_identity, :schema_version, 1, :environment_class, :state,
-                :target_reference, :trust_reference, :source_checkpoint, :source_tag,
+                :target_reference, :trust_reference,
+                :trust_algorithm, :trust_key_id, :trust_public_key_fingerprint,
+                :trust_schema_version, :trust_environment, :trust_target_reference,
+                :source_checkpoint, :source_tag,
                 :activation_candidate_hash, :intent_hash, :owner_approval_hash, :attempt_id
             )
         """), {
@@ -304,6 +396,7 @@ class ProductionAuthorityCandidate:
             "state": ProductionAuthorityState.GENESIS_RESERVED.value,
             "target_reference": target.target_reference,
             "trust_reference": target.signer_trust_reference,
+            **self._trust_binding_values(trust_record),
             "source_checkpoint": B1_FOUNDATION_CHECKPOINT_COMMIT,
             "source_tag": B1_FOUNDATION_CHECKPOINT_TAG,
             "activation_candidate_hash": candidate_hash,
@@ -314,10 +407,16 @@ class ProductionAuthorityCandidate:
         connection.execute(text("""
             INSERT INTO b2_production_authority_attempts (
                 attempt_id, environment_identity, activation_candidate_hash, intent_hash,
-                owner_approval_hash, target_reference, trust_reference, status, request_binding_hash
+                owner_approval_hash, target_reference, trust_reference,
+                trust_algorithm, trust_key_id, trust_public_key_fingerprint,
+                trust_schema_version, trust_environment, trust_target_reference,
+                status, request_binding_hash
             ) VALUES (
                 :attempt_id, :environment_identity, :activation_candidate_hash, :intent_hash,
-                :owner_approval_hash, :target_reference, :trust_reference, :status, :request_binding_hash
+                :owner_approval_hash, :target_reference, :trust_reference,
+                :trust_algorithm, :trust_key_id, :trust_public_key_fingerprint,
+                :trust_schema_version, :trust_environment, :trust_target_reference,
+                :status, :request_binding_hash
             )
         """), {
             "attempt_id": attempt_id,
@@ -327,6 +426,7 @@ class ProductionAuthorityCandidate:
             "owner_approval_hash": owner_hash,
             "target_reference": target.target_reference,
             "trust_reference": target.signer_trust_reference,
+            **self._trust_binding_values(trust_record),
             "status": ProductionAuthorityState.GENESIS_RESERVED.value,
             "request_binding_hash": binding_hash,
         })
@@ -335,11 +435,17 @@ class ProductionAuthorityCandidate:
             INSERT INTO b2_production_authority_audit (
                 environment_identity, attempt_id, event_type, state_before, state_after,
                 intent_hash, owner_approval_hash, activation_candidate_hash,
-                target_reference, trust_reference, payload_hash
+                target_reference, trust_reference,
+                trust_algorithm, trust_key_id, trust_public_key_fingerprint,
+                trust_schema_version, trust_environment, trust_target_reference,
+                payload_hash
             ) VALUES (
                 :environment_identity, :attempt_id, 'GENESIS_RESERVED', 'PRE_GENESIS', 'GENESIS_RESERVED',
                 :intent_hash, :owner_approval_hash, :activation_candidate_hash,
-                :target_reference, :trust_reference, :payload_hash
+                :target_reference, :trust_reference,
+                :trust_algorithm, :trust_key_id, :trust_public_key_fingerprint,
+                :trust_schema_version, :trust_environment, :trust_target_reference,
+                :payload_hash
             )
         """), {
             "environment_identity": target.environment_identity,
@@ -349,6 +455,7 @@ class ProductionAuthorityCandidate:
             "activation_candidate_hash": candidate_hash,
             "target_reference": target.target_reference,
             "trust_reference": target.signer_trust_reference,
+            **self._trust_binding_values(trust_record),
             "payload_hash": payload_hash,
         })
         attempt = connection.execute(text("SELECT * FROM b2_production_authority_attempts WHERE attempt_id = :attempt_id"), {"attempt_id": attempt_id}).mappings().first()
@@ -369,6 +476,7 @@ class ProductionAuthorityCandidate:
         attempt_id: str,
         candidate_hash: str,
         binding_hash: str,
+        trust_record: TrustRecord,
         original_error: IntegrityError,
     ) -> dict[str, Any]:
         with self.store.engine.begin() as connection:
@@ -379,6 +487,7 @@ class ProductionAuthorityCandidate:
             """), {"environment_identity": target.environment_identity}).mappings().first()
             if domain is None:
                 raise original_error
+            self._assert_persisted_trust_binding(domain, trust_record)
             if domain["activation_candidate_hash"] != candidate_hash or domain["attempt_id"] != attempt_id:
                 raise CoreError("B2_ACTIVATION_ATTEMPT_CONFLICT") from None
             attempt = connection.execute(text("SELECT * FROM b2_production_authority_attempts WHERE attempt_id = :attempt_id FOR UPDATE"), {"attempt_id": attempt_id}).mappings().first()
@@ -399,6 +508,7 @@ class ProductionAuthorityCandidate:
     ) -> ProductionAuthorityGenesisResult:
         approval = self._validate_all(target=target, observation=observation, intent=intent,
                                       approval=approval, attempt_id=attempt_id, now=now)
+        trust_record = self._trust_record_for_intent(intent)
         candidate_hash = activation_candidate_hash(target=target, intent=intent)
         owner_hash = self._owner_approval_hash(approval)
         binding_hash = self._request_binding_hash(target=target, observation=observation, intent=intent,
@@ -420,6 +530,7 @@ class ProductionAuthorityCandidate:
                     FOR UPDATE
                 """), {"environment_identity": target.environment_identity}).mappings().first()
             assert domain is not None
+            self._assert_persisted_trust_binding(domain, trust_record)
             if domain["attempt_id"] != attempt_id or domain["activation_candidate_hash"] != candidate_hash:
                 raise CoreError("B2_ACTIVATION_ATTEMPT_CONFLICT")
             attempt = connection.execute(text("SELECT * FROM b2_production_authority_attempts WHERE attempt_id = :attempt_id FOR UPDATE"), {"attempt_id": attempt_id}).mappings().first()
@@ -486,11 +597,17 @@ class ProductionAuthorityCandidate:
                 INSERT INTO b2_production_authority_audit (
                     environment_identity, attempt_id, event_type, state_before, state_after,
                     intent_hash, owner_approval_hash, activation_candidate_hash,
-                    target_reference, trust_reference, payload_hash
+                    target_reference, trust_reference,
+                    trust_algorithm, trust_key_id, trust_public_key_fingerprint,
+                    trust_schema_version, trust_environment, trust_target_reference,
+                    payload_hash
                 ) VALUES (
                     :environment_identity, :attempt_id, 'GENESIS_DURABLE', 'GENESIS_RESERVED', 'GENESIS_DURABLE',
                     :intent_hash, :owner_approval_hash, :activation_candidate_hash,
-                    :target_reference, :trust_reference, :payload_hash
+                    :target_reference, :trust_reference,
+                    :trust_algorithm, :trust_key_id, :trust_public_key_fingerprint,
+                    :trust_schema_version, :trust_environment, :trust_target_reference,
+                    :payload_hash
                 )
             """), {
                 "environment_identity": target.environment_identity,
@@ -500,6 +617,7 @@ class ProductionAuthorityCandidate:
                 "activation_candidate_hash": candidate_hash,
                 "target_reference": target.target_reference,
                 "trust_reference": target.signer_trust_reference,
+                **self._trust_binding_values(trust_record),
                 "payload_hash": result_hash,
             })
         if simulate_failure_after_commit:
@@ -522,10 +640,20 @@ class ProductionAuthorityCandidate:
         intent: SignedMigrationIntent,
         approval: OwnerApproval,
         evidence_refs: list[str],
+        now: datetime | None = None,
     ):
-        return build_activation_plan_without_execution(target=target, observation=observation,
-                                                       intent=intent, approval=approval,
-                                                       evidence_refs=evidence_refs)
+        return build_activation_plan_without_execution(
+            target=target,
+            observation=observation,
+            intent=intent,
+            approval=approval,
+            evidence_refs=evidence_refs,
+            now=now,
+            trust_store=self.trust_store,
+            environment_mode=self.environment_mode,
+            admission_store=self.admission_store,
+            signer_provider=self.signer_provider,
+        )
 
 
 def json_dumps(value: dict[str, Any]) -> str:

@@ -8,6 +8,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from app.b2_activation_readiness import (
     B1_FOUNDATION_CHECKPOINT_COMMIT,
@@ -19,6 +20,7 @@ from app.b2_activation_readiness import (
     activation_candidate_hash,
 )
 from app.b2_production_authority import (
+    REAL_PRODUCTION,
     SYNTHETIC_PRODUCTION_TEST,
     PRODUCTION_AUTHORITY_SCHEMA_VERSION,
     ProductionAuthorityCandidate,
@@ -26,9 +28,80 @@ from app.b2_production_authority import (
     ProductionAuthorityStore,
 )
 from app.errors import CoreError
+from app.b2_signer_trust import (
+    AuthorityEnvironmentMode,
+    InMemoryEd25519SignerProvider,
+    SignerProviderClassification,
+    TrustRecord,
+    TrustStore,
+    sign_smi_payload,
+)
 from tests.test_foundation_closure_rehearsal import FoundationPostgresEnvironment
 
 NOW = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+
+_SYNTHETIC_TRUST_CACHE = {}
+
+
+def synthetic_trust(
+    *,
+    trust_reference="synthetic-production-trust-ref",
+    environment=SYNTHETIC_PRODUCTION_TEST,
+    target_reference="synthetic-prod-target-ref-001",
+    classification=SignerProviderClassification.SYNTHETIC_PRODUCTION_TEST_ONLY,
+):
+    cache_key = (trust_reference, environment, target_reference, classification.value)
+    if cache_key not in _SYNTHETIC_TRUST_CACHE:
+        provider = InMemoryEd25519SignerProvider(
+            provider_reference=f"synthetic-provider:{trust_reference}",
+            private_key=Ed25519PrivateKey.generate(),
+            classification=classification,
+        )
+        record = TrustRecord.from_provider(
+            trust_reference=trust_reference,
+            provider=provider,
+            environment=environment,
+            target_reference=target_reference,
+            generation=1,
+            created_at=NOW,
+        )
+        _SYNTHETIC_TRUST_CACHE[cache_key] = (provider, record)
+    provider, record = _SYNTHETIC_TRUST_CACHE[cache_key]
+    return TrustStore({trust_reference: record}), provider, record
+
+
+def synthetic_trust_store(**kwargs):
+    return synthetic_trust(**kwargs)[0]
+
+
+def fresh_synthetic_trust(*, trust_reference="synthetic-production-trust-ref", environment=SYNTHETIC_PRODUCTION_TEST, target_reference="synthetic-prod-target-ref-001"):
+    provider = InMemoryEd25519SignerProvider(
+        provider_reference=f"synthetic-provider:{trust_reference}",
+        private_key=Ed25519PrivateKey.generate(),
+        classification=SignerProviderClassification.SYNTHETIC_PRODUCTION_TEST_ONLY,
+    )
+    record = TrustRecord.from_provider(
+        trust_reference=trust_reference,
+        provider=provider,
+        environment=environment,
+        target_reference=target_reference,
+        generation=1,
+        created_at=NOW,
+    )
+    return TrustStore({trust_reference: record}), provider, record
+
+
+def _sign_intent_data(data: dict, provider: InMemoryEd25519SignerProvider) -> dict:
+    placeholder = dict(data)
+    placeholder["signature_metadata"] = {"signature_ref": "synthetic-test-signature", "signature": "0" * 128}
+    payload = SignedMigrationIntent(**placeholder).canonical_payload()
+    signed = dict(data)
+    signed["signature_metadata"] = {
+        **signed.get("signature_metadata", {}),
+        "signature_ref": signed.get("signature_metadata", {}).get("signature_ref", "synthetic-test-signature"),
+        "signature": sign_smi_payload(provider, payload),
+    }
+    return signed
 
 
 def make_target(**updates):
@@ -70,9 +143,21 @@ def make_intent(**updates):
         "valid_from": NOW - timedelta(minutes=5),
         "expires_at": NOW + timedelta(hours=1),
         "owner_approval_reference": "synthetic-owner-approval-required",
-        "signature_metadata": {"signature_ref": "synthetic-test-signature", "key_fingerprint": "synthetic-test-key"},
+        "signature_metadata": {"signature_ref": "synthetic-test-signature"},
     }
     data.update(updates)
+    signer_key_id_overridden = "signer_key_id" in updates
+    _, provider, record = synthetic_trust(
+        trust_reference=data["authority_trust_reference"],
+        environment=data["target_environment"],
+        target_reference=data["target_reference"],
+    )
+    data["signer_key_id"] = data.get("signer_key_id", record.key_id)
+    if "signature_metadata" not in updates or "signature" not in data["signature_metadata"]:
+        signing_data = dict(data)
+        if signer_key_id_overridden:
+            signing_data["signer_key_id"] = record.key_id
+        data = _sign_intent_data(signing_data, provider) | {"signer_key_id": data["signer_key_id"]}
     return SignedMigrationIntent(**data)
 
 
@@ -119,7 +204,7 @@ def authority(tmp_path):
     try:
         env.create_database("b2_authority")
         store = ProductionAuthorityStore(env.url("b2_authority"))
-        yield ProductionAuthorityCandidate(store)
+        yield ProductionAuthorityCandidate(store, trust_store=synthetic_trust_store())
     finally:
         env.destroy()
 
@@ -143,7 +228,7 @@ def test_reservation_restart_reconstruction_and_same_retry(authority, tmp_path):
     target, intent, obs = make_target(), make_intent(), make_observation()
     approval = make_approval(target, intent)
     first = authority.reserve_genesis(target=target, observation=obs, intent=intent, approval=approval, attempt_id="attempt-1", now=NOW)
-    restarted = ProductionAuthorityCandidate(ProductionAuthorityStore(authority.store.sqlalchemy_url))
+    restarted = ProductionAuthorityCandidate(ProductionAuthorityStore(authority.store.sqlalchemy_url), trust_store=synthetic_trust_store())
     second = restarted.reserve_genesis(target=target, observation=obs, intent=intent, approval=approval, attempt_id="attempt-1", now=NOW)
     assert second["request_binding_hash"] == first["request_binding_hash"]
     assert restarted.export_state(SYNTHETIC_PRODUCTION_TEST)["state"] == ProductionAuthorityState.GENESIS_RESERVED.value
@@ -154,7 +239,7 @@ def test_durable_genesis_restart_response_loss_and_no_regenesis(authority):
     approval = make_approval(target, intent)
     with pytest.raises(CoreError, match="B2_SIMULATED_RESPONSE_LOSS_AFTER_DURABLE_COMMIT"):
         authority.commit_genesis(target=target, observation=obs, intent=intent, approval=approval, attempt_id="attempt-2", now=NOW, simulate_failure_after_commit=True)
-    restarted = ProductionAuthorityCandidate(ProductionAuthorityStore(authority.store.sqlalchemy_url))
+    restarted = ProductionAuthorityCandidate(ProductionAuthorityStore(authority.store.sqlalchemy_url), trust_store=synthetic_trust_store())
     replay = restarted.commit_genesis(target=target, observation=obs, intent=intent, approval=approval, attempt_id="attempt-2", now=NOW)
     again = restarted.commit_genesis(target=target, observation=obs, intent=intent, approval=approval, attempt_id="attempt-2", now=NOW)
     assert again.as_dict() == replay.as_dict()
@@ -200,6 +285,63 @@ def test_intent_approval_and_trust_binding_rejections(authority):
         authority.reserve_genesis(target=target, observation=obs, intent=intent, approval=wrong_approval, attempt_id="wrong-approval", now=NOW)
 
 
+def test_signature_and_trust_failures_are_pre_mutation(authority):
+    before = authority.store.counts_and_hash()
+    target, obs = make_target(), make_observation()
+    cases = [
+        make_intent(intent_id="bad-signature", signature_metadata={"signature_ref": "bad", "signature": "1" * 128}),
+        make_intent(intent_id="wrong-key", signer_key_id="0" * 64),
+        make_intent(intent_id="unknown-trust", authority_trust_reference="unknown-trust-ref"),
+        make_intent(intent_id="wrong-env").model_copy(update={"target_environment": "wrong-env"}),
+        make_intent(intent_id="wrong-target").model_copy(update={"target_reference": "wrong-target"}),
+    ]
+    expected = [
+        "SMI_SIGNATURE_INVALID",
+        "SMI_SIGNER_KEY_ID_MISMATCH",
+        "SMI_SIGNER_TRUST_NOT_FOUND",
+        "SMI_ENVIRONMENT_MISMATCH",
+        "SMI_TARGET_MISMATCH",
+    ]
+    for bad_intent, pattern in zip(cases, expected):
+        with pytest.raises(CoreError, match=pattern):
+            authority.reserve_genesis(
+                target=target,
+                observation=obs,
+                intent=bad_intent,
+                approval=make_approval(target, bad_intent),
+                attempt_id=f"negative-{bad_intent.intent_id}",
+                now=NOW,
+            )
+    assert authority.store.counts_and_hash() == before
+
+
+def test_real_production_mode_rejects_synthetic_trust_classification(tmp_path):
+    env = FoundationPostgresEnvironment(tmp_path).create()
+    try:
+        env.create_database("b2_real_mode")
+        store = ProductionAuthorityStore(env.url("b2_real_mode"))
+        target = make_target(environment_identity="qingyu-real-prod-primary")
+        obs = make_observation()
+        intent = make_intent(target_environment="qingyu-real-prod-primary")
+        candidate = ProductionAuthorityCandidate(
+            store,
+            trust_store=synthetic_trust_store(environment="qingyu-real-prod-primary"),
+            environment_mode=AuthorityEnvironmentMode.REAL_PRODUCTION,
+        )
+        with pytest.raises(CoreError, match="PRODUCTION_SIGNER_ADMISSION_NOT_FOUND"):
+            candidate.reserve_genesis(
+                target=target,
+                observation=obs,
+                intent=intent,
+                approval=make_approval(target, intent),
+                attempt_id="real-mode-synthetic-key",
+                now=NOW,
+            )
+        assert store.counts_and_hash()["domain_count"] == 0
+    finally:
+        env.destroy()
+
+
 def test_rehearsal_artifact_and_marker_rejected(authority):
     with pytest.raises(CoreError, match="B2_REHEARSAL_ARTIFACT_FORBIDDEN"):
         bad_target = make_target(authority_reference="PostgresAuthorityStateStore")
@@ -214,24 +356,56 @@ def test_recovery_state_fields_persist_after_durable_genesis(authority):
     target, intent, obs = make_target(), make_intent(), make_observation()
     approval = make_approval(target, intent)
     result = authority.commit_genesis(target=target, observation=obs, intent=intent, approval=approval, attempt_id="recovery-fields", now=NOW)
-    state = ProductionAuthorityCandidate(ProductionAuthorityStore(authority.store.sqlalchemy_url)).export_state(SYNTHETIC_PRODUCTION_TEST)
+    state = ProductionAuthorityCandidate(ProductionAuthorityStore(authority.store.sqlalchemy_url), trust_store=synthetic_trust_store()).export_state(SYNTHETIC_PRODUCTION_TEST)
     assert state["recovery_epoch"] == result.recovery_epoch
     assert state["governed_state_version"] == result.governed_state_version
     assert state["last_checkpoint_hash"]
     assert state["trust_reference"] == target.signer_trust_reference
+    _, _, record = synthetic_trust()
+    assert state["trust_algorithm"] == "Ed25519"
+    assert state["trust_key_id"] == record.key_id
+    assert state["trust_public_key_fingerprint"] == record.public_key_fingerprint
+    assert state["trust_schema_version"] == record.schema_version
+    assert state["trust_environment"] == SYNTHETIC_PRODUCTION_TEST
+    assert state["trust_target_reference"] == target.target_reference
+    with authority.store.engine.begin() as connection:
+        audit = connection.execute(text("SELECT * FROM b2_production_authority_audit ORDER BY audit_id")).mappings().all()
+    assert audit
+    assert all(row["trust_key_id"] == record.key_id for row in audit)
+    assert all(row["trust_public_key_fingerprint"] == record.public_key_fingerprint for row in audit)
+    assert all(row["trust_schema_version"] == record.schema_version for row in audit)
+    assert all(row["trust_environment"] == SYNTHETIC_PRODUCTION_TEST for row in audit)
+    assert all(row["trust_target_reference"] == target.target_reference for row in audit)
+
+
+def test_restart_rejects_same_trust_reference_with_different_key(authority):
+    target, intent, obs = make_target(), make_intent(), make_observation()
+    approval = make_approval(target, intent)
+    first = authority.reserve_genesis(target=target, observation=obs, intent=intent, approval=approval, attempt_id="drift", now=NOW)
+    drift_store, drift_provider, drift_record = fresh_synthetic_trust()
+    drift_data = intent.model_dump(mode="python")
+    drift_data["signer_key_id"] = drift_record.key_id
+    drift_data["intent_id"] = "intent-drift"
+    drift_data["signature_metadata"] = {"signature_ref": "drift"}
+    drift_intent = SignedMigrationIntent(**_sign_intent_data(drift_data, drift_provider))
+    drift_approval = make_approval(target, drift_intent)
+    restarted = ProductionAuthorityCandidate(ProductionAuthorityStore(authority.store.sqlalchemy_url), trust_store=drift_store)
+    with pytest.raises(CoreError, match="B2_PERSISTED_TRUST_BINDING_MISMATCH"):
+        restarted.reserve_genesis(target=target, observation=obs, intent=drift_intent, approval=drift_approval, attempt_id="drift", now=NOW)
 
 
 def test_dry_run_plan_deterministic_read_only_and_changes_on_trust_change(authority):
     target, intent, obs = make_target(), make_intent(), make_observation()
     approval = make_approval(target, intent)
-    first = authority.build_read_only_plan(target=target, observation=obs, intent=intent, approval=approval, evidence_refs=["synthetic"])
-    second = authority.build_read_only_plan(target=target, observation=obs, intent=intent, approval=approval, evidence_refs=["synthetic"])
+    first = authority.build_read_only_plan(target=target, observation=obs, intent=intent, approval=approval, evidence_refs=["synthetic"], now=NOW)
+    second = authority.build_read_only_plan(target=target, observation=obs, intent=intent, approval=approval, evidence_refs=["synthetic"], now=NOW)
     assert first.plan_hash == second.plan_hash
     assert first.planned_mutations == 0
     changed_target = make_target(signer_trust_reference="synthetic-production-trust-ref-2")
     changed_intent = make_intent(authority_trust_reference="synthetic-production-trust-ref-2")
     changed_approval = make_approval(changed_target, changed_intent)
-    changed = authority.build_read_only_plan(target=changed_target, observation=make_observation(authority_trust_reference="synthetic-production-trust-ref-2"), intent=changed_intent, approval=changed_approval, evidence_refs=["synthetic"])
+    changed_authority = ProductionAuthorityCandidate(authority.store, trust_store=synthetic_trust_store(trust_reference="synthetic-production-trust-ref-2"))
+    changed = changed_authority.build_read_only_plan(target=changed_target, observation=make_observation(authority_trust_reference="synthetic-production-trust-ref-2"), intent=changed_intent, approval=changed_approval, evidence_refs=["synthetic"], now=NOW)
     assert changed.plan_hash != first.plan_hash
 
 
@@ -248,7 +422,7 @@ def _barrier_race(authority, attempt_ids):
     approval = make_approval(target, intent)
     barrier = Barrier(len(attempt_ids))
     def run(attempt_id):
-        candidate = ProductionAuthorityCandidate(authority.store, reservation_race_hook=lambda: barrier.wait(timeout=10))
+        candidate = ProductionAuthorityCandidate(authority.store, reservation_race_hook=lambda: barrier.wait(timeout=10), trust_store=synthetic_trust_store())
         try:
             row = candidate.reserve_genesis(target=target, observation=obs, intent=intent,
                                             approval=approval, attempt_id=attempt_id, now=NOW)
@@ -285,7 +459,7 @@ def test_barrier_competing_attempt_concurrency_normalizes_unique_violation(autho
     assert counts["domain_count"] == 1
     assert counts["attempt_count"] == 1
     assert counts["audit_count"] == 1
-    restarted = ProductionAuthorityCandidate(ProductionAuthorityStore(authority.store.sqlalchemy_url))
+    restarted = ProductionAuthorityCandidate(ProductionAuthorityStore(authority.store.sqlalchemy_url), trust_store=synthetic_trust_store())
     state = restarted.export_state(SYNTHETIC_PRODUCTION_TEST)
     assert state["attempt_id"] in {"winner-a", "winner-b"}
     target, intent, obs = make_target(), make_intent(), make_observation()

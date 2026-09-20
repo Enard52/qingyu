@@ -8,7 +8,16 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .canonical import sha256_hex
+from .control_plane.r1_protocol import canonical_bytes
 from .errors import CoreError
+from .b2_signer_trust import (
+    AuthorityEnvironmentMode,
+    ProductionSignerAdmissionStore,
+    SignerProvider,
+    TrustStore,
+    ensure_production_eligible,
+    verify_smi_signature,
+)
 
 B1_FOUNDATION_CHECKPOINT_COMMIT = "ebcd8588e21ab28556e7d4f70fba095f3082cd28"
 B1_FOUNDATION_CHECKPOINT_TAG = "r1/dev-b1-foundation-stage-01-20260918"
@@ -87,6 +96,11 @@ class ProductionTargetContract(B2Model):
         return self
 
 
+class SMISignatureMetadata(B2Model):
+    signature_ref: str = Field(min_length=1)
+    signature: str = Field(min_length=128, max_length=128)
+
+
 class SignedMigrationIntent(B2Model):
     schema_version: Literal[B2_INTENT_SCHEMA_VERSION] = B2_INTENT_SCHEMA_VERSION
     intent_id: str = Field(min_length=1)
@@ -96,13 +110,14 @@ class SignedMigrationIntent(B2Model):
     source_tag: str = Field(min_length=1)
     target_schema_migration_version: str = Field(min_length=1)
     authority_trust_reference: str = Field(min_length=1)
+    signer_key_id: str = Field(min_length=64, max_length=64)
     requested_operation: Literal["PRODUCTION_GENESIS"]
     expected_preconditions: list[str] = Field(min_length=1)
     expected_genesis_behavior: Literal["DURABLE_ONCE_THEN_CONTINUATION_ONLY"]
     valid_from: datetime
     expires_at: datetime
     owner_approval_reference: str = Field(min_length=1)
-    signature_metadata: dict[str, Any]
+    signature_metadata: SMISignatureMetadata
 
     @model_validator(mode="after")
     def validate_intent(self) -> "SignedMigrationIntent":
@@ -113,8 +128,6 @@ class SignedMigrationIntent(B2Model):
             raise CoreError("B2_WRONG_IMPLEMENTATION_TAG")
         if self.expires_at <= self.valid_from:
             raise CoreError("B2_INTENT_EXPIRY_INVALID")
-        if not self.signature_metadata.get("signature_ref") or self.signature_metadata.get("raw_private_key"):
-            raise CoreError("B2_INTENT_SIGNATURE_METADATA_INVALID")
         return self
 
     def canonical_payload(self) -> dict[str, Any]:
@@ -124,7 +137,7 @@ class SignedMigrationIntent(B2Model):
 
     @property
     def canonical_payload_hash(self) -> str:
-        return sha256_hex(self.canonical_payload())
+        return sha256_hex(canonical_bytes(self.canonical_payload()))
 
 
 class OwnerApproval(B2Model):
@@ -210,10 +223,46 @@ def activation_candidate_hash(*, target: ProductionTargetContract, intent: Signe
     })
 
 
-def validate_signed_migration_intent(intent: SignedMigrationIntent, *, now: datetime | None = None) -> None:
+def validate_signed_migration_intent(
+    intent: SignedMigrationIntent,
+    *,
+    now: datetime | None = None,
+    trust_store: TrustStore | None = None,
+    target: ProductionTargetContract | None = None,
+    environment_mode: AuthorityEnvironmentMode = AuthorityEnvironmentMode.SYNTHETIC_PRODUCTION_TEST,
+    admission_store: ProductionSignerAdmissionStore | None = None,
+    signer_provider: SignerProvider | None = None,
+) -> None:
     now = now or datetime.now(timezone.utc)
     if now < intent.valid_from or now >= intent.expires_at:
         raise CoreError("B2_INTENT_NOT_VALID_NOW")
+    if trust_store is None:
+        raise CoreError("SMI_SIGNER_TRUST_NOT_FOUND")
+    trust = trust_store.resolve(intent.authority_trust_reference)
+    if trust.algorithm != "Ed25519":
+        raise CoreError("SMI_SIGNER_ALGORITHM_MISMATCH")
+    if intent.signer_key_id != trust.key_id:
+        raise CoreError("SMI_SIGNER_KEY_ID_MISMATCH")
+    if trust.environment != intent.target_environment:
+        raise CoreError("SMI_ENVIRONMENT_MISMATCH")
+    if trust.target_reference != intent.target_reference:
+        raise CoreError("SMI_TARGET_MISMATCH")
+    if target is not None:
+        if intent.target_environment != target.environment_identity:
+            raise CoreError("SMI_ENVIRONMENT_MISMATCH")
+        if intent.target_reference != target.target_reference:
+            raise CoreError("SMI_TARGET_MISMATCH")
+    ensure_production_eligible(
+        trust,
+        mode=environment_mode,
+        admission_store=admission_store,
+        signer_provider=signer_provider,
+    )
+    verify_smi_signature(
+        canonical_payload=intent.canonical_payload(),
+        signature_hex=intent.signature_metadata.signature,
+        trust_record=trust,
+    )
 
 
 def validate_owner_approval(*, approval: OwnerApproval | None, target: ProductionTargetContract, intent: SignedMigrationIntent) -> None:
@@ -254,6 +303,33 @@ def validate_target_observation(target: ProductionTargetContract, observation: T
         raise CoreError("B2_ACTIVATION_LOCK_MISSING")
 
 
+def validate_activation_request_without_mutation(
+    *,
+    target: ProductionTargetContract,
+    observation: TargetReadOnlyObservation,
+    intent: SignedMigrationIntent,
+    approval: OwnerApproval | None,
+    now: datetime | None = None,
+    trust_store: TrustStore | None = None,
+    environment_mode: AuthorityEnvironmentMode = AuthorityEnvironmentMode.SYNTHETIC_PRODUCTION_TEST,
+    admission_store: ProductionSignerAdmissionStore | None = None,
+    signer_provider: SignerProvider | None = None,
+) -> OwnerApproval:
+    validate_signed_migration_intent(
+        intent,
+        now=now,
+        trust_store=trust_store,
+        target=target,
+        environment_mode=environment_mode,
+        admission_store=admission_store,
+        signer_provider=signer_provider,
+    )
+    validate_target_observation(target, observation)
+    validate_owner_approval(approval=approval, target=target, intent=intent)
+    assert approval is not None
+    return approval
+
+
 @dataclass
 class ActivationAttemptGuard:
     active_attempt_id: str | None = None
@@ -287,10 +363,22 @@ def build_activation_dry_run(
     approval: OwnerApproval | None,
     evidence_refs: list[str],
     now: datetime | None = None,
+    trust_store: TrustStore | None = None,
+    environment_mode: AuthorityEnvironmentMode = AuthorityEnvironmentMode.SYNTHETIC_PRODUCTION_TEST,
+    admission_store: ProductionSignerAdmissionStore | None = None,
+    signer_provider: SignerProvider | None = None,
 ) -> ActivationDryRunResult:
-    validate_signed_migration_intent(intent, now=now)
-    validate_target_observation(target, observation)
-    validate_owner_approval(approval=approval, target=target, intent=intent)
+    approval = validate_activation_request_without_mutation(
+        target=target,
+        observation=observation,
+        intent=intent,
+        approval=approval,
+        now=now,
+        trust_store=trust_store,
+        environment_mode=environment_mode,
+        admission_store=admission_store,
+        signer_provider=signer_provider,
+    )
     decision = production_authority_decision()
     if decision["decision"] != "EXISTS_AND_REUSABLE":
         raise CoreError("B2_PRODUCTION_AUTHORITY_BLOCKED")
@@ -307,6 +395,11 @@ def build_activation_plan_without_execution(
     intent: SignedMigrationIntent,
     approval: OwnerApproval,
     evidence_refs: list[str],
+    now: datetime | None = None,
+    trust_store: TrustStore | None = None,
+    environment_mode: AuthorityEnvironmentMode = AuthorityEnvironmentMode.SYNTHETIC_PRODUCTION_TEST,
+    admission_store: ProductionSignerAdmissionStore | None = None,
+    signer_provider: SignerProvider | None = None,
 ) -> ActivationDryRunResult:
     """Build a deterministic review artifact after individual gates are checked.
 
@@ -314,8 +407,17 @@ def build_activation_plan_without_execution(
     production-authority blocker. It is used to freeze the planned sequence for
     independent review while final execution remains blocked.
     """
-    validate_target_observation(target, observation)
-    validate_owner_approval(approval=approval, target=target, intent=intent)
+    approval = validate_activation_request_without_mutation(
+        target=target,
+        observation=observation,
+        intent=intent,
+        approval=approval,
+        now=now,
+        trust_store=trust_store,
+        environment_mode=environment_mode,
+        admission_store=admission_store,
+        signer_provider=signer_provider,
+    )
     return _build_activation_plan(target=target, observation=observation, intent=intent,
                                   approval=approval, evidence_refs=evidence_refs)
 
