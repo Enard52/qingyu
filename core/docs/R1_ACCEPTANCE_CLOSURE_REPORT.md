@@ -1,8 +1,17 @@
 # Qingyu Control Plane R1 Acceptance Closure Report
 
-**Overall / Implementation Gate: BLOCKED.** Stopped in Phase 2 under the user's
-explicit OPEN-contract-blocker rule. This report records an interrupted Marathon,
-not a completed acceptance or Foundation Closure.
+**Overall / Implementation Gate: BLOCKED.** The latest Minimal Trust Design Gate
+ended with **R1 MINIMAL MODEL UNSOUND / STOP**. Independent A/B/C all returned
+BLOCKED. Git Safety Checkpoint is complete at `e490134ba9ced81be182b4c24eb41c970258f325`
+with tag `r1/pre-minimal-trust-pivot-e490134`; new Minimal Trust implementation
+and Foundation Closure have not begun.
+
+Current outcome and all review evidence:
+[Minimal Trust disposition](evidence/r1-acceptance-marathon/minimal-trust-disposition.md).
+C01 automatic witness work is **DEFERRED / REMOVED FROM R1 REQUIRED SCOPE**;
+the new blockers concern required recovery, exact byte semantics and model
+fidelity. The historical sections below preserve their original stage-specific
+claims, including earlier HEAD/commit/test status; they are not current status.
 
 ## 2026-09-14 C01 design resumption
 

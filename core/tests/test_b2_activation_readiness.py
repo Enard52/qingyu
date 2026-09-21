@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from app.b2_activation_readiness import (
@@ -27,7 +30,20 @@ from app.b2_activation_readiness import (
 )
 from app.errors import CoreError
 from app.b2_signer_trust import (
+    AuthorityEnvironmentMode,
+    EncryptedFileBackedEd25519SignerProvider,
     InMemoryEd25519SignerProvider,
+    PRODUCTION_PERMISSION_POLICY,
+    PRODUCTION_STORAGE_POLICY,
+    PRODUCTION_WSL_ROOTFS_STORAGE_POLICY,
+    ProductionSignerAdmissionRecord,
+    ProductionSignerAdmissionStatus,
+    ProductionSignerAdmissionStore,
+    ProductionSignerStorageAttestation,
+    ProductionSignerStorageAttestationStore,
+    ProductionSignerStorageClass,
+    ProductionSignerStorageInspectionResult,
+    ProductionSignerStorageInspector,
     SignerProviderClassification,
     TrustRecord,
     TrustStore,
@@ -37,7 +53,7 @@ from app.foundation_rehearsal import REHEARSAL_ENVIRONMENT, assert_rehearsal_gen
 from app.schemas import GenesisRequest
 import uuid
 
-NOW = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+NOW = datetime.now(timezone.utc)
 _TEST_TRUST_CACHE = {}
 
 
@@ -79,6 +95,68 @@ def _sign_intent_data(data: dict, provider: InMemoryEd25519SignerProvider) -> di
         "signature": sign_smi_payload(provider, payload),
     }
     return signed
+
+
+
+def real_file_backed_signer_fixture(tmp_path):
+    key_path = "//wsl.localhost/qingyu-prod-local-01/etc/qingyu/secrets/production-signer/qingyu-prod-signer-01.pem"
+    passphrase_path = "//wsl.localhost/qingyu-prod-local-01/etc/qingyu/secrets/production-signer/qingyu-prod-signer-01.passphrase"
+    provider = EncryptedFileBackedEd25519SignerProvider(
+        provider_reference="qingyu-prod-signer-01",
+        encrypted_private_key_path=key_path,
+        passphrase_provider=lambda: Path(passphrase_path).read_bytes().strip(),
+        classification=SignerProviderClassification.PRODUCTION_ELIGIBLE,
+    )
+    record = TrustRecord.from_provider(
+        trust_reference="production-root-trust-ref-001",
+        provider=provider,
+        environment="qingyu-production-primary",
+        target_reference="prod-target-ref-001",
+        generation=1,
+        created_at=NOW,
+    )
+    admission = ProductionSignerAdmissionRecord(
+        admission_reference="ephemeral-real-production-admission-fixture",
+        provider_reference=record.provider_reference,
+        provider_backend_type=record.provider_backend_type,
+        algorithm=record.algorithm,
+        key_id=record.key_id,
+        public_key_fingerprint=record.public_key_fingerprint,
+        environment=record.environment,
+        target_reference=record.target_reference,
+        storage_policy=PRODUCTION_WSL_ROOTFS_STORAGE_POLICY,
+        storage_class=ProductionSignerStorageClass.D_BACKED_WSL_ROOTFS.value,
+        permission_policy=PRODUCTION_PERMISSION_POLICY,
+        custody_policy_version="ephemeral-test-custody-policy-v1",
+        provisioning_reference="ephemeral-test-fixture-not-real-admission-record",
+        provisioning_generation=1,
+        status=ProductionSignerAdmissionStatus.ACTIVE,
+        created_at=NOW,
+    )
+    return TrustStore({record.trust_reference: record}), provider, record, ProductionSignerAdmissionStore({admission.admission_reference: admission})
+
+
+def real_signed_intent(provider, record):
+    data = {
+        "intent_id": "real-path-threading-intent",
+        "target_environment": "qingyu-production-primary",
+        "target_reference": "prod-target-ref-001",
+        "source_checkpoint": B1_FOUNDATION_CHECKPOINT_COMMIT,
+        "source_tag": B1_FOUNDATION_CHECKPOINT_TAG,
+        "target_schema_migration_version": "r1-control-plane-initial-v1",
+        "authority_trust_reference": record.trust_reference,
+        "requested_operation": "PRODUCTION_GENESIS",
+        "expected_preconditions": ["no previous durable GENESIS", "owner approval valid"],
+        "expected_genesis_behavior": "DURABLE_ONCE_THEN_CONTINUATION_ONLY",
+        "valid_from": NOW - timedelta(minutes=5),
+        "expires_at": NOW + timedelta(hours=1),
+        "owner_approval_reference": "owner-approval-ref-required",
+        "signer_key_id": record.key_id,
+        "signature_metadata": {"signature_ref": "real-path-test-signature", "signature": "0" * 128},
+    }
+    placeholder = SignedMigrationIntent(**data)
+    data["signature_metadata"] = {"signature_ref": "real-path-test-signature", "signature": sign_smi_payload(provider, placeholder.canonical_payload())}
+    return SignedMigrationIntent(**data)
 
 
 def target(**updates):
@@ -277,6 +355,67 @@ def test_plan_builder_is_deterministic_and_read_only_for_review_artifact():
     bad_approval = approval(t, bad)
     with pytest.raises(CoreError, match="SMI_SIGNATURE_INVALID"):
         build_activation_plan_without_execution(target=t, observation=o, intent=bad, approval=bad_approval, evidence_refs=["b1-checkpoint"], trust_store=trust_store, now=NOW)
+
+
+
+def test_real_production_activation_path_uses_owned_storage_composition(tmp_path):
+    trust_store, provider, record, admission_store = real_file_backed_signer_fixture(tmp_path)
+    i = real_signed_intent(provider, record)
+    t = target()
+    o = observation()
+    a = approval(t, i)
+    validate_signed_migration_intent(
+        i,
+        now=NOW,
+        trust_store=trust_store,
+        target=t,
+        environment_mode=AuthorityEnvironmentMode.REAL_PRODUCTION,
+        admission_store=admission_store,
+        signer_provider=provider,
+    )
+    plan = build_activation_plan_without_execution(
+        target=t,
+        observation=o,
+        intent=i,
+        approval=a,
+        evidence_refs=["owned-storage-composition-test"],
+        trust_store=trust_store,
+        environment_mode=AuthorityEnvironmentMode.REAL_PRODUCTION,
+        admission_store=admission_store,
+        signer_provider=provider,
+        now=NOW,
+    )
+    assert plan.planned_mutations == 0
+
+
+def test_activation_request_cannot_supply_storage_trust_capability(tmp_path):
+    trust_store, provider, record, admission_store = real_file_backed_signer_fixture(tmp_path)
+    i = real_signed_intent(provider, record)
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        validate_signed_migration_intent(
+            i,
+            now=NOW,
+            trust_store=trust_store,
+            target=target(),
+            environment_mode=AuthorityEnvironmentMode.REAL_PRODUCTION,
+            admission_store=admission_store,
+            signer_provider=provider,
+            storage_inspector=object(),
+        )
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        build_activation_plan_without_execution(
+            target=target(),
+            observation=observation(),
+            intent=i,
+            approval=approval(target(), i),
+            evidence_refs=["caller-storage-trust-rejected"],
+            trust_store=trust_store,
+            environment_mode=AuthorityEnvironmentMode.REAL_PRODUCTION,
+            admission_store=admission_store,
+            signer_provider=provider,
+            storage_attestation_store=object(),
+            now=NOW,
+        )
 
 
 def test_activation_attempt_guard_allows_same_attempt_and_rejects_concurrent_attempt():

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
-from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from pathlib import Path, PureWindowsPath
 from enum import StrEnum
 import re
+import subprocess
 from typing import Any, Callable, Mapping, Protocol
 
 from cryptography.exceptions import InvalidSignature
@@ -23,7 +24,9 @@ PRODUCTION_SIGNER_ADMISSION_SCHEMA_VERSION = "qingyu-b2-production-signer-admiss
 APPROVED_R1_PRODUCTION_PROVIDER_BACKEND = "encrypted-file-backed-ed25519"
 IN_MEMORY_PROVIDER_BACKEND = "in-memory-ed25519"
 PRODUCTION_STORAGE_POLICY = "D_BACKED_QINGYU_PROTECTED_STORAGE"
-PRODUCTION_PERMISSION_POLICY = "OWNER_ONLY_POSIX_0600_EQUIVALENT"
+PRODUCTION_WSL_ROOTFS_STORAGE_POLICY = "D_BACKED_WSL_ROOTFS"
+APPROVED_PRODUCTION_STORAGE_POLICIES = {PRODUCTION_STORAGE_POLICY, PRODUCTION_WSL_ROOTFS_STORAGE_POLICY}
+PRODUCTION_PERMISSION_POLICY = "GUEST_OWNER_ONLY_0700_0600"
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 _HEX128 = re.compile(r"[0-9a-f]{128}\Z")
 
@@ -156,16 +159,424 @@ class EncryptedFileBackedEd25519SignerProvider:
         }
 
 
-def validate_file_backed_provider_policy(provider: EncryptedFileBackedEd25519SignerProvider) -> None:
+class ProductionSignerStorageClass(StrEnum):
+    D_BACKED_HOST_PATH = "D_BACKED_HOST_PATH"
+    D_BACKED_WSL_ROOTFS = "D_BACKED_WSL_ROOTFS"
+
+
+PRODUCTION_SIGNER_STORAGE_ATTESTATION_SCHEMA_VERSION = "qingyu-b2-production-signer-storage-attestation-v1"
+APPROVED_R1_PRODUCTION_WSL_DISTRO = "qingyu-prod-local-01"
+APPROVED_R1_PRODUCTION_HOST_VOLUME = "D:"
+GUEST_OWNER_ONLY_PERMISSION_POLICY = PRODUCTION_PERMISSION_POLICY
+PRODUCTION_SIGNER_STORAGE_ATTESTATION_MAX_AGE = timedelta(minutes=5)
+TRUSTED_STORAGE_INSPECTOR_ATTESTED_BY = "windows-wsl-storage-inspector"
+
+
+def _host_path_is_within(path: str, root: str) -> bool:
+    try:
+        candidate = Path(path).resolve(strict=True)
+        allowed = Path(root).resolve(strict=True)
+        candidate.relative_to(allowed)
+        return True
+    except ValueError:
+        return False
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise CoreError("PRODUCTION_SIGNER_STORAGE_PATH_INVALID") from exc
+
+
+def _host_volume(path: str) -> str:
+    drive = PureWindowsPath(str(path)).drive
+    return drive.upper()
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _ensure_fresh_observation(observed_at: datetime | None, *, now: datetime | None = None) -> None:
+    if observed_at is None:
+        raise CoreError("PRODUCTION_SIGNER_STORAGE_ATTESTATION_FRESHNESS_REQUIRED")
+    observed = observed_at if observed_at.tzinfo is not None else observed_at.replace(tzinfo=timezone.utc)
+    current = now or _utc_now()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    if observed > current + timedelta(seconds=30):
+        raise CoreError("PRODUCTION_SIGNER_STORAGE_ATTESTATION_NOT_YET_VALID")
+    if current - observed > PRODUCTION_SIGNER_STORAGE_ATTESTATION_MAX_AGE:
+        raise CoreError("PRODUCTION_SIGNER_STORAGE_ATTESTATION_STALE")
+
+class ProductionSignerStorageAttestation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: str = PRODUCTION_SIGNER_STORAGE_ATTESTATION_SCHEMA_VERSION
+    storage_class: str = Field(min_length=1)
+    provider_reference: str = Field(min_length=1)
+    environment: str = Field(min_length=1)
+    target_reference: str = Field(min_length=1)
+    logical_secret_path_reference: str = Field(min_length=1)
+    host_backing_volume: str = Field(min_length=1)
+    host_backing_artifact_reference: str = Field(min_length=1)
+    qingyu_storage_root_reference: str = Field(min_length=1)
+    backing_verified: bool
+    encrypted_private_key_format: str = "PKCS8_PEM_ENCRYPTED_PRIVATE_KEY"
+    guest_secret_dir_mode: str = "0o700"
+    guest_key_file_mode: str = "0o600"
+    guest_passphrase_file_mode: str = "0o600"
+    permission_boundary: str = GUEST_OWNER_ONLY_PERMISSION_POLICY
+    host_admin_boundary_claimed: bool = False
+    host_admin_trusted_computing_base: bool = True
+    passphrase_separation_policy: str = "DEDICATED_SIGNER_PASSPHRASE_SEPARATE_CUSTODY"
+    attested_by: str = "provisioning-storage-inspection-boundary"
+    provider_self_attested: bool = False
+    distro_reference: str | None = None
+    wsl_version: int | None = None
+    registered_base_path: str | None = None
+    approved_qingyu_root: str | None = None
+    encrypted_format_verified: bool = True
+    passphrase_separation_verified: bool = True
+    host_acl_state: str = "HOST_STORAGE_ACL_ACCEPTABLE"
+    attestation_reference: str | None = None
+    inspector_version: str = "qingyu-b2-production-signer-storage-inspector-v1"
+    observed_at: datetime | None = None
+    observation_generation: int = 1
+    evidence_hash: str | None = None
+    status: str = "VALID"
+    created_at: datetime | None = None
+    os_observed: bool = False
+
+    @model_validator(mode="after")
+    def validate_attestation_contract(self) -> "ProductionSignerStorageAttestation":
+        if self.schema_version != PRODUCTION_SIGNER_STORAGE_ATTESTATION_SCHEMA_VERSION:
+            raise CoreError("PRODUCTION_SIGNER_STORAGE_ATTESTATION_SCHEMA_UNSUPPORTED")
+        if self.storage_class not in {item.value for item in ProductionSignerStorageClass}:
+            raise CoreError("PRODUCTION_SIGNER_STORAGE_CLASS_UNSUPPORTED")
+        if self.provider_self_attested or self.attested_by == "provider":
+            raise CoreError("PRODUCTION_SIGNER_STORAGE_ATTESTATION_SELF_DECLARED")
+        if self.storage_class == ProductionSignerStorageClass.D_BACKED_WSL_ROOTFS.value:
+            if self.attested_by != TRUSTED_STORAGE_INSPECTOR_ATTESTED_BY or not self.os_observed:
+                raise CoreError("PRODUCTION_SIGNER_STORAGE_ATTESTATION_NOT_OS_OBSERVED")
+            _ensure_fresh_observation(self.observed_at)
+        if not self.backing_verified:
+            raise CoreError("PRODUCTION_SIGNER_STORAGE_BACKING_UNVERIFIED")
+        if self.host_backing_volume.upper() != APPROVED_R1_PRODUCTION_HOST_VOLUME:
+            raise CoreError("PRODUCTION_SIGNER_STORAGE_HOST_VOLUME_UNAPPROVED")
+        if self.approved_qingyu_root is not None and self.approved_qingyu_root != self.qingyu_storage_root_reference:
+            raise CoreError("PRODUCTION_SIGNER_STORAGE_ROOT_UNAPPROVED")
+        if not _host_path_is_within(self.host_backing_artifact_reference, self.qingyu_storage_root_reference):
+            raise CoreError("PRODUCTION_SIGNER_STORAGE_ROOT_UNAPPROVED")
+        if _host_volume(self.host_backing_artifact_reference) != APPROVED_R1_PRODUCTION_HOST_VOLUME:
+            raise CoreError("PRODUCTION_SIGNER_STORAGE_HOST_VOLUME_UNAPPROVED")
+        if self.encrypted_private_key_format != "PKCS8_PEM_ENCRYPTED_PRIVATE_KEY" or not self.encrypted_format_verified:
+            raise CoreError("SIGNER_PROVIDER_ENCRYPTION_FORMAT_INVALID")
+        if self.guest_secret_dir_mode != "0o700" or self.guest_key_file_mode != "0o600" or self.guest_passphrase_file_mode != "0o600":
+            raise CoreError("PRODUCTION_SIGNER_GUEST_PERMISSION_POLICY_INVALID")
+        if self.permission_boundary != GUEST_OWNER_ONLY_PERMISSION_POLICY:
+            raise CoreError("PRODUCTION_SIGNER_PERMISSION_BOUNDARY_INVALID")
+        if self.host_admin_boundary_claimed:
+            raise CoreError("PRODUCTION_SIGNER_HOST_ADMIN_BOUNDARY_OVERCLAIMED")
+        if not self.host_admin_trusted_computing_base:
+            raise CoreError("PRODUCTION_SIGNER_HOST_ADMIN_TCB_REQUIRED")
+        if not self.passphrase_separation_verified:
+            raise CoreError("PRODUCTION_SIGNER_PASSPHRASE_SEPARATION_UNVERIFIED")
+        if self.host_acl_state != "HOST_STORAGE_ACL_ACCEPTABLE":
+            raise CoreError("PRODUCTION_SIGNER_HOST_ACL_UNSAFE")
+        if self.status != "VALID":
+            raise CoreError("PRODUCTION_SIGNER_STORAGE_ATTESTATION_INVALID")
+        if self.storage_class == ProductionSignerStorageClass.D_BACKED_WSL_ROOTFS.value:
+            if self.distro_reference != APPROVED_R1_PRODUCTION_WSL_DISTRO:
+                raise CoreError("PRODUCTION_SIGNER_WSL_DISTRO_UNAPPROVED")
+            if self.wsl_version != 2:
+                raise CoreError("PRODUCTION_SIGNER_WSL_VERSION_UNAPPROVED")
+            if not self.logical_secret_path_reference.startswith("/etc/qingyu/secrets/production-signer/"):
+                raise CoreError("PRODUCTION_SIGNER_WSL_LOGICAL_PATH_UNAPPROVED")
+            if self.registered_base_path is None or not _host_path_is_within(self.host_backing_artifact_reference, self.registered_base_path):
+                raise CoreError("PRODUCTION_SIGNER_WSL_BACKING_ARTIFACT_INVALID")
+            if not self.host_backing_artifact_reference.lower().endswith(".vhdx"):
+                raise CoreError("PRODUCTION_SIGNER_WSL_BACKING_ARTIFACT_INVALID")
+            if not Path(self.host_backing_artifact_reference).is_file():
+                raise CoreError("PRODUCTION_SIGNER_WSL_BACKING_ARTIFACT_INVALID")
+        if self.storage_class == ProductionSignerStorageClass.D_BACKED_HOST_PATH.value:
+            if not self.logical_secret_path_reference.lower().startswith("d:"):
+                raise CoreError("SIGNER_PROVIDER_STORAGE_POLICY_INVALID")
+        return self
+
+
+
+
+class ProductionSignerStorageAttestationStore:
+    """Trusted provisioning/inspection boundary for non-secret signer storage facts."""
+
+    def __init__(self, records: Mapping[str, ProductionSignerStorageAttestation] | None = None):
+        self._records: dict[str, ProductionSignerStorageAttestation] = {}
+        for record in (records or {}).values():
+            self.add(record)
+
+    def add(self, record: ProductionSignerStorageAttestation) -> None:
+        record.validate_attestation_contract()
+        self._records[record.provider_reference] = record
+
+    def resolve_for_provider(
+        self,
+        *,
+        provider_reference: str,
+        environment: str,
+        target_reference: str,
+    ) -> ProductionSignerStorageAttestation:
+        record = self._records.get(provider_reference)
+        if record is None:
+            raise CoreError("PRODUCTION_SIGNER_STORAGE_ATTESTATION_REQUIRED")
+        if record.environment != environment:
+            raise CoreError("PRODUCTION_SIGNER_STORAGE_ATTESTATION_ENVIRONMENT_MISMATCH")
+        if record.target_reference != target_reference:
+            raise CoreError("PRODUCTION_SIGNER_STORAGE_ATTESTATION_TARGET_MISMATCH")
+        record.validate_attestation_contract()
+        return record
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionSignerStorageInspectionResult:
+    signer_reference: str
+    provider_reference: str
+    environment: str
+    target_reference: str
+    storage_class: str
+    distro_reference: str
+    wsl_version: int
+    registered_base_path: str
+    host_backing_artifact_reference: str
+    qingyu_storage_root_reference: str
+    logical_secret_path_reference: str
+    guest_secret_dir_mode: str
+    guest_key_file_mode: str
+    guest_passphrase_file_mode: str
+    encrypted_format_verified: bool
+    passphrase_separation_verified: bool
+    host_acl_state: str
+    observed_at: datetime
+    observation_generation: int = 1
+
+
+class ProductionSignerStorageInspector:
+    """Base inspector contract. Test subclasses may provide controlled observations.
+
+    Directly passing ProductionSignerStorageInspectionResult is intentionally not
+    a production API; real production uses WindowsWslProductionSignerStorageInspector
+    to observe WSL/Windows state before minting the attestation.
+    """
+
+    inspector_version = "qingyu-b2-production-signer-storage-inspector-v1"
+    trusted_for_real_production = False
+
+    def inspect(self, *, provider: EncryptedFileBackedEd25519SignerProvider, environment: str, target_reference: str) -> ProductionSignerStorageAttestation:
+        raise CoreError("PRODUCTION_SIGNER_STORAGE_INSPECTOR_REQUIRED")
+
+    def attest(self, observation: ProductionSignerStorageInspectionResult) -> ProductionSignerStorageAttestation:
+        if observation.storage_class != ProductionSignerStorageClass.D_BACKED_WSL_ROOTFS.value:
+            raise CoreError("PRODUCTION_SIGNER_STORAGE_CLASS_UNSUPPORTED")
+        if observation.distro_reference != APPROVED_R1_PRODUCTION_WSL_DISTRO:
+            raise CoreError("PRODUCTION_SIGNER_WSL_DISTRO_UNAPPROVED")
+        if observation.wsl_version != 2:
+            raise CoreError("PRODUCTION_SIGNER_WSL_VERSION_UNAPPROVED")
+        if not _host_path_is_within(observation.registered_base_path, observation.qingyu_storage_root_reference):
+            raise CoreError("PRODUCTION_SIGNER_STORAGE_ROOT_UNAPPROVED")
+        if not _host_path_is_within(observation.host_backing_artifact_reference, observation.registered_base_path):
+            raise CoreError("PRODUCTION_SIGNER_WSL_BACKING_ARTIFACT_INVALID")
+        if _host_volume(observation.host_backing_artifact_reference) != APPROVED_R1_PRODUCTION_HOST_VOLUME:
+            raise CoreError("PRODUCTION_SIGNER_STORAGE_HOST_VOLUME_UNAPPROVED")
+        payload = {
+            "provider_reference": observation.provider_reference,
+            "environment": observation.environment,
+            "target_reference": observation.target_reference,
+            "storage_class": observation.storage_class,
+            "distro_reference": observation.distro_reference,
+            "registered_base_path": observation.registered_base_path,
+            "host_backing_artifact_reference": observation.host_backing_artifact_reference,
+            "logical_secret_path_reference": observation.logical_secret_path_reference,
+            "observed_at": observation.observed_at.isoformat(),
+            "generation": observation.observation_generation,
+        }
+        from .canonical import sha256_hex
+        evidence_hash = sha256_hex(payload)
+        record = ProductionSignerStorageAttestation(
+            attestation_reference=f"storage-attestation:{observation.provider_reference}:{observation.observation_generation}",
+            storage_class=observation.storage_class,
+            distro_reference=observation.distro_reference,
+            wsl_version=observation.wsl_version,
+            registered_base_path=observation.registered_base_path,
+            provider_reference=observation.provider_reference,
+            environment=observation.environment,
+            target_reference=observation.target_reference,
+            logical_secret_path_reference=observation.logical_secret_path_reference,
+            host_backing_volume=_host_volume(observation.host_backing_artifact_reference),
+            host_backing_artifact_reference=observation.host_backing_artifact_reference,
+            qingyu_storage_root_reference=observation.qingyu_storage_root_reference,
+            approved_qingyu_root=observation.qingyu_storage_root_reference,
+            backing_verified=True,
+            attested_by=TRUSTED_STORAGE_INSPECTOR_ATTESTED_BY if self.trusted_for_real_production else "test-storage-inspection-boundary",
+            os_observed=self.trusted_for_real_production,
+            guest_secret_dir_mode=observation.guest_secret_dir_mode,
+            guest_key_file_mode=observation.guest_key_file_mode,
+            guest_passphrase_file_mode=observation.guest_passphrase_file_mode,
+            encrypted_format_verified=observation.encrypted_format_verified,
+            passphrase_separation_verified=observation.passphrase_separation_verified,
+            host_acl_state=observation.host_acl_state,
+            inspector_version=self.inspector_version,
+            observed_at=observation.observed_at,
+            observation_generation=observation.observation_generation,
+            evidence_hash=evidence_hash,
+            status="VALID",
+        )
+        record.validate_attestation_contract()
+        return record
+
+
+class WindowsWslProductionSignerStorageInspector(ProductionSignerStorageInspector):
+    """Read-only Windows/WSL observer for the R1 production signer storage boundary."""
+
+    inspector_version = "qingyu-b2-production-signer-storage-inspector-v2-windows-wsl"
+    trusted_for_real_production = True
+
+    def __init__(
+        self,
+        *,
+        signer_reference: str = "qingyu-prod-signer-01",
+        distro_reference: str = APPROVED_R1_PRODUCTION_WSL_DISTRO,
+        qingyu_storage_root_reference: str = "<repo>/production/qingyu-prod-local-01",
+        logical_secret_path_reference: str = "/etc/qingyu/secrets/production-signer/qingyu-prod-signer-01.pem",
+        logical_passphrase_path_reference: str = "/etc/qingyu/secrets/production-signer/qingyu-prod-signer-01.passphrase",
+    ):
+        self.signer_reference = signer_reference
+        self.distro_reference = distro_reference
+        self.qingyu_storage_root_reference = qingyu_storage_root_reference
+        self.logical_secret_path_reference = logical_secret_path_reference
+        self.logical_passphrase_path_reference = logical_passphrase_path_reference
+
+    def _run(self, args: list[str]) -> str:
+        result = subprocess.run(args, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if result.returncode != 0:
+            raise CoreError("PRODUCTION_SIGNER_STORAGE_OS_OBSERVATION_FAILED")
+        return result.stdout.strip()
+
+    def _registered_base_path(self) -> str:
+        script = (
+            "$d='" + self.distro_reference.replace("'", "''") + "';"
+            "$k=Get-ChildItem HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss | "
+            "Where-Object { $_.GetValue('DistributionName') -eq $d } | Select-Object -First 1;"
+            "if (-not $k) { exit 2 }; $k.GetValue('BasePath')"
+        )
+        return self._run(["powershell", "-NoProfile", "-Command", script])
+
+    def _wsl_version(self) -> int:
+        out = self._run(["wsl.exe", "-l", "-v"])
+        for raw in out.splitlines():
+            line = raw.replace("\x00", "").replace("*", " ").strip()
+            if line.startswith(self.distro_reference):
+                parts = line.split()
+                if parts and parts[-1].isdigit():
+                    return int(parts[-1])
+        raise CoreError("PRODUCTION_SIGNER_WSL_DISTRO_UNAPPROVED")
+
+    def _mode(self, path: str) -> str:
+        value = self._run(["wsl.exe", "-d", self.distro_reference, "--", "stat", "-c", "%a", path]).strip()
+        return "0o" + value[-3:]
+
+    def _encrypted_private_key_format_verified(self, provider: EncryptedFileBackedEd25519SignerProvider) -> bool:
+        try:
+            head = Path(provider.encrypted_private_key_path).read_bytes()[:128]
+        except OSError:
+            return False
+        return b"BEGIN ENCRYPTED PRIVATE KEY" in head
+
+    def _host_acl_state(self, artifact: Path) -> str:
+        out = self._run(["icacls", str(artifact)])
+        unsafe = ("Everyone", "Authenticated Users", "BUILTIN\\Users", "CodexSandboxUsers")
+        return "HOST_STORAGE_ACL_UNSAFE" if any(item in out for item in unsafe) else "HOST_STORAGE_ACL_ACCEPTABLE"
+
+    def inspect(self, *, provider: EncryptedFileBackedEd25519SignerProvider, environment: str, target_reference: str) -> ProductionSignerStorageAttestation:
+        registered_base = self._registered_base_path()
+        base = Path(registered_base).resolve(strict=True)
+        candidates = sorted(base.glob("*.vhdx"))
+        if not candidates:
+            raise CoreError("PRODUCTION_SIGNER_WSL_BACKING_ARTIFACT_INVALID")
+        artifact = candidates[0].resolve(strict=True)
+        observation = ProductionSignerStorageInspectionResult(
+            signer_reference=self.signer_reference,
+            provider_reference=provider.provider_reference,
+            environment=environment,
+            target_reference=target_reference,
+            storage_class=ProductionSignerStorageClass.D_BACKED_WSL_ROOTFS.value,
+            distro_reference=self.distro_reference,
+            wsl_version=self._wsl_version(),
+            registered_base_path=str(base),
+            host_backing_artifact_reference=str(artifact),
+            qingyu_storage_root_reference=str(Path(self.qingyu_storage_root_reference).resolve(strict=True)),
+            logical_secret_path_reference=self.logical_secret_path_reference,
+            guest_secret_dir_mode=self._mode("/etc/qingyu/secrets/production-signer"),
+            guest_key_file_mode=self._mode(self.logical_secret_path_reference),
+            guest_passphrase_file_mode=self._mode(self.logical_passphrase_path_reference),
+            encrypted_format_verified=self._encrypted_private_key_format_verified(provider),
+            passphrase_separation_verified=self.logical_secret_path_reference != self.logical_passphrase_path_reference,
+            host_acl_state=self._host_acl_state(artifact),
+            observed_at=_utc_now(),
+        )
+        return self.attest(observation)
+
+
+def build_r1_production_signer_storage_inspector() -> WindowsWslProductionSignerStorageInspector:
+    return WindowsWslProductionSignerStorageInspector()
+
+
+def inspect_r1_production_signer_storage(
+    provider: EncryptedFileBackedEd25519SignerProvider,
+    *,
+    environment: str,
+    target_reference: str,
+) -> ProductionSignerStorageAttestation:
+    """Production-owned storage trust boundary for R1 real production.
+
+    Callers do not provide the inspector, a store, or a precomputed attestation.
+    The authority comes from this controlled call path constructing the concrete
+    Windows/WSL inspector and using its fresh observation in the same validation.
+    """
+
+    inspector = build_r1_production_signer_storage_inspector()
+    return inspector.inspect(provider=provider, environment=environment, target_reference=target_reference)
+
+
+def _provider_key_path_matches_attestation(provider_path: str, attestation: ProductionSignerStorageAttestation) -> bool:
+    normalized_provider_path = provider_path.replace("\\", "/")
+    logical = attestation.logical_secret_path_reference.replace("\\", "/")
+    if attestation.storage_class == ProductionSignerStorageClass.D_BACKED_WSL_ROOTFS.value:
+        unc_prefix = f"//wsl.localhost/{attestation.distro_reference}"
+        return normalized_provider_path == logical or normalized_provider_path.endswith(unc_prefix + logical)
+    return normalized_provider_path.lower() == logical.lower().replace("\\", "/")
+
+
+def validate_file_backed_provider_policy(
+    provider: EncryptedFileBackedEd25519SignerProvider,
+    *,
+    storage_attestation: ProductionSignerStorageAttestation | None = None,
+    environment: str | None = None,
+    target_reference: str | None = None,
+) -> None:
+    if storage_attestation is None:
+        raise CoreError("PRODUCTION_SIGNER_STORAGE_ATTESTATION_REQUIRED")
+    storage_attestation.validate_attestation_contract()
+    if storage_attestation.provider_reference != provider.provider_reference:
+        raise CoreError("PRODUCTION_SIGNER_STORAGE_ATTESTATION_PROVIDER_MISMATCH")
+    if environment is not None and storage_attestation.environment != environment:
+        raise CoreError("PRODUCTION_SIGNER_STORAGE_ATTESTATION_ENVIRONMENT_MISMATCH")
+    if target_reference is not None and storage_attestation.target_reference != target_reference:
+        raise CoreError("PRODUCTION_SIGNER_STORAGE_ATTESTATION_TARGET_MISMATCH")
+    if not _provider_key_path_matches_attestation(provider.encrypted_private_key_path, storage_attestation):
+        raise CoreError("PRODUCTION_SIGNER_STORAGE_ATTESTATION_PATH_MISMATCH")
     path = Path(provider.encrypted_private_key_path)
-    if not str(path).lower().startswith("d:"):
-        raise CoreError("SIGNER_PROVIDER_STORAGE_POLICY_INVALID")
-    if "qingyu" not in str(path).lower():
-        raise CoreError("SIGNER_PROVIDER_STORAGE_POLICY_INVALID")
     if not path.exists() or not path.is_file():
         raise CoreError("SIGNER_PROVIDER_KEY_FILE_MISSING")
     data = path.read_bytes()
-    if b"BEGIN ENCRYPTED PRIVATE KEY" not in data:
+    if b"BEGIN ENCRYPTED PRIVATE KEY" not in data or b"BEGIN PRIVATE KEY" in data.replace(b"BEGIN ENCRYPTED PRIVATE KEY", b""):
         raise CoreError("SIGNER_PROVIDER_ENCRYPTION_FORMAT_INVALID")
     passphrase = provider.passphrase_provider()
     if not isinstance(passphrase, bytes) or len(passphrase) < 16:
@@ -323,6 +734,7 @@ class ProductionSignerAdmissionRecord(BaseModel):
     environment: str = Field(min_length=1)
     target_reference: str = Field(min_length=1)
     storage_policy: str = Field(min_length=1)
+    storage_class: str | None = None
     permission_policy: str = Field(min_length=1)
     custody_policy_version: str = Field(min_length=1)
     provisioning_reference: str = Field(min_length=1)
@@ -343,6 +755,10 @@ class ProductionSignerAdmissionRecord(BaseModel):
             raise CoreError("PRODUCTION_SIGNER_ADMISSION_SCHEMA_UNSUPPORTED")
         if self.algorithm != "Ed25519":
             raise CoreError("PRODUCTION_SIGNER_ADMISSION_ALGORITHM_MISMATCH")
+        if self.storage_policy not in APPROVED_PRODUCTION_STORAGE_POLICIES:
+            raise CoreError("PRODUCTION_SIGNER_ADMISSION_STORAGE_POLICY_MISMATCH")
+        if self.storage_class is not None and self.storage_class not in {item.value for item in ProductionSignerStorageClass}:
+            raise CoreError("PRODUCTION_SIGNER_STORAGE_CLASS_UNSUPPORTED")
         return self
 
     @property
@@ -403,11 +819,27 @@ def verify_production_signer_admission(
         raise CoreError("PRODUCTION_SIGNER_ADMISSION_BACKEND_MISMATCH")
     if not isinstance(signer_provider, EncryptedFileBackedEd25519SignerProvider):
         raise CoreError("PRODUCTION_SIGNER_PROVIDER_BACKEND_NOT_APPROVED")
-    if admission.storage_policy != PRODUCTION_STORAGE_POLICY:
+    if admission.storage_policy not in APPROVED_PRODUCTION_STORAGE_POLICIES:
         raise CoreError("PRODUCTION_SIGNER_ADMISSION_STORAGE_POLICY_MISMATCH")
     if admission.permission_policy != PRODUCTION_PERMISSION_POLICY:
         raise CoreError("PRODUCTION_SIGNER_ADMISSION_PERMISSION_POLICY_MISMATCH")
-    validate_file_backed_provider_policy(signer_provider)
+    if admission.storage_policy != PRODUCTION_WSL_ROOTFS_STORAGE_POLICY:
+        raise CoreError("PRODUCTION_SIGNER_ADMISSION_STORAGE_POLICY_MISMATCH")
+    resolved_attestation = inspect_r1_production_signer_storage(
+        signer_provider,
+        environment=trust_record.environment,
+        target_reference=trust_record.target_reference,
+    )
+    if admission.storage_class is not None and admission.storage_class != resolved_attestation.storage_class:
+        raise CoreError("PRODUCTION_SIGNER_ADMISSION_STORAGE_CLASS_MISMATCH")
+    if resolved_attestation.storage_class != ProductionSignerStorageClass.D_BACKED_WSL_ROOTFS.value:
+        raise CoreError("PRODUCTION_SIGNER_ADMISSION_STORAGE_POLICY_MISMATCH")
+    validate_file_backed_provider_policy(
+        signer_provider,
+        storage_attestation=resolved_attestation,
+        environment=trust_record.environment,
+        target_reference=trust_record.target_reference,
+    )
 
 
 def ensure_production_eligible(
