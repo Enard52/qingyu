@@ -8,17 +8,23 @@ import re
 import subprocess
 from typing import Any, Callable, Mapping, Protocol
 
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import IntegrityError, ProgrammingError
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .canonical import sha256_hex
 from .control_plane.r1_protocol import canonical_bytes, key_id
 from .errors import CoreError
 
 
 SMI_SIGNATURE_DOMAIN_V1 = b"QINGYU:R1:SIGNED_MIGRATION_INTENT:v1\x00"
 TRUST_RECORD_SCHEMA_VERSION = "qingyu-b2-production-trust-record-v1"
+POSTGRES_PRODUCTION_TRUST_STORE_SCHEMA_VERSION = "qingyu-b2-postgres-production-trust-store-v1"
+POSTGRES_PRODUCTION_TRUST_STORE_MIGRATION_ID = "b2_001_postgres_production_trust_store"
+R1_PRODUCTION_CONTROL_DATABASE_NAME = "qingyu_control"
 SIGNER_PROVIDER_CONTRACT_VERSION = "qingyu-b2-signer-provider-v1"
 PRODUCTION_SIGNER_ADMISSION_SCHEMA_VERSION = "qingyu-b2-production-signer-admission-v1"
 APPROVED_R1_PRODUCTION_PROVIDER_BACKEND = "encrypted-file-backed-ed25519"
@@ -675,6 +681,238 @@ class TrustStore:
         if record is None:
             raise CoreError("SMI_SIGNER_TRUST_NOT_FOUND")
         return record
+
+
+def _trust_record_payload(record: TrustRecord) -> dict[str, Any]:
+    return record.validate_record().model_dump(mode="json")
+
+
+def _trust_record_hash(record: TrustRecord) -> str:
+    return sha256_hex(_trust_record_payload(record))
+
+
+def _assert_postgres_trust_store_database_identity(connection: Any, expected_database_name: str | None) -> str:
+    if not expected_database_name:
+        raise CoreError("DATABASE_SAFETY_VIOLATION")
+    actual = str(connection.execute(text("SELECT current_database()")).scalar_one())
+    if actual.lower() != expected_database_name.lower():
+        raise CoreError("DATABASE_SAFETY_VIOLATION")
+    if actual.lower() in {"postgres", "template0", "template1", "qingyu_prod"}:
+        raise CoreError("DATABASE_SAFETY_VIOLATION")
+    return actual
+
+
+def apply_postgres_production_trust_store_migration(
+    sqlalchemy_url: str,
+    *,
+    expected_database_name: str,
+) -> None:
+    """Explicit B2 control-plane migration for durable production trust records.
+
+    This function is intentionally separate from PostgresProductionTrustStore
+    construction. Normal reads/writes must not opportunistically create
+    governance tables, and REAL production must provision the control database
+    through an owner/migrator-controlled path.
+    """
+
+    engine = create_engine(sqlalchemy_url, pool_pre_ping=True)
+    with engine.begin() as connection:
+        _assert_postgres_trust_store_database_identity(connection, expected_database_name)
+        connection.execute(text("CREATE SCHEMA IF NOT EXISTS governance"))
+        connection.execute(text("""
+            CREATE TABLE IF NOT EXISTS governance.schema_migrations (
+                migration_id TEXT PRIMARY KEY,
+                schema_version TEXT NOT NULL,
+                applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """))
+        connection.execute(text("""
+            CREATE TABLE IF NOT EXISTS governance.production_trust_records (
+                trust_reference TEXT PRIMARY KEY,
+                schema_version TEXT NOT NULL,
+                algorithm TEXT NOT NULL,
+                key_id TEXT NOT NULL,
+                public_key TEXT NOT NULL,
+                public_key_fingerprint TEXT NOT NULL,
+                provider_reference TEXT NOT NULL,
+                provider_backend_type TEXT NOT NULL,
+                environment TEXT NOT NULL,
+                target_reference TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                status TEXT NOT NULL,
+                provider_classification TEXT NOT NULL,
+                rotation_deferred BOOLEAN NOT NULL,
+                record_hash TEXT NOT NULL,
+                durable_store_schema_version TEXT NOT NULL,
+                provisioned_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                provenance JSONB NOT NULL DEFAULT '{}'::jsonb,
+                CONSTRAINT production_trust_records_schema_version_ck
+                    CHECK (schema_version = 'qingyu-b2-production-trust-record-v1'),
+                CONSTRAINT production_trust_records_store_schema_version_ck
+                    CHECK (durable_store_schema_version = 'qingyu-b2-postgres-production-trust-store-v1'),
+                CONSTRAINT production_trust_records_algorithm_ck
+                    CHECK (algorithm = 'Ed25519'),
+                CONSTRAINT production_trust_records_status_ck
+                    CHECK (status IN ('ACTIVE', 'REVOKED', 'RETIRED')),
+                CONSTRAINT production_trust_records_generation_ck
+                    CHECK (generation >= 1),
+                CONSTRAINT production_trust_records_key_id_ck
+                    CHECK (key_id ~ '^[0-9a-f]{64}$'),
+                CONSTRAINT production_trust_records_public_key_ck
+                    CHECK (public_key ~ '^[0-9a-f]{64}$'),
+                CONSTRAINT production_trust_records_fingerprint_ck
+                    CHECK (public_key_fingerprint ~ '^[0-9a-f]{64}$'),
+                CONSTRAINT production_trust_records_record_hash_ck
+                    CHECK (record_hash ~ '^[0-9a-f]{64}$')
+            )
+        """))
+        connection.execute(text("""
+            INSERT INTO governance.schema_migrations (migration_id, schema_version)
+            VALUES (:migration_id, :schema_version)
+            ON CONFLICT (migration_id) DO NOTHING
+        """), {
+            "migration_id": POSTGRES_PRODUCTION_TRUST_STORE_MIGRATION_ID,
+            "schema_version": POSTGRES_PRODUCTION_TRUST_STORE_SCHEMA_VERSION,
+        })
+
+
+def apply_r1_production_trust_store_migration(sqlalchemy_url: str) -> None:
+    apply_postgres_production_trust_store_migration(
+        sqlalchemy_url,
+        expected_database_name=R1_PRODUCTION_CONTROL_DATABASE_NAME,
+    )
+
+
+class PostgresProductionTrustStore:
+    """Durable PostgreSQL TrustStore-compatible implementation for B2 control plane.
+
+    Construction does not create tables. Call
+    apply_postgres_production_trust_store_migration through an explicit
+    migration/provisioning path before using this store.
+    """
+
+    def __init__(self, sqlalchemy_url: str, *, expected_database_name: str):
+        if not expected_database_name:
+            raise CoreError("DATABASE_SAFETY_VIOLATION")
+        self.sqlalchemy_url = sqlalchemy_url
+        self.expected_database_name = expected_database_name
+        self.engine = create_engine(sqlalchemy_url, pool_pre_ping=True)
+
+    def create_if_absent_exact(self, record: TrustRecord, *, provenance: Mapping[str, Any] | None = None) -> str:
+        record.validate_record()
+        payload = _trust_record_payload(record)
+        record_hash = _trust_record_hash(record)
+        try:
+            with self.engine.begin() as connection:
+                _assert_postgres_trust_store_database_identity(connection, self.expected_database_name)
+                result = connection.execute(text("""
+                    INSERT INTO governance.production_trust_records (
+                        trust_reference, schema_version, algorithm, key_id, public_key,
+                        public_key_fingerprint, provider_reference, provider_backend_type,
+                        environment, target_reference, generation, created_at, status,
+                        provider_classification, rotation_deferred, record_hash,
+                        durable_store_schema_version, provenance
+                    )
+                    VALUES (
+                        :trust_reference, :schema_version, :algorithm, :key_id, :public_key,
+                        :public_key_fingerprint, :provider_reference, :provider_backend_type,
+                        :environment, :target_reference, :generation, :created_at, :status,
+                        :provider_classification, :rotation_deferred, :record_hash,
+                        :durable_store_schema_version, CAST(:provenance AS jsonb)
+                    )
+                    ON CONFLICT (trust_reference) DO NOTHING
+                """), {
+                    **payload,
+                    "status": record.status.value,
+                    "provider_classification": record.provider_classification.value,
+                    "record_hash": record_hash,
+                    "durable_store_schema_version": POSTGRES_PRODUCTION_TRUST_STORE_SCHEMA_VERSION,
+                    "provenance": canonical_bytes(provenance or {}).decode("utf-8"),
+                })
+                if result.rowcount == 1:
+                    return "CREATED"
+                existing = self._get_for_update(connection, record.trust_reference)
+                if existing is None:
+                    raise CoreError("PRODUCTION_TRUST_CREATE_RACE_UNRESOLVED")
+                if _trust_record_hash(existing) != record_hash or _trust_record_payload(existing) != payload:
+                    raise CoreError("PRODUCTION_TRUST_IDENTITY_CONFLICT")
+                return "IDEMPOTENT_EXISTING"
+        except ProgrammingError as exc:
+            raise CoreError("PRODUCTION_TRUST_STORE_SCHEMA_REQUIRED") from exc
+        except IntegrityError as exc:
+            raise CoreError("PRODUCTION_TRUST_IDENTITY_CONFLICT") from exc
+
+    def add(self, record: TrustRecord) -> None:
+        self.create_if_absent_exact(record)
+
+    def get(self, trust_reference: str) -> TrustRecord | None:
+        try:
+            with self.engine.begin() as connection:
+                _assert_postgres_trust_store_database_identity(connection, self.expected_database_name)
+                return self._get_for_update(connection, trust_reference, lock=False)
+        except ProgrammingError as exc:
+            raise CoreError("PRODUCTION_TRUST_STORE_SCHEMA_REQUIRED") from exc
+
+    def resolve(self, trust_reference: str) -> TrustRecord:
+        record = self.get(trust_reference)
+        if record is None:
+            raise CoreError("SMI_SIGNER_TRUST_NOT_FOUND")
+        return record
+
+    def exists(self, trust_reference: str) -> bool:
+        return self.get(trust_reference) is not None
+
+    def _get_for_update(self, connection: Any, trust_reference: str, *, lock: bool = True) -> TrustRecord | None:
+        suffix = " FOR UPDATE" if lock else ""
+        row = connection.execute(text(f"""
+            SELECT trust_reference, schema_version, algorithm, key_id, public_key,
+                   public_key_fingerprint, provider_reference, provider_backend_type,
+                   environment, target_reference, generation, created_at, status,
+                   provider_classification, rotation_deferred, record_hash
+              FROM governance.production_trust_records
+             WHERE trust_reference = :trust_reference
+            {suffix}
+        """), {"trust_reference": trust_reference}).mappings().first()
+        if row is None:
+            return None
+        record = TrustRecord(
+            schema_version=row["schema_version"],
+            trust_reference=row["trust_reference"],
+            algorithm=row["algorithm"],
+            key_id=row["key_id"],
+            public_key=row["public_key"],
+            public_key_fingerprint=row["public_key_fingerprint"],
+            provider_reference=row["provider_reference"],
+            provider_backend_type=row["provider_backend_type"],
+            environment=row["environment"],
+            target_reference=row["target_reference"],
+            generation=row["generation"],
+            created_at=row["created_at"],
+            status=TrustStatus(row["status"]),
+            provider_classification=SignerProviderClassification(row["provider_classification"]),
+            rotation_deferred=row["rotation_deferred"],
+        )
+        if _trust_record_hash(record) != row["record_hash"]:
+            raise CoreError("PRODUCTION_TRUST_DURABLE_HASH_MISMATCH")
+        return record
+
+
+def require_postgres_production_trust_store_config(
+    *,
+    mode: AuthorityEnvironmentMode,
+    sqlalchemy_url: str | None,
+) -> PostgresProductionTrustStore:
+    if mode == AuthorityEnvironmentMode.REAL_PRODUCTION and not sqlalchemy_url:
+        raise CoreError("PRODUCTION_TRUST_STORE_CONFIG_REQUIRED")
+    if not sqlalchemy_url:
+        raise CoreError("PRODUCTION_TRUST_STORE_CONFIG_REQUIRED")
+    if mode == AuthorityEnvironmentMode.REAL_PRODUCTION:
+        return PostgresProductionTrustStore(
+            sqlalchemy_url,
+            expected_database_name=R1_PRODUCTION_CONTROL_DATABASE_NAME,
+        )
+    raise CoreError("PRODUCTION_TRUST_STORE_CONFIG_REQUIRED")
 
 
 def smi_signing_bytes(payload: Mapping[str, Any]) -> bytes:
