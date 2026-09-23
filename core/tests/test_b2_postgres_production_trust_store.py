@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 from pathlib import Path
 from threading import Barrier
 
@@ -19,6 +20,8 @@ from app.b2_signer_trust import (
     SignerProviderClassification,
     TrustRecord,
     TrustStatus,
+    _trust_record_hash,
+    _trust_record_payload,
     apply_postgres_production_trust_store_migration,
     apply_r1_production_trust_store_migration,
     require_postgres_production_trust_store_config,
@@ -65,6 +68,53 @@ def trust_record(*, trust_reference="rehearsal-trust-01", environment=SYNTHETIC_
     return provider, record
 
 
+def trust_record_with(record: TrustRecord, **updates):
+    data = record.model_dump()
+    data.update(updates)
+    return TrustRecord(**data)
+
+
+def test_trust_record_hash_canonicalizes_timezone_equivalent_instants_and_rejects_naive_datetime():
+    _, record = trust_record(trust_reference="timezone-matrix")
+    instant = datetime(2026, 9, 22, 12, 13, 58, 598009, tzinfo=timezone.utc)
+    offsets = [
+        timezone.utc,
+        timezone(timedelta(0)),
+        timezone(timedelta(hours=-12)),
+        timezone(timedelta(hours=8)),
+        timezone(timedelta(hours=9)),
+        timezone(timedelta(hours=5, minutes=30)),
+    ]
+
+    hashes = {
+        _trust_record_hash(trust_record_with(record, created_at=instant.astimezone(offset)))
+        for offset in offsets
+    }
+    payloads = [
+        _trust_record_payload(trust_record_with(record, created_at=instant.astimezone(offset)))
+        for offset in offsets
+    ]
+
+    assert len(hashes) == 1
+    assert {payload["created_at"] for payload in payloads} == {"2026-09-22T12:13:58.598009Z"}
+    assert (
+        _trust_record_hash(trust_record_with(record, created_at=instant + timedelta(microseconds=1)))
+        not in hashes
+    )
+    with pytest.raises(CoreError, match="TRUST_RECORD_CREATED_AT_TIMEZONE_REQUIRED"):
+        trust_record_with(record, created_at=datetime(2026, 9, 22, 12, 13, 58, 598009))
+
+
+def test_exact_production_datetime_offset_case_hashes_to_writer_value():
+    _, record = trust_record(trust_reference="exact-production-offset")
+    utc = trust_record_with(record, created_at=datetime(2026, 9, 22, 12, 13, 58, 598009, tzinfo=timezone.utc))
+    offset = trust_record_with(record, created_at=datetime(2026, 9, 22, 0, 13, 58, 598009, tzinfo=timezone(timedelta(hours=-12))))
+
+    assert _trust_record_payload(utc)["created_at"] == "2026-09-22T12:13:58.598009Z"
+    assert _trust_record_payload(offset)["created_at"] == "2026-09-22T12:13:58.598009Z"
+    assert _trust_record_hash(utc) == _trust_record_hash(offset)
+
+
 def test_explicit_migration_then_exact_create_get_restart_and_crypto(pg_env, control_db):
     url = pg_env.url(control_db)
     provider, record = trust_record()
@@ -85,6 +135,29 @@ def test_explicit_migration_then_exact_create_get_restart_and_crypto(pg_env, con
     wrong_provider, wrong_record = trust_record(trust_reference="wrong-key")
     with pytest.raises(CoreError, match="SMI_SIGNATURE_INVALID"):
         verify_smi_signature(canonical_payload=payload, signature_hex=signature, trust_record=wrong_record)
+
+
+def test_postgres_timestamp_with_session_timezone_roundtrips_to_same_trust_hash(pg_env, control_db):
+    url = pg_env.url(control_db)
+    provider, record = trust_record(
+        trust_reference="timezone-roundtrip",
+    )
+    record = trust_record_with(
+        record,
+        created_at=datetime(2026, 9, 22, 12, 13, 58, 598009, tzinfo=timezone.utc),
+    )
+    apply_postgres_production_trust_store_migration(url, expected_database_name=control_db)
+    writer = PostgresProductionTrustStore(url, expected_database_name=control_db)
+    assert writer.create_if_absent_exact(record, provenance={"test": "timezone-roundtrip"}) == "CREATED"
+
+    timezone_url = url + "?options=" + quote("-c timezone=Etc/GMT+12")
+    reloaded = PostgresProductionTrustStore(
+        timezone_url,
+        expected_database_name=control_db,
+    ).resolve(record.trust_reference)
+
+    assert reloaded == record
+    assert _trust_record_hash(reloaded) == _trust_record_hash(record)
 
 
 @pytest.mark.parametrize(

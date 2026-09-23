@@ -613,6 +613,13 @@ class TrustRecord(BaseModel):
     provider_classification: SignerProviderClassification
     rotation_deferred: bool = True
 
+    @field_validator("created_at")
+    @classmethod
+    def _created_at_aware_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise CoreError("TRUST_RECORD_CREATED_AT_TIMEZONE_REQUIRED")
+        return value.astimezone(timezone.utc)
+
     @field_validator("key_id", "public_key", "public_key_fingerprint")
     @classmethod
     def _hex64(cls, value: str) -> str:
