@@ -24,6 +24,8 @@ SMI_SIGNATURE_DOMAIN_V1 = b"QINGYU:R1:SIGNED_MIGRATION_INTENT:v1\x00"
 TRUST_RECORD_SCHEMA_VERSION = "qingyu-b2-production-trust-record-v1"
 POSTGRES_PRODUCTION_TRUST_STORE_SCHEMA_VERSION = "qingyu-b2-postgres-production-trust-store-v1"
 POSTGRES_PRODUCTION_TRUST_STORE_MIGRATION_ID = "b2_001_postgres_production_trust_store"
+POSTGRES_PRODUCTION_SIGNER_ADMISSION_STORE_SCHEMA_VERSION = "qingyu-b2-postgres-production-signer-admission-store-v1"
+POSTGRES_PRODUCTION_SIGNER_ADMISSION_STORE_MIGRATION_ID = "b2_002_postgres_production_signer_admission_store"
 R1_PRODUCTION_CONTROL_DATABASE_NAME = "qingyu_control"
 SIGNER_PROVIDER_CONTRACT_VERSION = "qingyu-b2-signer-provider-v1"
 PRODUCTION_SIGNER_ADMISSION_SCHEMA_VERSION = "qingyu-b2-production-signer-admission-v1"
@@ -994,6 +996,13 @@ class ProductionSignerAdmissionRecord(BaseModel):
             raise CoreError("PRODUCTION_SIGNER_ADMISSION_HEX_INVALID")
         return value
 
+    @field_validator("created_at")
+    @classmethod
+    def _admission_created_at_aware_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise CoreError("PRODUCTION_SIGNER_ADMISSION_CREATED_AT_TIMEZONE_REQUIRED")
+        return value.astimezone(timezone.utc)
+
     @model_validator(mode="after")
     def validate_admission(self) -> "ProductionSignerAdmissionRecord":
         if self.schema_version != PRODUCTION_SIGNER_ADMISSION_SCHEMA_VERSION:
@@ -1027,6 +1036,355 @@ class ProductionSignerAdmissionStore:
         if len(matches) != 1:
             raise CoreError("PRODUCTION_SIGNER_ADMISSION_NOT_FOUND")
         return matches[0]
+
+
+def _admission_record_payload(record: ProductionSignerAdmissionRecord) -> dict[str, Any]:
+    return record.validate_admission().model_dump(mode="json")
+
+
+def _admission_record_hash(record: ProductionSignerAdmissionRecord) -> str:
+    return sha256_hex(_admission_record_payload(record))
+
+
+def apply_postgres_production_signer_admission_store_migration(
+    sqlalchemy_url: str,
+    *,
+    expected_database_name: str,
+) -> None:
+    """Explicit B2 control-plane migration for durable production signer admission.
+
+    The migration is intentionally separate from ordinary store construction.
+    Production store reads/writes must not opportunistically create schema, and
+    REAL production must use an owner/migrator-controlled migration path.
+    """
+
+    engine = create_engine(sqlalchemy_url, pool_pre_ping=True)
+    with engine.begin() as connection:
+        _assert_postgres_trust_store_database_identity(connection, expected_database_name)
+        connection.execute(text("CREATE SCHEMA IF NOT EXISTS governance"))
+        connection.execute(text("""
+            CREATE TABLE IF NOT EXISTS governance.schema_migrations (
+                migration_id TEXT PRIMARY KEY,
+                schema_version TEXT NOT NULL,
+                applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """))
+        connection.execute(text("""
+            CREATE TABLE IF NOT EXISTS governance.production_signer_admission_records (
+                admission_reference TEXT PRIMARY KEY,
+                schema_version TEXT NOT NULL,
+                provider_reference TEXT NOT NULL UNIQUE,
+                provider_backend_type TEXT NOT NULL,
+                algorithm TEXT NOT NULL,
+                key_id TEXT NOT NULL,
+                public_key_fingerprint TEXT NOT NULL,
+                environment TEXT NOT NULL,
+                target_reference TEXT NOT NULL,
+                storage_policy TEXT NOT NULL,
+                storage_class TEXT,
+                permission_policy TEXT NOT NULL,
+                custody_policy_version TEXT NOT NULL,
+                provisioning_reference TEXT NOT NULL,
+                provisioning_generation INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                admission_hash TEXT NOT NULL,
+                durable_store_schema_version TEXT NOT NULL,
+                persisted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                provenance JSONB NOT NULL DEFAULT '{}'::jsonb,
+                CONSTRAINT production_signer_admission_schema_version_ck
+                    CHECK (schema_version = 'qingyu-b2-production-signer-admission-v1'),
+                CONSTRAINT production_signer_admission_store_schema_version_ck
+                    CHECK (durable_store_schema_version = 'qingyu-b2-postgres-production-signer-admission-store-v1'),
+                CONSTRAINT production_signer_admission_algorithm_ck
+                    CHECK (algorithm = 'Ed25519'),
+                CONSTRAINT production_signer_admission_status_ck
+                    CHECK (status IN ('ACTIVE', 'REVOKED', 'RETIRED')),
+                CONSTRAINT production_signer_admission_generation_ck
+                    CHECK (provisioning_generation >= 1),
+                CONSTRAINT production_signer_admission_key_id_ck
+                    CHECK (key_id ~ '^[0-9a-f]{64}$'),
+                CONSTRAINT production_signer_admission_fingerprint_ck
+                    CHECK (public_key_fingerprint ~ '^[0-9a-f]{64}$'),
+                CONSTRAINT production_signer_admission_hash_ck
+                    CHECK (admission_hash ~ '^[0-9a-f]{64}$')
+            )
+        """))
+        connection.execute(text("""
+            INSERT INTO governance.schema_migrations (migration_id, schema_version)
+            VALUES (:migration_id, :schema_version)
+            ON CONFLICT (migration_id) DO NOTHING
+        """), {
+            "migration_id": POSTGRES_PRODUCTION_SIGNER_ADMISSION_STORE_MIGRATION_ID,
+            "schema_version": POSTGRES_PRODUCTION_SIGNER_ADMISSION_STORE_SCHEMA_VERSION,
+        })
+
+
+def apply_r1_production_signer_admission_store_migration(sqlalchemy_url: str) -> None:
+    apply_postgres_production_signer_admission_store_migration(
+        sqlalchemy_url,
+        expected_database_name=R1_PRODUCTION_CONTROL_DATABASE_NAME,
+    )
+
+
+class PostgresProductionSignerAdmissionStore:
+    """Durable PostgreSQL ProductionSignerAdmissionStore-compatible implementation."""
+
+    def __init__(self, sqlalchemy_url: str, *, expected_database_name: str):
+        if not expected_database_name:
+            raise CoreError("DATABASE_SAFETY_VIOLATION")
+        self.sqlalchemy_url = sqlalchemy_url
+        self.expected_database_name = expected_database_name
+        self.engine = create_engine(sqlalchemy_url, pool_pre_ping=True)
+
+    def create_if_absent_exact(self, record: ProductionSignerAdmissionRecord, *, provenance: Mapping[str, Any] | None = None) -> str:
+        payload = _admission_record_payload(record)
+        admission_hash = _admission_record_hash(record)
+        try:
+            with self.engine.begin() as connection:
+                _assert_postgres_trust_store_database_identity(connection, self.expected_database_name)
+                result = connection.execute(text("""
+                    INSERT INTO governance.production_signer_admission_records (
+                        admission_reference, schema_version, provider_reference, provider_backend_type,
+                        algorithm, key_id, public_key_fingerprint, environment, target_reference,
+                        storage_policy, storage_class, permission_policy, custody_policy_version,
+                        provisioning_reference, provisioning_generation, status, created_at, admission_hash,
+                        durable_store_schema_version, provenance
+                    )
+                    VALUES (
+                        :admission_reference, :schema_version, :provider_reference, :provider_backend_type,
+                        :algorithm, :key_id, :public_key_fingerprint, :environment, :target_reference,
+                        :storage_policy, :storage_class, :permission_policy, :custody_policy_version,
+                        :provisioning_reference, :provisioning_generation, :status, :created_at, :admission_hash,
+                        :durable_store_schema_version, CAST(:provenance AS jsonb)
+                    )
+                    ON CONFLICT (admission_reference) DO NOTHING
+                """), {
+                    **payload,
+                    "status": record.status.value,
+                    "admission_hash": admission_hash,
+                    "durable_store_schema_version": POSTGRES_PRODUCTION_SIGNER_ADMISSION_STORE_SCHEMA_VERSION,
+                    "provenance": canonical_bytes(provenance or {}).decode("utf-8"),
+                })
+                if result.rowcount == 1:
+                    return "CREATED"
+                existing = self._get_for_update(connection, record.admission_reference)
+                if existing is None:
+                    raise CoreError("PRODUCTION_SIGNER_ADMISSION_CREATE_RACE_UNRESOLVED")
+                if _admission_record_hash(existing) != admission_hash or _admission_record_payload(existing) != payload:
+                    raise CoreError("PRODUCTION_SIGNER_ADMISSION_IDENTITY_CONFLICT")
+                return "IDEMPOTENT_EXISTING"
+        except ProgrammingError as exc:
+            raise CoreError("PRODUCTION_SIGNER_ADMISSION_STORE_SCHEMA_REQUIRED") from exc
+        except IntegrityError as exc:
+            raise CoreError("PRODUCTION_SIGNER_ADMISSION_IDENTITY_CONFLICT") from exc
+
+    def add(self, record: ProductionSignerAdmissionRecord) -> None:
+        self.create_if_absent_exact(record)
+
+    def get(self, admission_reference: str) -> ProductionSignerAdmissionRecord | None:
+        try:
+            with self.engine.begin() as connection:
+                _assert_postgres_trust_store_database_identity(connection, self.expected_database_name)
+                return self._get_for_update(connection, admission_reference, lock=False)
+        except ProgrammingError as exc:
+            raise CoreError("PRODUCTION_SIGNER_ADMISSION_STORE_SCHEMA_REQUIRED") from exc
+
+    def resolve(self, admission_reference: str) -> ProductionSignerAdmissionRecord:
+        record = self.get(admission_reference)
+        if record is None:
+            raise CoreError("PRODUCTION_SIGNER_ADMISSION_NOT_FOUND")
+        return record
+
+    def resolve_for_trust(self, trust_record: TrustRecord) -> ProductionSignerAdmissionRecord:
+        try:
+            with self.engine.begin() as connection:
+                _assert_postgres_trust_store_database_identity(connection, self.expected_database_name)
+                rows = connection.execute(text("""
+                    SELECT admission_reference
+                      FROM governance.production_signer_admission_records
+                     WHERE provider_reference = :provider_reference
+                """), {"provider_reference": trust_record.provider_reference}).mappings().all()
+                if len(rows) != 1:
+                    raise CoreError("PRODUCTION_SIGNER_ADMISSION_NOT_FOUND")
+                record = self._get_for_update(connection, rows[0]["admission_reference"], lock=False)
+                if record is None:
+                    raise CoreError("PRODUCTION_SIGNER_ADMISSION_NOT_FOUND")
+                return record
+        except ProgrammingError as exc:
+            raise CoreError("PRODUCTION_SIGNER_ADMISSION_STORE_SCHEMA_REQUIRED") from exc
+
+    def count(self) -> int:
+        try:
+            with self.engine.begin() as connection:
+                _assert_postgres_trust_store_database_identity(connection, self.expected_database_name)
+                return int(connection.execute(text("SELECT count(*) FROM governance.production_signer_admission_records")).scalar_one())
+        except ProgrammingError as exc:
+            raise CoreError("PRODUCTION_SIGNER_ADMISSION_STORE_SCHEMA_REQUIRED") from exc
+
+    def _get_for_update(self, connection: Any, admission_reference: str, *, lock: bool = True) -> ProductionSignerAdmissionRecord | None:
+        suffix = " FOR UPDATE" if lock else ""
+        row = connection.execute(text(f"""
+            SELECT admission_reference, schema_version, provider_reference, provider_backend_type,
+                   algorithm, key_id, public_key_fingerprint, environment, target_reference,
+                   storage_policy, storage_class, permission_policy, custody_policy_version,
+                   provisioning_reference, provisioning_generation, status, created_at, admission_hash
+              FROM governance.production_signer_admission_records
+             WHERE admission_reference = :admission_reference
+            {suffix}
+        """), {"admission_reference": admission_reference}).mappings().first()
+        if row is None:
+            return None
+        record = ProductionSignerAdmissionRecord(
+            schema_version=row["schema_version"],
+            admission_reference=row["admission_reference"],
+            provider_reference=row["provider_reference"],
+            provider_backend_type=row["provider_backend_type"],
+            algorithm=row["algorithm"],
+            key_id=row["key_id"],
+            public_key_fingerprint=row["public_key_fingerprint"],
+            environment=row["environment"],
+            target_reference=row["target_reference"],
+            storage_policy=row["storage_policy"],
+            storage_class=row["storage_class"],
+            permission_policy=row["permission_policy"],
+            custody_policy_version=row["custody_policy_version"],
+            provisioning_reference=row["provisioning_reference"],
+            provisioning_generation=row["provisioning_generation"],
+            status=ProductionSignerAdmissionStatus(row["status"]),
+            created_at=row["created_at"],
+        )
+        if _admission_record_hash(record) != row["admission_hash"]:
+            raise CoreError("PRODUCTION_SIGNER_ADMISSION_DURABLE_HASH_MISMATCH")
+        return record
+
+
+def require_postgres_production_signer_admission_store_config(
+    *,
+    mode: AuthorityEnvironmentMode,
+    sqlalchemy_url: str | None,
+) -> PostgresProductionSignerAdmissionStore:
+    if mode == AuthorityEnvironmentMode.REAL_PRODUCTION and not sqlalchemy_url:
+        raise CoreError("PRODUCTION_SIGNER_ADMISSION_STORE_CONFIG_REQUIRED")
+    if not sqlalchemy_url:
+        raise CoreError("PRODUCTION_SIGNER_ADMISSION_STORE_CONFIG_REQUIRED")
+    if mode == AuthorityEnvironmentMode.REAL_PRODUCTION:
+        return PostgresProductionSignerAdmissionStore(
+            sqlalchemy_url,
+            expected_database_name=R1_PRODUCTION_CONTROL_DATABASE_NAME,
+        )
+    raise CoreError("PRODUCTION_SIGNER_ADMISSION_STORE_CONFIG_REQUIRED")
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionSignerAdmissionRecoveryBinding:
+    ext_rec_01_status: str
+    source_backup_sha256: str
+    encrypted_asset_sha256: str
+    release_identifier: str
+    remote_asset_identifier: str
+    remote_repository_visibility: str
+
+    def validate_binding(self) -> "ProductionSignerAdmissionRecoveryBinding":
+        if self.ext_rec_01_status != "CLOSED":
+            raise CoreError("PRODUCTION_SIGNER_ADMISSION_RECOVERY_GATE_NOT_CLOSED")
+        if self.source_backup_sha256 != "0bcac9aacb35372e8ae732bef3fc39c5033e623fffe54421dd8c85aaa2c5f362":
+            raise CoreError("PRODUCTION_SIGNER_ADMISSION_RECOVERY_SOURCE_MISMATCH")
+        if self.encrypted_asset_sha256 != "fa906348960fcaac7d5e2f752a346efcbebf0e19d3786059677ced0efae6abd0":
+            raise CoreError("PRODUCTION_SIGNER_ADMISSION_RECOVERY_ASSET_MISMATCH")
+        if self.release_identifier != "backup-trust-control-20260924T142657Z-073c4f3a":
+            raise CoreError("PRODUCTION_SIGNER_ADMISSION_RECOVERY_RELEASE_MISMATCH")
+        if self.remote_asset_identifier != "RA_kwDOUikIh84i76Iu":
+            raise CoreError("PRODUCTION_SIGNER_ADMISSION_RECOVERY_ASSET_MISMATCH")
+        if self.remote_repository_visibility != "PRIVATE":
+            raise CoreError("PRODUCTION_SIGNER_ADMISSION_RECOVERY_VISIBILITY_MISMATCH")
+        return self
+
+
+class ProductionSignerAdmissionProvisioningService:
+    """Canonical composition for future REAL production Admission provisioning."""
+
+    def __init__(
+        self,
+        *,
+        trust_store: PostgresProductionTrustStore,
+        admission_store: PostgresProductionSignerAdmissionStore,
+        signer_provider: SignerProvider,
+        recovery_binding: ProductionSignerAdmissionRecoveryBinding,
+    ):
+        if not isinstance(trust_store, PostgresProductionTrustStore):
+            raise CoreError("PRODUCTION_SIGNER_ADMISSION_TRUST_STORE_REQUIRED")
+        if not isinstance(admission_store, PostgresProductionSignerAdmissionStore):
+            raise CoreError("PRODUCTION_SIGNER_ADMISSION_DURABLE_STORE_REQUIRED")
+        self.trust_store = trust_store
+        self.admission_store = admission_store
+        self.signer_provider = signer_provider
+        self.recovery_binding = recovery_binding.validate_binding()
+
+    def create_admission(
+        self,
+        *,
+        admission_reference: str,
+        trust_reference: str,
+        custody_policy_version: str,
+        provisioning_reference: str,
+        provisioning_generation: int,
+        created_at: datetime,
+        provenance: Mapping[str, Any] | None = None,
+    ) -> str:
+        trust_record = self.trust_store.resolve(trust_reference)
+        if trust_record.status != TrustStatus.ACTIVE:
+            raise CoreError("PRODUCTION_SIGNER_ADMISSION_TRUST_NOT_ACTIVE")
+        if self.signer_provider.provider_reference != trust_record.provider_reference:
+            raise CoreError("PRODUCTION_SIGNER_ADMISSION_PROVIDER_MISMATCH")
+        if self.signer_provider.key_id != trust_record.key_id:
+            raise CoreError("PRODUCTION_SIGNER_ADMISSION_KEY_ID_MISMATCH")
+        verify_production_signer_admission(
+            trust_record=trust_record,
+            admission_store=ProductionSignerAdmissionStore({
+                admission_reference: ProductionSignerAdmissionRecord(
+                    admission_reference=admission_reference,
+                    provider_reference=trust_record.provider_reference,
+                    provider_backend_type=trust_record.provider_backend_type,
+                    algorithm=trust_record.algorithm,
+                    key_id=trust_record.key_id,
+                    public_key_fingerprint=trust_record.public_key_fingerprint,
+                    environment=trust_record.environment,
+                    target_reference=trust_record.target_reference,
+                    storage_policy=PRODUCTION_WSL_ROOTFS_STORAGE_POLICY,
+                    storage_class=ProductionSignerStorageClass.D_BACKED_WSL_ROOTFS.value,
+                    permission_policy=PRODUCTION_PERMISSION_POLICY,
+                    custody_policy_version=custody_policy_version,
+                    provisioning_reference=provisioning_reference,
+                    provisioning_generation=provisioning_generation,
+                    status=ProductionSignerAdmissionStatus.ACTIVE,
+                    created_at=created_at,
+                )
+            }),
+            signer_provider=self.signer_provider,
+        )
+        record = ProductionSignerAdmissionRecord(
+            admission_reference=admission_reference,
+            provider_reference=trust_record.provider_reference,
+            provider_backend_type=trust_record.provider_backend_type,
+            algorithm=trust_record.algorithm,
+            key_id=trust_record.key_id,
+            public_key_fingerprint=trust_record.public_key_fingerprint,
+            environment=trust_record.environment,
+            target_reference=trust_record.target_reference,
+            storage_policy=PRODUCTION_WSL_ROOTFS_STORAGE_POLICY,
+            storage_class=ProductionSignerStorageClass.D_BACKED_WSL_ROOTFS.value,
+            permission_policy=PRODUCTION_PERMISSION_POLICY,
+            custody_policy_version=custody_policy_version,
+            provisioning_reference=provisioning_reference,
+            provisioning_generation=provisioning_generation,
+            status=ProductionSignerAdmissionStatus.ACTIVE,
+            created_at=created_at,
+        )
+        return self.admission_store.create_if_absent_exact(record, provenance=provenance)
+
+    def read_admission(self, admission_reference: str) -> ProductionSignerAdmissionRecord:
+        return self.admission_store.resolve(admission_reference)
 
 
 def verify_production_signer_admission(
