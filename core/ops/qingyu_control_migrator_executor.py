@@ -4,7 +4,9 @@ import argparse
 import json
 import subprocess
 import sys
+from collections.abc import Callable
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from sqlalchemy import create_engine, text
 
@@ -17,16 +19,21 @@ from app.b2_signer_trust import (
 
 SECRET_PATH = "/etc/qingyu/secrets/control-postgres.env"
 WSL_DISTRO = "qingyu-prod-local-01"
+APPLY_B2_002_TO_QINGYU_CONTROL = "APPLY_B2_002_TO_QINGYU_CONTROL"
+CONTROL_MIGRATOR_ROLE = "qingyu_control_migrator"
+CONTROL_OWNER_ROLE = "qingyu_control_owner"
 ALLOWED_MIGRATIONS = {
     POSTGRES_PRODUCTION_SIGNER_ADMISSION_STORE_MIGRATION_ID: {
         "schema_version": POSTGRES_PRODUCTION_SIGNER_ADMISSION_STORE_SCHEMA_VERSION,
         "callable": "app.b2_signer_trust.apply_r1_production_signer_admission_store_migration",
+        "target_database": R1_PRODUCTION_CONTROL_DATABASE_NAME,
+        "confirmation": APPLY_B2_002_TO_QINGYU_CONTROL,
     }
 }
 
 
 def _fail(code: str, **extra: Any) -> int:
-    payload = {"status": "FAIL", "code": code}
+    payload = {"status": "FAIL", "code": code, "mutation_performed": False}
     payload.update(extra)
     print(json.dumps(payload, sort_keys=True))
     return 2
@@ -59,13 +66,10 @@ def _read_control_env() -> dict[str, str]:
 def _safe_secret_metadata() -> dict[str, str]:
     listing = _run_wsl(["sudo", "ls", "-ln", SECRET_PATH]).stdout.strip().split()
     size = _run_wsl(["sudo", "wc", "-c", SECRET_PATH]).stdout.strip().split()[0]
-    mode_text = listing[0]
-    owner_uid = listing[2]
-    group_gid = listing[3]
     return {
-        "owner_uid": owner_uid,
-        "group_gid": group_gid,
-        "mode_text": mode_text,
+        "owner_uid": listing[2],
+        "group_gid": listing[3],
+        "mode_text": listing[0],
         "size_bytes": size,
         "path": SECRET_PATH,
     }
@@ -79,45 +83,81 @@ def _connect_url() -> str:
     return url
 
 
+def _validate_target(target_db: str) -> str | None:
+    if target_db != R1_PRODUCTION_CONTROL_DATABASE_NAME:
+        return "TARGET_DATABASE_OVERRIDE_REJECTED"
+    return None
+
+
+def _validate_migration(migration_id: str) -> str | None:
+    if migration_id not in ALLOWED_MIGRATIONS:
+        return "MIGRATION_NOT_ALLOWLISTED"
+    return None
+
+
+def _validate_confirmation(migration_id: str, target_db: str, confirmation: str | None) -> str | None:
+    expected = ALLOWED_MIGRATIONS[migration_id]["confirmation"]
+    expected_target = ALLOWED_MIGRATIONS[migration_id]["target_database"]
+    if target_db != expected_target:
+        return "TARGET_DATABASE_OVERRIDE_REJECTED"
+    if confirmation is None:
+        return "APPLY_CONFIRMATION_REQUIRED"
+    if confirmation != expected:
+        return "APPLY_CONFIRMATION_MISMATCH"
+    return None
+
+
+def _assert_identity(identity: Any) -> None:
+    if identity[0] != CONTROL_MIGRATOR_ROLE:
+        raise RuntimeError("MIGRATOR_SESSION_USER_MISMATCH")
+    if identity[2] != R1_PRODUCTION_CONTROL_DATABASE_NAME:
+        raise RuntimeError("DATABASE_IDENTITY_MISMATCH")
+
+
+def _collect_readonly_state(connection: Any) -> dict[str, Any]:
+    b2_002 = connection.execute(text("""
+        SELECT EXISTS (
+            SELECT 1 FROM governance.schema_migrations
+             WHERE migration_id = 'b2_002_postgres_production_signer_admission_store'
+        )
+    """)).scalar_one()
+    admission_table = connection.execute(text(
+        "SELECT to_regclass('governance.production_signer_admission_records') IS NOT NULL"
+    )).scalar_one()
+    trust = connection.execute(text("""
+        SELECT count(*) AS trust_count,
+               max(record_hash) AS record_hash,
+               max(key_id) AS key_id
+          FROM governance.production_trust_records
+    """)).mappings().one()
+    return {
+        "b2_002_present": bool(b2_002),
+        "admission_table_present": bool(admission_table),
+        "trust_count": int(trust["trust_count"]),
+        "trust_record_hash": trust["record_hash"],
+        "signer_key_id": trust["key_id"],
+    }
+
+
 def _run_probe(url: str, migration_id: str) -> dict[str, Any]:
     engine = create_engine(url, pool_pre_ping=True)
     with engine.begin() as connection:
         identity_before = connection.execute(
             text("SELECT session_user, current_user, current_database(), version()")
         ).one()
-        if identity_before[0] != "qingyu_control_migrator":
-            raise RuntimeError("MIGRATOR_SESSION_USER_MISMATCH")
-        if identity_before[2] != R1_PRODUCTION_CONTROL_DATABASE_NAME:
-            raise RuntimeError("DATABASE_IDENTITY_MISMATCH")
-
+        _assert_identity(identity_before)
         owner_member = connection.execute(
             text("SELECT pg_has_role(current_user, 'qingyu_control_owner', 'MEMBER')")
         ).scalar_one()
-
         connection.execute(text("SET ROLE qingyu_control_owner"))
         identity_during = connection.execute(
             text("SELECT session_user, current_user, current_database()")
         ).one()
-        b2_002 = connection.execute(text("""
-            SELECT EXISTS (
-                SELECT 1 FROM governance.schema_migrations
-                 WHERE migration_id = 'b2_002_postgres_production_signer_admission_store'
-            )
-        """)).scalar_one()
-        admission_table = connection.execute(text(
-            "SELECT to_regclass('governance.production_signer_admission_records') IS NOT NULL"
-        )).scalar_one()
-        trust = connection.execute(text("""
-            SELECT count(*) AS trust_count,
-                   max(record_hash) AS record_hash,
-                   max(key_id) AS key_id
-              FROM governance.production_trust_records
-        """)).mappings().one()
+        readonly_state = _collect_readonly_state(connection)
         connection.execute(text("RESET ROLE"))
         identity_after = connection.execute(
             text("SELECT session_user, current_user, current_database()")
         ).one()
-
         role_rows = connection.execute(text("""
             SELECT rolname, rolcanlogin, rolsuper, rolcreatedb, rolcreaterole,
                    rolreplication, rolbypassrls, rolinherit
@@ -143,13 +183,114 @@ def _run_probe(url: str, migration_id: str) -> dict[str, Any]:
         "session_user_during_owner_role": identity_during[0],
         "current_user_after_reset_role": identity_after[1],
         "roles": [dict(row) for row in role_rows],
-        "b2_002_present": bool(b2_002),
-        "admission_table_present": bool(admission_table),
-        "trust_count": int(trust["trust_count"]),
-        "trust_record_hash": trust["record_hash"],
-        "signer_key_id": trust["key_id"],
         "mutation_performed": False,
         "apply_callable_imported": callable(apply_r1_production_signer_admission_store_migration),
+        **readonly_state,
+    }
+
+
+
+def _url_with_fixed_owner_role(url: str) -> str:
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    if "options" in query:
+        raise RuntimeError("MIGRATION_CONNECTION_OPTIONS_ALREADY_PRESENT")
+    query["options"] = f"-c role={CONTROL_OWNER_ROLE}"
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def _migration_connection_identity(url: str) -> dict[str, str]:
+    engine = create_engine(url, pool_pre_ping=True)
+    with engine.begin() as connection:
+        identity = connection.execute(text("SELECT session_user, current_user, current_database()")).one()
+    return {
+        "session_user": identity[0],
+        "current_user": identity[1],
+        "database": identity[2],
+    }
+
+
+def _assert_owner_authority_connection(url: str) -> dict[str, str]:
+    identity = _migration_connection_identity(url)
+    if identity["session_user"] != CONTROL_MIGRATOR_ROLE:
+        raise RuntimeError("MIGRATION_CONNECTION_SESSION_USER_MISMATCH")
+    if identity["current_user"] != CONTROL_OWNER_ROLE:
+        raise RuntimeError("MIGRATION_CONNECTION_CURRENT_USER_MISMATCH")
+    if identity["database"] != R1_PRODUCTION_CONTROL_DATABASE_NAME:
+        raise RuntimeError("MIGRATION_CONNECTION_DATABASE_MISMATCH")
+    return identity
+
+
+def _collect_apply_postconditions(url: str) -> dict[str, Any]:
+    engine = create_engine(url, pool_pre_ping=True)
+    with engine.begin() as connection:
+        readonly_state = _collect_readonly_state(connection)
+        b2_002_count = connection.execute(text("""
+            SELECT count(*) FROM governance.schema_migrations
+             WHERE migration_id = 'b2_002_postgres_production_signer_admission_store'
+        """)).scalar_one()
+        admission_row_count = connection.execute(text(
+            "SELECT count(*) FROM governance.production_signer_admission_records"
+        )).scalar_one() if readonly_state["admission_table_present"] else 0
+    return {
+        **readonly_state,
+        "b2_002_count": int(b2_002_count),
+        "admission_row_count": int(admission_row_count),
+    }
+
+def _run_apply(
+    url: str,
+    migration_id: str,
+    *,
+    migration_callable: Callable[[str], None] = apply_r1_production_signer_admission_store_migration,
+) -> dict[str, Any]:
+    engine = create_engine(url, pool_pre_ping=True)
+    with engine.begin() as connection:
+        identity_before = connection.execute(
+            text("SELECT session_user, current_user, current_database(), version()")
+        ).one()
+        _assert_identity(identity_before)
+        owner_member = connection.execute(
+            text("SELECT pg_has_role(current_user, :owner_role, 'MEMBER')"), {"owner_role": CONTROL_OWNER_ROLE}
+        ).scalar_one()
+        if not owner_member:
+            raise RuntimeError("OWNER_ROLE_TRANSITION_FAILED")
+        owner_can_login = connection.execute(
+            text("SELECT rolcanlogin FROM pg_roles WHERE rolname = :owner_role"), {"owner_role": CONTROL_OWNER_ROLE}
+        ).scalar_one()
+        if owner_can_login:
+            raise RuntimeError("OWNER_ROLE_LOGIN_NOT_ALLOWED")
+        connection.execute(text("SET ROLE qingyu_control_owner"))
+        identity_during = connection.execute(
+            text("SELECT session_user, current_user, current_database()")
+        ).one()
+        if identity_during[0] != CONTROL_MIGRATOR_ROLE or identity_during[1] != CONTROL_OWNER_ROLE or identity_during[2] != R1_PRODUCTION_CONTROL_DATABASE_NAME:
+            raise RuntimeError("OWNER_ROLE_TRANSITION_FAILED")
+        connection.execute(text("RESET ROLE"))
+    migration_url = _url_with_fixed_owner_role(url)
+    migration_identity = _assert_owner_authority_connection(migration_url)
+    try:
+        migration_callable(migration_url)
+    except Exception as exc:  # no fallback; no manual SQL; no retry as another role
+        raise RuntimeError("CANONICAL_MIGRATION_FAILED") from exc
+    postconditions = _collect_apply_postconditions(migration_url)
+    mutation_confirmed = bool(postconditions["b2_002_present"] and postconditions["admission_table_present"])
+    if not mutation_confirmed:
+        raise RuntimeError("APPLY_POSTCONDITION_MISSING")
+    return {
+        "status": "PASS",
+        "mode": "APPLY",
+        "migration_id": migration_id,
+        "target_database": R1_PRODUCTION_CONTROL_DATABASE_NAME,
+        "session_user": identity_before[0],
+        "current_user_before_set_role": identity_before[1],
+        "current_user_during_owner_role": identity_during[1],
+        "migration_connection_session_user": migration_identity["session_user"],
+        "migration_connection_current_user": migration_identity["current_user"],
+        "migration_connection_database": migration_identity["database"],
+        "migration_result": "CANONICAL_MIGRATION_CALL_COMPLETED",
+        "mutation_performed": mutation_confirmed,
+        **postconditions,
     }
 
 
@@ -157,24 +298,48 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Qingyu qingyu_control migrator executor")
     parser.add_argument("--mode", choices=["probe", "apply"], default="probe")
     parser.add_argument("--migration", default=POSTGRES_PRODUCTION_SIGNER_ADMISSION_STORE_MIGRATION_ID)
-    parser.add_argument("--target-db", default=R1_PRODUCTION_CONTROL_DATABASE_NAME)
+    parser.add_argument("--target-db", "--target-database", dest="target_db", default=R1_PRODUCTION_CONTROL_DATABASE_NAME)
+    parser.add_argument("--confirm", default=None)
     args = parser.parse_args(argv)
 
-    if args.target_db != R1_PRODUCTION_CONTROL_DATABASE_NAME:
-        return _fail("TARGET_DATABASE_OVERRIDE_REJECTED", target_db=args.target_db)
-    if args.migration not in ALLOWED_MIGRATIONS:
-        return _fail("MIGRATION_NOT_ALLOWLISTED", migration=args.migration)
+    target_error = _validate_target(args.target_db)
+    if target_error:
+        return _fail(target_error, target_db=args.target_db)
+    migration_error = _validate_migration(args.migration)
+    if migration_error:
+        return _fail(migration_error, migration=args.migration)
     if args.mode == "apply":
-        return _fail("APPLY_MODE_DISABLED_FOR_THIS_TASK", migration=args.migration)
+        confirm_error = _validate_confirmation(args.migration, args.target_db, args.confirm)
+        if confirm_error:
+            return _fail(confirm_error, migration=args.migration, target_db=args.target_db)
 
     try:
-        result = _run_probe(_connect_url(), args.migration)
+        if args.mode == "probe":
+            result = _run_probe(_connect_url(), args.migration)
+        else:
+            result = _run_apply(_connect_url(), args.migration)
+    except RuntimeError as exc:
+        code = str(exc).splitlines()[0]
+        if code not in {
+            "MIGRATOR_SESSION_USER_MISMATCH",
+            "DATABASE_IDENTITY_MISMATCH",
+            "OWNER_ROLE_TRANSITION_FAILED",
+            "OWNER_ROLE_LOGIN_NOT_ALLOWED",
+            "MIGRATION_CONNECTION_OPTIONS_ALREADY_PRESENT",
+            "MIGRATION_CONNECTION_SESSION_USER_MISMATCH",
+            "MIGRATION_CONNECTION_CURRENT_USER_MISMATCH",
+            "MIGRATION_CONNECTION_DATABASE_MISMATCH",
+            "CANONICAL_MIGRATION_FAILED",
+            "APPLY_POSTCONDITION_MISSING",
+            "CONTROL_DATABASE_URL_MIGRATOR_MISSING",
+        }:
+            code = exc.__class__.__name__
+        return _fail(code, migration=args.migration, target_db=args.target_db)
     except Exception as exc:
-        return _fail(exc.__class__.__name__, detail=str(exc).splitlines()[0][:200])
+        return _fail(exc.__class__.__name__, migration=args.migration, target_db=args.target_db)
     print(json.dumps(result, sort_keys=True))
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
-
