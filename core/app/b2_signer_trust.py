@@ -1158,7 +1158,7 @@ class PostgresProductionSignerAdmissionStore:
                         :provisioning_reference, :provisioning_generation, :status, :created_at, :admission_hash,
                         :durable_store_schema_version, CAST(:provenance AS jsonb)
                     )
-                    ON CONFLICT (admission_reference) DO NOTHING
+                    ON CONFLICT DO NOTHING
                 """), {
                     **payload,
                     "status": record.status.value,
@@ -1168,9 +1168,10 @@ class PostgresProductionSignerAdmissionStore:
                 })
                 if result.rowcount == 1:
                     return "CREATED"
-                existing = self._get_for_update(connection, record.admission_reference)
+                existing = self._get_for_update(connection, record.admission_reference, lock=False)
                 if existing is None:
-                    raise CoreError("PRODUCTION_SIGNER_ADMISSION_CREATE_RACE_UNRESOLVED")
+                    # Another immutable identity can own the unique provider reference.
+                    raise CoreError("PRODUCTION_SIGNER_ADMISSION_IDENTITY_CONFLICT")
                 if _admission_record_hash(existing) != admission_hash or _admission_record_payload(existing) != payload:
                     raise CoreError("PRODUCTION_SIGNER_ADMISSION_IDENTITY_CONFLICT")
                 return "IDEMPOTENT_EXISTING"

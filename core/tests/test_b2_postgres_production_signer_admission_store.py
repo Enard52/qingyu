@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import os
 from threading import Barrier
 from urllib.parse import quote
 
@@ -116,6 +117,63 @@ def admission_with(record: ProductionSignerAdmissionRecord, **updates):
 def migrate_both(url: str, database: str) -> None:
     apply_postgres_production_trust_store_migration(url, expected_database_name=database)
     apply_postgres_production_signer_admission_store_migration(url, expected_database_name=database)
+
+
+def least_privilege_provisioner_url(pg_env, database: str) -> str:
+    import psycopg
+
+    role = "qingyu_control_provisioner"
+    password = "least_privilege_provisioner_test_only"
+    with psycopg.connect(host="127.0.0.1", port=pg_env.port, dbname=database, user="postgres", password=pg_env.password) as connection:
+        connection.execute(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'qingyu_control_provisioner') THEN
+                    CREATE ROLE qingyu_control_provisioner LOGIN PASSWORD 'least_privilege_provisioner_test_only'
+                        NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+                END IF;
+            END
+            $$;
+            """
+        )
+        connection.execute("GRANT CONNECT ON DATABASE " + connection.info.dbname + " TO qingyu_control_provisioner")
+        connection.execute("GRANT USAGE ON SCHEMA governance TO qingyu_control_provisioner")
+        connection.execute("GRANT SELECT ON governance.production_trust_records TO qingyu_control_provisioner")
+        connection.execute("GRANT SELECT, INSERT ON governance.production_signer_admission_records TO qingyu_control_provisioner")
+        connection.execute("REVOKE UPDATE, DELETE, TRUNCATE ON governance.production_signer_admission_records FROM qingyu_control_provisioner")
+    authority = f"{role}:{quote(password)}" + f"@127.0.0.1:{pg_env.port}"
+    return "postgresql+psycopg://" + authority + f"/{database}"
+
+
+def provisioner_privileges(pg_env, database: str) -> dict[str, bool]:
+    import psycopg
+
+    with psycopg.connect(host="127.0.0.1", port=pg_env.port, dbname=database, user="postgres", password=pg_env.password) as connection:
+        row = connection.execute(
+            """
+            SELECT has_table_privilege('qingyu_control_provisioner','governance.production_signer_admission_records','SELECT'),
+                   has_table_privilege('qingyu_control_provisioner','governance.production_signer_admission_records','INSERT'),
+                   has_table_privilege('qingyu_control_provisioner','governance.production_signer_admission_records','UPDATE'),
+                   has_table_privilege('qingyu_control_provisioner','governance.production_signer_admission_records','DELETE'),
+                   has_table_privilege('qingyu_control_provisioner','governance.production_signer_admission_records','TRUNCATE')
+            """
+        ).fetchone()
+    return {"select": row[0], "insert": row[1], "update": row[2], "delete": row[3], "truncate": row[4]}
+
+
+def provisioner_role_attributes(pg_env, database: str) -> dict[str, bool]:
+    import psycopg
+
+    with psycopg.connect(host="127.0.0.1", port=pg_env.port, dbname=database, user="postgres", password=pg_env.password) as connection:
+        row = connection.execute(
+            """
+            SELECT rolsuper, rolcreatedb, rolcreaterole, rolbypassrls
+              FROM pg_roles
+             WHERE rolname = 'qingyu_control_provisioner'
+            """
+        ).fetchone()
+    return {"superuser": row[0], "createdb": row[1], "createrole": row[2], "bypassrls": row[3]}
 
 
 def _governance_objects(pg_env, database: str) -> tuple[bool, bool, bool]:
@@ -668,3 +726,222 @@ def test_direct_service_success_has_no_governance_side_effects(pg_env, control_d
     assert not any("smi" in table for table in governance_tables)
     assert not any("genesis" in table for table in governance_tables)
 
+
+def test_least_privilege_provisioner_service_create_replay_and_conflict_without_update(pg_env, control_db, tmp_path, monkeypatch):
+    admin_url = pg_env.url(control_db)
+    migrate_both(admin_url, control_db)
+    provider = encrypted_provider(tmp_path, "least-privilege-provider")
+    record = TrustRecord.from_provider(
+        trust_reference="least-privilege-trust",
+        provider=provider,
+        environment="qingyu-production-primary",
+        target_reference="prod-target-ref-001",
+        generation=1,
+        created_at=NOW,
+        status=TrustStatus.ACTIVE,
+    )
+    monkeypatch.setattr(
+        signer_trust_module,
+        "build_r1_production_signer_storage_inspector",
+        lambda: TrustedServiceStorageInspector(trusted_storage_observation(provider, record, tmp_path)),
+    )
+    monkeypatch.setattr(signer_trust_module, "_provider_key_path_matches_attestation", lambda *_args, **_kwargs: True)
+    assert PostgresProductionTrustStore(admin_url, expected_database_name=control_db).create_if_absent_exact(record) == "CREATED"
+
+    provisioner_url = least_privilege_provisioner_url(pg_env, control_db)
+    privileges = provisioner_privileges(pg_env, control_db)
+    assert privileges == {"select": True, "insert": True, "update": False, "delete": False, "truncate": False}
+    assert provisioner_role_attributes(pg_env, control_db) == {
+        "superuser": False,
+        "createdb": False,
+        "createrole": False,
+        "bypassrls": False,
+    }
+    service = ProductionSignerAdmissionProvisioningService(
+        trust_store=PostgresProductionTrustStore(provisioner_url, expected_database_name=control_db),
+        admission_store=PostgresProductionSignerAdmissionStore(provisioner_url, expected_database_name=control_db),
+        signer_provider=provider,
+        recovery_binding=recovery_binding(),
+    )
+
+    assert create_via_service(service, record, admission_reference="admission:least-privilege") == "CREATED"
+    first = service.read_admission("admission:least-privilege")
+    assert create_via_service(service, record, admission_reference="admission:least-privilege") == "IDEMPOTENT_EXISTING"
+    service.trust_store.engine.dispose()
+    service.admission_store.engine.dispose()
+    del service
+    restarted_service = ProductionSignerAdmissionProvisioningService(
+        trust_store=PostgresProductionTrustStore(provisioner_url, expected_database_name=control_db),
+        admission_store=PostgresProductionSignerAdmissionStore(provisioner_url, expected_database_name=control_db),
+        signer_provider=provider,
+        recovery_binding=recovery_binding(),
+    )
+    assert restarted_service.create_admission(
+        admission_reference="admission:least-privilege",
+        trust_reference=record.trust_reference,
+        custody_policy_version="service-entrypoint-custody-v1",
+        provisioning_reference="service-entrypoint-test",
+        provisioning_generation=1,
+        created_at=NOW,
+        provenance={"test": "direct-service-entrypoint"},
+    ) == "IDEMPOTENT_EXISTING"
+    service = restarted_service
+    with pytest.raises(CoreError, match="PRODUCTION_SIGNER_ADMISSION_IDENTITY_CONFLICT"):
+        create_via_service(
+            service,
+            record,
+            admission_reference="admission:least-privilege",
+            provisioning_reference="different-immutable-payload",
+        )
+
+    assert service.read_admission("admission:least-privilege") == first
+    assert PostgresProductionSignerAdmissionStore(provisioner_url, expected_database_name=control_db).count() == 1
+    assert provisioner_privileges(pg_env, control_db) == privileges
+    assert provisioner_role_attributes(pg_env, control_db) == {
+        "superuser": False,
+        "createdb": False,
+        "createrole": False,
+        "bypassrls": False,
+    }
+
+
+def test_least_privilege_identical_concurrent_creates_do_not_need_update(pg_env, control_db):
+    admin_url = pg_env.url(control_db)
+    migrate_both(admin_url, control_db)
+    _, trust = trust_record(trust_reference="least-privilege-concurrent-identical")
+    admission = admission_for(trust, admission_reference="admission:least-privilege-concurrent-identical")
+    provisioner_url = least_privilege_provisioner_url(pg_env, control_db)
+    assert provisioner_privileges(pg_env, control_db)["update"] is False
+    barrier = Barrier(6)
+
+    def create_once():
+        barrier.wait(timeout=10)
+        return PostgresProductionSignerAdmissionStore(provisioner_url, expected_database_name=control_db).create_if_absent_exact(admission)
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        results = list(executor.map(lambda _: create_once(), range(6)))
+
+    assert results.count("CREATED") == 1
+    assert results.count("IDEMPOTENT_EXISTING") == 5
+    store = PostgresProductionSignerAdmissionStore(provisioner_url, expected_database_name=control_db)
+    assert store.count() == 1
+    assert _admission_record_hash(store.resolve(admission.admission_reference)) == _admission_record_hash(admission)
+    assert provisioner_privileges(pg_env, control_db)["update"] is False
+
+
+def test_least_privilege_conflicting_concurrent_creates_preserve_winner_without_update(pg_env, control_db):
+    admin_url = pg_env.url(control_db)
+    migrate_both(admin_url, control_db)
+    _, trust = trust_record(trust_reference="least-privilege-concurrent-conflict")
+    first = admission_for(trust, admission_reference="admission:least-privilege-concurrent-conflict", provisioning_reference="winner-candidate")
+    second = admission_with(first, provisioning_reference="conflicting-candidate")
+    provisioner_url = least_privilege_provisioner_url(pg_env, control_db)
+    assert provisioner_privileges(pg_env, control_db)["update"] is False
+
+    barrier = Barrier(2)
+
+    def create(record):
+        barrier.wait(timeout=10)
+        try:
+            return PostgresProductionSignerAdmissionStore(provisioner_url, expected_database_name=control_db).create_if_absent_exact(record)
+        except CoreError as exc:
+            return exc.code
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(create, [first, second]))
+
+    assert sorted(results) == ["CREATED", "PRODUCTION_SIGNER_ADMISSION_IDENTITY_CONFLICT"]
+    store = PostgresProductionSignerAdmissionStore(provisioner_url, expected_database_name=control_db)
+    assert store.count() == 1
+    winner = store.resolve(first.admission_reference)
+    assert winner in (first, second)
+    assert _admission_record_hash(winner) in {_admission_record_hash(first), _admission_record_hash(second)}
+    assert provisioner_privileges(pg_env, control_db)["update"] is False
+
+
+@pytest.mark.parametrize("concurrent", [False, True])
+def test_least_privilege_provider_unique_collision_is_identity_conflict(pg_env, control_db, concurrent):
+    migrate_both(pg_env.url(control_db), control_db)
+    _, trust = trust_record(trust_reference="provider-unique-collision")
+    first = admission_for(trust, admission_reference="admission:provider-owner")
+    second = admission_with(first, admission_reference="admission:provider-contender")
+    url = least_privilege_provisioner_url(pg_env, control_db)
+    privileges = provisioner_privileges(pg_env, control_db)
+    assert privileges == {"select": True, "insert": True, "update": False, "delete": False, "truncate": False}
+    barrier = Barrier(2) if concurrent else None
+
+    def create(record):
+        store = PostgresProductionSignerAdmissionStore(url, expected_database_name=control_db)
+        try:
+            if barrier:
+                barrier.wait(timeout=10)
+            try:
+                return store.create_if_absent_exact(record)
+            except CoreError as exc:
+                return exc.code
+        finally:
+            store.engine.dispose()
+
+    if concurrent:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(create, [first, second]))
+    else:
+        results = [create(first), create(second)]
+    assert sorted(results) == ["CREATED", "PRODUCTION_SIGNER_ADMISSION_IDENTITY_CONFLICT"]
+    store = PostgresProductionSignerAdmissionStore(url, expected_database_name=control_db)
+    try:
+        winner = first if results[0] == "CREATED" else second
+        loser = second if winner == first else first
+        assert store.count() == 1
+        assert store.resolve(winner.admission_reference) == winner
+        assert store.get(loser.admission_reference) is None
+        assert store.create_if_absent_exact(winner) == "IDEMPOTENT_EXISTING"
+        assert provisioner_privileges(pg_env, control_db) == privileges
+    finally:
+        store.engine.dispose()
+
+
+def test_least_privilege_identical_concurrency_all_unique_constraints_multiround(pg_env, control_db):
+    from sqlalchemy import event
+
+    migrate_both(pg_env.url(control_db), control_db)
+    url = least_privilege_provisioner_url(pg_env, control_db)
+    privileges = provisioner_privileges(pg_env, control_db)
+    assert privileges == {"select": True, "insert": True, "update": False, "delete": False, "truncate": False}
+    rounds = int(os.environ.get("QINGYU_F01_STRESS_ROUNDS", "12"))
+    assert 1 <= rounds <= 1000
+    stores = [PostgresProductionSignerAdmissionStore(url, expected_database_name=control_db) for _ in range(6)]
+    statements = []
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(" ".join(statement.upper().split()))
+
+    for store in stores:
+        event.listen(store.engine, "before_cursor_execute", capture)
+    try:
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            for round_index in range(rounds):
+                _, trust = trust_record(trust_reference=f"f01-round-{round_index}")
+                admission = admission_for(trust, admission_reference=f"admission:f01-{round_index}")
+                barrier = Barrier(6)
+
+                def create(store):
+                    barrier.wait(timeout=10)
+                    return store.create_if_absent_exact(admission)
+
+                results = list(executor.map(create, stores))
+                assert results.count("CREATED") == 1, (round_index, results)
+                assert results.count("IDEMPOTENT_EXISTING") == 5, (round_index, results)
+                assert stores[0].count() == round_index + 1
+                assert stores[0].resolve(admission.admission_reference) == admission
+        inserts = [statement for statement in statements if statement.startswith("INSERT")]
+        assert len(inserts) == rounds * 6
+        # This mechanism assertion fails deterministically for the old narrow arbiter,
+        # while the real PostgreSQL rounds verify canonical convergence and readback.
+        assert all("ON CONFLICT DO NOTHING" in statement for statement in inserts)
+        assert not any("FOR UPDATE" in statement or "FOR SHARE" in statement for statement in statements)
+        assert all(statement.startswith(("SELECT", "INSERT")) for statement in statements)
+        assert provisioner_privileges(pg_env, control_db) == privileges
+    finally:
+        for store in stores:
+            store.engine.dispose()
