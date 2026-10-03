@@ -5,11 +5,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path, PureWindowsPath
 from enum import StrEnum
 import re
+import json
 import subprocess
 from typing import Any, Callable, Mapping, Protocol
 
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import IntegrityError, ProgrammingError
+from sqlalchemy.exc import DBAPIError, IntegrityError, ProgrammingError
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
@@ -1464,3 +1465,304 @@ def ensure_production_eligible(
         SignerProviderClassification.TEST_ONLY,
     ):
         raise CoreError("B2_SYNTHETIC_TRUST_CLASSIFICATION_INVALID")
+
+
+# Additive OBS-02 foundation. Existing Trust/Admission payloads and migrations
+# remain historical contracts; this record carries the new authority separately.
+PRODUCTION_SIGNER_ADMISSION_TRUST_BINDING_SCHEMA_VERSION = "qingyu-b2-production-signer-admission-trust-binding-v1"
+POSTGRES_PRODUCTION_SIGNER_ADMISSION_TRUST_BINDING_STORE_SCHEMA_VERSION = "qingyu-b2-postgres-production-signer-admission-trust-binding-store-v1"
+POSTGRES_PRODUCTION_SIGNER_ADMISSION_TRUST_BINDING_STORE_MIGRATION_ID = "b2_003_postgres_production_signer_admission_trust_binding_store"
+_BINDING_ERROR_PREFIX = "PRODUCTION_SIGNER_ADMISSION_TRUST_BINDING_"
+
+
+class ProductionSignerAdmissionTrustBindingRequest(BaseModel):
+    """Owner inputs only: durable source hashes cannot be supplied by the caller."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    admission_reference: str = Field(min_length=1)
+    trust_reference: str = Field(min_length=1)
+    created_at: datetime
+    provenance: dict[str, Any]
+
+    @field_validator("created_at")
+    @classmethod
+    def _binding_created_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise CoreError(_BINDING_ERROR_PREFIX + "CREATED_AT_TIMEZONE_REQUIRED")
+        return value.astimezone(timezone.utc)
+
+    @field_validator("provenance", mode="before")
+    @classmethod
+    def _binding_provenance(cls, value: Any) -> dict[str, Any]:
+        def valid(item: Any) -> bool:
+            if isinstance(item, dict):
+                return all(isinstance(k, str) and bool(k) and valid(v) for k, v in item.items())
+            if isinstance(item, list):
+                return all(valid(v) for v in item)
+            return item is None or type(item) in (str, int, float, bool)
+
+        if not isinstance(value, dict) or not value or not valid(value):
+            raise CoreError(_BINDING_ERROR_PREFIX + "PROVENANCE_INVALID")
+        try:
+            # Detach nested caller-owned objects and reject NaN/Infinity.
+            return json.loads(json.dumps(value, allow_nan=False))
+        except (ValueError, TypeError) as exc:
+            raise CoreError(_BINDING_ERROR_PREFIX + "PROVENANCE_INVALID") from exc
+
+
+class ProductionSignerAdmissionTrustBinding(ProductionSignerAdmissionTrustBindingRequest):
+    schema_version: str = PRODUCTION_SIGNER_ADMISSION_TRUST_BINDING_SCHEMA_VERSION
+    admission_hash: str
+    trust_hash: str
+
+    @field_validator("admission_hash", "trust_hash")
+    @classmethod
+    def _binding_source_hash(cls, value: str) -> str:
+        if not _HEX64.fullmatch(value):
+            raise CoreError(_BINDING_ERROR_PREFIX + "HASH_INVALID")
+        return value
+
+    @model_validator(mode="after")
+    def validate_binding(self) -> "ProductionSignerAdmissionTrustBinding":
+        if self.schema_version != PRODUCTION_SIGNER_ADMISSION_TRUST_BINDING_SCHEMA_VERSION:
+            raise CoreError(_BINDING_ERROR_PREFIX + "SCHEMA_UNSUPPORTED")
+        return self
+
+    @property
+    def binding_hash(self) -> str:
+        return sha256_hex(self.model_dump(mode="json"))
+
+
+def _binding_database_error(exc: DBAPIError) -> CoreError:
+    # No blanket IntegrityError -> IDENTITY_CONFLICT classification. Unique
+    # conflicts are arbitrated by INSERT and exact readback, not exceptions.
+    code = getattr(exc.orig, "sqlstate", None)
+    suffix = {
+        "42P01": "STORE_SCHEMA_REQUIRED", "3F000": "STORE_SCHEMA_REQUIRED",
+        "42501": "STORE_PERMISSION_DENIED", "23503": "SOURCE_REFERENCE_INVALID",
+        "23514": "STORE_CONSTRAINT_VIOLATION", "23502": "STORE_CONSTRAINT_VIOLATION",
+        "40001": "STORE_TRANSACTION_RETRY_REQUIRED", "40P01": "STORE_TRANSACTION_RETRY_REQUIRED",
+    }.get(code, "STORE_DATABASE_ERROR")
+    return CoreError(_BINDING_ERROR_PREFIX + suffix)
+
+
+def apply_postgres_production_signer_admission_trust_binding_store_migration(
+    sqlalchemy_url: str, *, expected_database_name: str,
+) -> None:
+    """Additive b2_003 candidate; never backfills or rewrites source authority.
+
+    Uses the established explicit callable migration mechanism. Real executor
+    allowlisting and role grants belong to a separately authorized future stage.
+    """
+    engine = create_engine(sqlalchemy_url, pool_pre_ping=True)
+    try:
+        with engine.begin() as connection:
+            _assert_postgres_trust_store_database_identity(connection, expected_database_name)
+            prerequisites = connection.execute(text("""
+                SELECT migration_id, schema_version FROM governance.schema_migrations
+                 WHERE migration_id IN (:trust, :admission)
+            """), {"trust": POSTGRES_PRODUCTION_TRUST_STORE_MIGRATION_ID,
+                     "admission": POSTGRES_PRODUCTION_SIGNER_ADMISSION_STORE_MIGRATION_ID}).all()
+            if dict(prerequisites) != {
+                POSTGRES_PRODUCTION_TRUST_STORE_MIGRATION_ID: POSTGRES_PRODUCTION_TRUST_STORE_SCHEMA_VERSION,
+                POSTGRES_PRODUCTION_SIGNER_ADMISSION_STORE_MIGRATION_ID: POSTGRES_PRODUCTION_SIGNER_ADMISSION_STORE_SCHEMA_VERSION,
+            }:
+                raise CoreError(_BINDING_ERROR_PREFIX + "MIGRATION_PREREQUISITES_REQUIRED")
+            connection.execute(text("""
+                CREATE TABLE IF NOT EXISTS governance.production_signer_admission_trust_bindings (
+                    admission_reference TEXT PRIMARY KEY,
+                    schema_version TEXT NOT NULL,
+                    admission_hash TEXT NOT NULL CHECK (admission_hash ~ '^[0-9a-f]{64}$'),
+                    trust_reference TEXT NOT NULL UNIQUE,
+                    trust_hash TEXT NOT NULL CHECK (trust_hash ~ '^[0-9a-f]{64}$'),
+                    created_at TIMESTAMPTZ NOT NULL,
+                    provenance JSONB NOT NULL CHECK (jsonb_typeof(provenance) = 'object' AND provenance <> '{}'::jsonb),
+                    binding_hash TEXT NOT NULL CHECK (binding_hash ~ '^[0-9a-f]{64}$'),
+                    durable_store_schema_version TEXT NOT NULL,
+                    persisted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    CONSTRAINT admission_trust_binding_schema_ck CHECK (
+                        schema_version = 'qingyu-b2-production-signer-admission-trust-binding-v1'),
+                    CONSTRAINT admission_trust_binding_store_schema_ck CHECK (
+                        durable_store_schema_version = 'qingyu-b2-postgres-production-signer-admission-trust-binding-store-v1'),
+                    CONSTRAINT admission_trust_binding_admission_fk FOREIGN KEY (admission_reference)
+                        REFERENCES governance.production_signer_admission_records(admission_reference)
+                        ON UPDATE RESTRICT ON DELETE RESTRICT,
+                    CONSTRAINT admission_trust_binding_trust_fk FOREIGN KEY (trust_reference)
+                        REFERENCES governance.production_trust_records(trust_reference)
+                        ON UPDATE RESTRICT ON DELETE RESTRICT
+                )
+            """))
+            connection.execute(text("""
+                INSERT INTO governance.schema_migrations (migration_id, schema_version)
+                VALUES (:migration_id, :schema_version) ON CONFLICT DO NOTHING
+            """), {"migration_id": POSTGRES_PRODUCTION_SIGNER_ADMISSION_TRUST_BINDING_STORE_MIGRATION_ID,
+                     "schema_version": POSTGRES_PRODUCTION_SIGNER_ADMISSION_TRUST_BINDING_STORE_SCHEMA_VERSION})
+            version = connection.execute(text("SELECT schema_version FROM governance.schema_migrations WHERE migration_id=:id"),
+                                         {"id": POSTGRES_PRODUCTION_SIGNER_ADMISSION_TRUST_BINDING_STORE_MIGRATION_ID}).scalar_one()
+            if version != POSTGRES_PRODUCTION_SIGNER_ADMISSION_TRUST_BINDING_STORE_SCHEMA_VERSION:
+                raise CoreError(_BINDING_ERROR_PREFIX + "STORE_SCHEMA_UNSUPPORTED")
+    except DBAPIError as exc:
+        raise _binding_database_error(exc) from exc
+    finally:
+        engine.dispose()
+
+
+def apply_r1_production_signer_admission_trust_binding_store_migration(sqlalchemy_url: str) -> None:
+    apply_postgres_production_signer_admission_trust_binding_store_migration(
+        sqlalchemy_url, expected_database_name=R1_PRODUCTION_CONTROL_DATABASE_NAME,
+    )
+
+
+class PostgresProductionSignerAdmissionTrustBindingStore:
+    """Immutable relational authority; source validation and INSERT share a connection.
+
+    READ COMMITTED gives the SELECT after a waiting ON CONFLICT a new snapshot,
+    including the winner's committed row. No locking SELECT or UPDATE is used.
+    Role credentials, ownership and grants are separately provisioned prerequisites.
+    """
+
+    def __init__(self, sqlalchemy_url: str, *, expected_database_name: str):
+        if not expected_database_name:
+            raise CoreError("DATABASE_SAFETY_VIOLATION")
+        self.expected_database_name = expected_database_name
+        self.engine = create_engine(sqlalchemy_url, pool_pre_ping=True, isolation_level="READ COMMITTED")
+
+    def _sources(self, connection: Any, admission_reference: str, trust_reference: str) -> tuple[ProductionSignerAdmissionRecord, TrustRecord]:
+        admission_row = connection.execute(text("SELECT * FROM governance.production_signer_admission_records WHERE admission_reference=:ref"),
+                                           {"ref": admission_reference}).mappings().first()
+        if admission_row is None:
+            raise CoreError(_BINDING_ERROR_PREFIX + "ADMISSION_NOT_FOUND")
+        trust_row = connection.execute(text("SELECT * FROM governance.production_trust_records WHERE trust_reference=:ref"),
+                                       {"ref": trust_reference}).mappings().first()
+        if trust_row is None:
+            raise CoreError(_BINDING_ERROR_PREFIX + "TRUST_NOT_FOUND")
+        if (admission_row["durable_store_schema_version"] != POSTGRES_PRODUCTION_SIGNER_ADMISSION_STORE_SCHEMA_VERSION
+                or trust_row["durable_store_schema_version"] != POSTGRES_PRODUCTION_TRUST_STORE_SCHEMA_VERSION):
+            raise CoreError(_BINDING_ERROR_PREFIX + "SOURCE_SCHEMA_UNSUPPORTED")
+        admission = ProductionSignerAdmissionRecord(**{k: admission_row[k] for k in ProductionSignerAdmissionRecord.model_fields})
+        trust = TrustRecord(**{k: trust_row[k] for k in TrustRecord.model_fields})
+        if _admission_record_hash(admission) != admission_row["admission_hash"]:
+            raise CoreError(_BINDING_ERROR_PREFIX + "ADMISSION_HASH_MISMATCH")
+        if _trust_record_hash(trust) != trust_row["record_hash"]:
+            raise CoreError(_BINDING_ERROR_PREFIX + "TRUST_HASH_MISMATCH")
+        if admission.status != ProductionSignerAdmissionStatus.ACTIVE or trust.status != TrustStatus.ACTIVE:
+            raise CoreError(_BINDING_ERROR_PREFIX + "SOURCE_NOT_ACTIVE")
+        for name in ("algorithm", "provider_reference", "provider_backend_type", "key_id",
+                     "public_key_fingerprint", "environment", "target_reference"):
+            if getattr(admission, name) != getattr(trust, name):
+                raise CoreError(_BINDING_ERROR_PREFIX + "SIGNER_TRUST_MISMATCH")
+        return admission, trust
+
+    def _get(self, connection: Any, admission_reference: str) -> ProductionSignerAdmissionTrustBinding | None:
+        row = connection.execute(text("SELECT * FROM governance.production_signer_admission_trust_bindings WHERE admission_reference=:ref"),
+                                 {"ref": admission_reference}).mappings().first()
+        if row is None:
+            return None
+        if row["durable_store_schema_version"] != POSTGRES_PRODUCTION_SIGNER_ADMISSION_TRUST_BINDING_STORE_SCHEMA_VERSION:
+            raise CoreError(_BINDING_ERROR_PREFIX + "STORE_SCHEMA_UNSUPPORTED")
+        binding = ProductionSignerAdmissionTrustBinding(**{k: row[k] for k in ProductionSignerAdmissionTrustBinding.model_fields})
+        if binding.binding_hash != row["binding_hash"]:
+            raise CoreError(_BINDING_ERROR_PREFIX + "DURABLE_HASH_MISMATCH")
+        return binding
+
+    def _insert_exact(self, connection: Any, binding: ProductionSignerAdmissionTrustBinding) -> str:
+        result = connection.execute(text("""
+            INSERT INTO governance.production_signer_admission_trust_bindings
+                (schema_version, admission_reference, admission_hash, trust_reference, trust_hash,
+                 created_at, provenance, binding_hash, durable_store_schema_version)
+            VALUES (:schema_version, :admission_reference, :admission_hash, :trust_reference, :trust_hash,
+                    :created_at, CAST(:provenance AS jsonb), :binding_hash, :durable_store_schema_version)
+            ON CONFLICT DO NOTHING
+        """), {**binding.model_dump(mode="json"), "binding_hash": binding.binding_hash,
+                 "provenance": canonical_bytes(binding.provenance).decode("utf-8"),
+                 "durable_store_schema_version": POSTGRES_PRODUCTION_SIGNER_ADMISSION_TRUST_BINDING_STORE_SCHEMA_VERSION})
+        if result.rowcount == 1:
+            return "CREATED"
+        existing = self._get(connection, binding.admission_reference)
+        if existing is None or existing.model_dump(mode="json") != binding.model_dump(mode="json"):
+            raise CoreError(_BINDING_ERROR_PREFIX + "IDENTITY_CONFLICT")
+        return "IDEMPOTENT_EXISTING"
+
+    def create_if_absent_exact(self, binding: ProductionSignerAdmissionTrustBinding) -> str:
+        # Revalidate even a model_copy/model_construct and detach provenance before IO.
+        binding = ProductionSignerAdmissionTrustBinding.model_validate(binding.model_dump())
+        try:
+            with self.engine.begin() as connection:
+                _assert_postgres_trust_store_database_identity(connection, self.expected_database_name)
+                existing = self._get(connection, binding.admission_reference)
+                if existing is not None and existing.model_dump(mode="json") != binding.model_dump(mode="json"):
+                    raise CoreError(_BINDING_ERROR_PREFIX + "IDENTITY_CONFLICT")
+                admission, trust = self._sources(connection, binding.admission_reference, binding.trust_reference)
+                if binding.admission_hash != _admission_record_hash(admission):
+                    raise CoreError(_BINDING_ERROR_PREFIX + "ADMISSION_HASH_MISMATCH")
+                if binding.trust_hash != _trust_record_hash(trust):
+                    raise CoreError(_BINDING_ERROR_PREFIX + "TRUST_HASH_MISMATCH")
+                return self._insert_exact(connection, binding)
+        except DBAPIError as exc:
+            raise _binding_database_error(exc) from exc
+
+    def create_from_sources(self, request: ProductionSignerAdmissionTrustBindingRequest) -> str:
+        request = ProductionSignerAdmissionTrustBindingRequest.model_validate(request.model_dump())
+        try:
+            with self.engine.begin() as connection:
+                _assert_postgres_trust_store_database_identity(connection, self.expected_database_name)
+                admission, trust = self._sources(connection, request.admission_reference, request.trust_reference)
+                binding = ProductionSignerAdmissionTrustBinding(**request.model_dump(),
+                    admission_hash=_admission_record_hash(admission), trust_hash=_trust_record_hash(trust))
+                return self._insert_exact(connection, binding)
+        except DBAPIError as exc:
+            raise _binding_database_error(exc) from exc
+
+    def get(self, admission_reference: str) -> ProductionSignerAdmissionTrustBinding | None:
+        try:
+            with self.engine.begin() as connection:
+                _assert_postgres_trust_store_database_identity(connection, self.expected_database_name)
+                return self._get(connection, admission_reference)
+        except DBAPIError as exc:
+            raise _binding_database_error(exc) from exc
+
+    def resolve(self, admission_reference: str) -> ProductionSignerAdmissionTrustBinding:
+        binding = self.get(admission_reference)
+        if binding is None:
+            raise CoreError(_BINDING_ERROR_PREFIX + "NOT_FOUND")
+        return binding
+
+    def count(self) -> int:
+        try:
+            with self.engine.begin() as connection:
+                _assert_postgres_trust_store_database_identity(connection, self.expected_database_name)
+                return int(connection.execute(text("SELECT count(*) FROM governance.production_signer_admission_trust_bindings")).scalar_one())
+        except DBAPIError as exc:
+            raise _binding_database_error(exc) from exc
+
+
+def require_postgres_production_signer_admission_trust_binding_store_config(
+    *, mode: AuthorityEnvironmentMode, sqlalchemy_url: str | None,
+) -> PostgresProductionSignerAdmissionTrustBindingStore:
+    if mode != AuthorityEnvironmentMode.REAL_PRODUCTION or not sqlalchemy_url:
+        raise CoreError(_BINDING_ERROR_PREFIX + "STORE_CONFIG_REQUIRED")
+    return PostgresProductionSignerAdmissionTrustBindingStore(
+        sqlalchemy_url, expected_database_name=R1_PRODUCTION_CONTROL_DATABASE_NAME,
+    )
+
+
+class ProductionSignerAdmissionTrustBindingProvisioningService:
+    """Explicit future provisioning; never wired into activation or automatic backfill."""
+
+    def __init__(self, *, binding_store: PostgresProductionSignerAdmissionTrustBindingStore):
+        if not isinstance(binding_store, PostgresProductionSignerAdmissionTrustBindingStore):
+            raise CoreError(_BINDING_ERROR_PREFIX + "DURABLE_STORE_REQUIRED")
+        self.binding_store = binding_store
+
+    def create_binding(self, *, admission_reference: str, trust_reference: str,
+                       created_at: datetime, provenance: dict[str, Any]) -> str:
+        request = ProductionSignerAdmissionTrustBindingRequest(
+            admission_reference=admission_reference, trust_reference=trust_reference,
+            created_at=created_at, provenance=provenance,
+        )
+        # Derivation, canonical source validation and exactly one INSERT occur in
+        # the store's single guarded transaction, including direct store callers.
+        return self.binding_store.create_from_sources(request)
+
+    def read_binding(self, admission_reference: str) -> ProductionSignerAdmissionTrustBinding:
+        return self.binding_store.resolve(admission_reference)
