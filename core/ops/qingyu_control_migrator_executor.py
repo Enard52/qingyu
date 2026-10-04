@@ -9,17 +9,24 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import DBAPIError
 
 from app.b2_signer_trust import (
     POSTGRES_PRODUCTION_SIGNER_ADMISSION_STORE_MIGRATION_ID,
+    POSTGRES_PRODUCTION_SIGNER_ADMISSION_TRUST_BINDING_STORE_MIGRATION_ID,
+    POSTGRES_PRODUCTION_SIGNER_ADMISSION_TRUST_BINDING_STORE_SCHEMA_VERSION,
+    POSTGRES_PRODUCTION_TRUST_STORE_MIGRATION_ID,
+    POSTGRES_PRODUCTION_TRUST_STORE_SCHEMA_VERSION,
     POSTGRES_PRODUCTION_SIGNER_ADMISSION_STORE_SCHEMA_VERSION,
     R1_PRODUCTION_CONTROL_DATABASE_NAME,
     apply_r1_production_signer_admission_store_migration,
+    apply_r1_production_signer_admission_trust_binding_store_migration,
 )
 
 SECRET_PATH = "/etc/qingyu/secrets/control-postgres.env"
 WSL_DISTRO = "qingyu-prod-local-01"
 APPLY_B2_002_TO_QINGYU_CONTROL = "APPLY_B2_002_TO_QINGYU_CONTROL"
+APPLY_B2_003_TO_QINGYU_CONTROL = "APPLY_B2_003_TO_QINGYU_CONTROL"
 CONTROL_MIGRATOR_ROLE = "qingyu_control_migrator"
 CONTROL_OWNER_ROLE = "qingyu_control_owner"
 ALLOWED_MIGRATIONS = {
@@ -28,7 +35,13 @@ ALLOWED_MIGRATIONS = {
         "callable": "app.b2_signer_trust.apply_r1_production_signer_admission_store_migration",
         "target_database": R1_PRODUCTION_CONTROL_DATABASE_NAME,
         "confirmation": APPLY_B2_002_TO_QINGYU_CONTROL,
-    }
+    },
+    POSTGRES_PRODUCTION_SIGNER_ADMISSION_TRUST_BINDING_STORE_MIGRATION_ID: {
+        "schema_version": POSTGRES_PRODUCTION_SIGNER_ADMISSION_TRUST_BINDING_STORE_SCHEMA_VERSION,
+        "callable": "app.b2_signer_trust.apply_r1_production_signer_admission_trust_binding_store_migration",
+        "target_database": R1_PRODUCTION_CONTROL_DATABASE_NAME,
+        "confirmation": APPLY_B2_003_TO_QINGYU_CONTROL,
+    },
 }
 
 
@@ -139,6 +152,100 @@ def _collect_readonly_state(connection: Any) -> dict[str, Any]:
     }
 
 
+BINDING_TABLE = "governance.production_signer_admission_trust_bindings"
+BINDING_LEDGER_VERSIONS = {
+    POSTGRES_PRODUCTION_TRUST_STORE_MIGRATION_ID: POSTGRES_PRODUCTION_TRUST_STORE_SCHEMA_VERSION,
+    POSTGRES_PRODUCTION_SIGNER_ADMISSION_STORE_MIGRATION_ID: POSTGRES_PRODUCTION_SIGNER_ADMISSION_STORE_SCHEMA_VERSION,
+    POSTGRES_PRODUCTION_SIGNER_ADMISSION_TRUST_BINDING_STORE_MIGRATION_ID: POSTGRES_PRODUCTION_SIGNER_ADMISSION_TRUST_BINDING_STORE_SCHEMA_VERSION,
+}
+
+
+def _collect_binding_state(connection: Any) -> dict[str, Any]:
+    identity = connection.execute(text("SELECT session_user, current_user, current_database()")).one()
+    if tuple(identity) != (CONTROL_MIGRATOR_ROLE, CONTROL_OWNER_ROLE, R1_PRODUCTION_CONTROL_DATABASE_NAME):
+        raise RuntimeError("MIGRATION_CONNECTION_IDENTITY_MISMATCH")
+    ledger = connection.execute(text("SELECT migration_id, schema_version FROM governance.schema_migrations")).all()
+    versions = {name: [version for migration, version in ledger if migration == name]
+                for name in BINDING_LEDGER_VERSIONS}
+    sources = connection.execute(text("""
+        SELECT (SELECT coalesce(jsonb_agg(t ORDER BY trust_reference), '[]'::jsonb)
+                  FROM governance.production_trust_records t) AS trusts,
+               (SELECT coalesce(jsonb_agg(a ORDER BY admission_reference), '[]'::jsonb)
+                  FROM governance.production_signer_admission_records a) AS admissions
+    """)).mappings().one()
+    present = connection.execute(text("SELECT to_regclass(:table) IS NOT NULL"), {"table": BINDING_TABLE}).scalar_one()
+    count = connection.execute(text("SELECT count(*) FROM governance.production_signer_admission_trust_bindings")).scalar_one() if present else None
+    return {"ledger_versions": versions, "sources": dict(sources), "binding_table_present": bool(present), "binding_row_count": count}
+
+
+def _require_binding_preconditions(state: dict[str, Any]) -> None:
+    versions = state["ledger_versions"]
+    for name, version in BINDING_LEDGER_VERSIONS.items():
+        if name != POSTGRES_PRODUCTION_SIGNER_ADMISSION_TRUST_BINDING_STORE_MIGRATION_ID and versions[name] != [version]:
+            raise RuntimeError("B2_003_PREREQUISITES_REQUIRED")
+    if versions[POSTGRES_PRODUCTION_SIGNER_ADMISSION_TRUST_BINDING_STORE_MIGRATION_ID]:
+        raise RuntimeError("B2_003_ALREADY_APPLIED")
+    if state["binding_table_present"]:
+        raise RuntimeError("B2_003_PRECONDITION_FAILED")
+
+
+def _binding_structure(connection: Any) -> dict[str, Any]:
+    rows = connection.execute(text("""
+        SELECT contype, pg_get_constraintdef(oid) AS definition
+          FROM pg_constraint WHERE conrelid = to_regclass(:table)
+    """), {"table": BINDING_TABLE}).all()
+    # PostgreSQL renders harmless parentheses and text casts in CHECK expressions.
+    def normalized(value: str) -> str:
+        return "".join(value.replace("::text", "").split()).replace("(", "").replace(")", "")
+    expected = [
+        ("p", "PRIMARY KEY (admission_reference)"),
+        ("u", "UNIQUE (trust_reference)"),
+        ("f", "FOREIGN KEY (admission_reference) REFERENCES governance.production_signer_admission_records(admission_reference) ON UPDATE RESTRICT ON DELETE RESTRICT"),
+        ("f", "FOREIGN KEY (trust_reference) REFERENCES governance.production_trust_records(trust_reference) ON UPDATE RESTRICT ON DELETE RESTRICT"),
+        ("c", "CHECK (admission_hash ~ '^[0-9a-f]{64}$')"),
+        ("c", "CHECK (trust_hash ~ '^[0-9a-f]{64}$')"),
+        ("c", "CHECK (binding_hash ~ '^[0-9a-f]{64}$')"),
+        ("c", "CHECK (schema_version = 'qingyu-b2-production-signer-admission-trust-binding-v1')"),
+        ("c", "CHECK (durable_store_schema_version = 'qingyu-b2-postgres-production-signer-admission-trust-binding-store-v1')"),
+        ("c", "CHECK (jsonb_typeof(provenance) = 'object' AND provenance <> '{}'::jsonb)"),
+    ]
+    owners = connection.execute(text("""
+        SELECT pg_get_userbyid(c.relowner), pg_get_userbyid(n.nspowner)
+          FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+         WHERE c.oid=to_regclass(:table)
+    """), {"table": BINDING_TABLE}).one()
+    valid = (sorted((kind, normalized(definition)) for kind, definition in rows) ==
+             sorted((kind, normalized(definition)) for kind, definition in expected)
+             and tuple(owners) == (CONTROL_OWNER_ROLE, CONTROL_OWNER_ROLE))
+    if not valid:
+        raise RuntimeError("B2_003_STRUCTURE_MISMATCH")
+    return {"constraints": [{"type": kind, "definition": definition} for kind, definition in rows],
+            "table_owner": owners[0], "schema_owner": owners[1], "verified": True}
+
+
+def _collect_binding_postconditions(url: str, before: dict[str, Any]) -> dict[str, Any]:
+    engine = create_engine(url, pool_pre_ping=True)
+    try:
+        with engine.begin() as connection:
+            state = _collect_binding_state(connection)
+            if (state["ledger_versions"] != {name: [version] for name, version in BINDING_LEDGER_VERSIONS.items()}
+                    or not state["binding_table_present"] or state["binding_row_count"] != 0
+                    or state["sources"] != before["sources"]):
+                raise RuntimeError("B2_003_POSTCONDITION_FAILED")
+            structure = _binding_structure(connection)
+        return {**state, "source_preservation": True, "structure": structure}
+    finally:
+        engine.dispose()
+
+
+def _canonical_migration_callable(migration_id: str) -> Callable[[str], None]:
+    # Code-level callables only. Metadata strings are never dynamically resolved.
+    return {
+        POSTGRES_PRODUCTION_SIGNER_ADMISSION_STORE_MIGRATION_ID: apply_r1_production_signer_admission_store_migration,
+        POSTGRES_PRODUCTION_SIGNER_ADMISSION_TRUST_BINDING_STORE_MIGRATION_ID: apply_r1_production_signer_admission_trust_binding_store_migration,
+    }[migration_id]
+
+
 def _run_probe(url: str, migration_id: str) -> dict[str, Any]:
     engine = create_engine(url, pool_pre_ping=True)
     with engine.begin() as connection:
@@ -153,7 +260,8 @@ def _run_probe(url: str, migration_id: str) -> dict[str, Any]:
         identity_during = connection.execute(
             text("SELECT session_user, current_user, current_database()")
         ).one()
-        readonly_state = _collect_readonly_state(connection)
+        readonly_state = (_collect_binding_state(connection) if migration_id == POSTGRES_PRODUCTION_SIGNER_ADMISSION_TRUST_BINDING_STORE_MIGRATION_ID
+                          else _collect_readonly_state(connection))
         connection.execute(text("RESET ROLE"))
         identity_after = connection.execute(
             text("SELECT session_user, current_user, current_database()")
@@ -184,7 +292,7 @@ def _run_probe(url: str, migration_id: str) -> dict[str, Any]:
         "current_user_after_reset_role": identity_after[1],
         "roles": [dict(row) for row in role_rows],
         "mutation_performed": False,
-        "apply_callable_imported": callable(apply_r1_production_signer_admission_store_migration),
+        "apply_callable_imported": callable(_canonical_migration_callable(migration_id)),
         **readonly_state,
     }
 
@@ -203,6 +311,9 @@ def _migration_connection_identity(url: str) -> dict[str, str]:
     engine = create_engine(url, pool_pre_ping=True)
     with engine.begin() as connection:
         identity = connection.execute(text("SELECT session_user, current_user, current_database()")).one()
+        superuser = connection.execute(text("SELECT bool_or(rolsuper) FROM pg_roles WHERE rolname IN (session_user, current_user)")).scalar_one()
+        if superuser:
+            raise RuntimeError("MIGRATION_SUPERUSER_NOT_ALLOWED")
     return {
         "session_user": identity[0],
         "current_user": identity[1],
@@ -241,9 +352,10 @@ def _collect_apply_postconditions(url: str) -> dict[str, Any]:
 def _run_apply(
     url: str,
     migration_id: str,
-    *,
-    migration_callable: Callable[[str], None] = apply_r1_production_signer_admission_store_migration,
 ) -> dict[str, Any]:
+    if _validate_migration(migration_id):
+        raise RuntimeError("MIGRATION_NOT_ALLOWLISTED")
+    is_binding = migration_id == POSTGRES_PRODUCTION_SIGNER_ADMISSION_TRUST_BINDING_STORE_MIGRATION_ID
     engine = create_engine(url, pool_pre_ping=True)
     with engine.begin() as connection:
         identity_before = connection.execute(
@@ -266,15 +378,24 @@ def _run_apply(
         ).one()
         if identity_during[0] != CONTROL_MIGRATOR_ROLE or identity_during[1] != CONTROL_OWNER_ROLE or identity_during[2] != R1_PRODUCTION_CONTROL_DATABASE_NAME:
             raise RuntimeError("OWNER_ROLE_TRANSITION_FAILED")
+        before = _collect_binding_state(connection) if is_binding else None
+        if is_binding:
+            _require_binding_preconditions(before)
         connection.execute(text("RESET ROLE"))
     migration_url = _url_with_fixed_owner_role(url)
     migration_identity = _assert_owner_authority_connection(migration_url)
     try:
-        migration_callable(migration_url)
+        _canonical_migration_callable(migration_id)(migration_url)
     except Exception as exc:  # no fallback; no manual SQL; no retry as another role
         raise RuntimeError("CANONICAL_MIGRATION_FAILED") from exc
-    postconditions = _collect_apply_postconditions(migration_url)
-    mutation_confirmed = bool(postconditions["b2_002_present"] and postconditions["admission_table_present"])
+    if is_binding:
+        try:
+            postconditions = _collect_binding_postconditions(migration_url, before)
+        except DBAPIError as exc:
+            raise RuntimeError("B2_003_POSTCHECK_UNAVAILABLE") from exc
+    else:
+        postconditions = _collect_apply_postconditions(migration_url)
+    mutation_confirmed = bool(postconditions["binding_table_present"]) if is_binding else bool(postconditions["b2_002_present"] and postconditions["admission_table_present"])
     if not mutation_confirmed:
         raise RuntimeError("APPLY_POSTCONDITION_MISSING")
     return {
@@ -332,9 +453,19 @@ def main(argv: list[str]) -> int:
             "CANONICAL_MIGRATION_FAILED",
             "APPLY_POSTCONDITION_MISSING",
             "CONTROL_DATABASE_URL_MIGRATOR_MISSING",
+            "MIGRATION_NOT_ALLOWLISTED",
+            "MIGRATION_SUPERUSER_NOT_ALLOWED",
+            "MIGRATION_CONNECTION_IDENTITY_MISMATCH",
+            "B2_003_PREREQUISITES_REQUIRED",
+            "B2_003_ALREADY_APPLIED",
+            "B2_003_PRECONDITION_FAILED",
+            "B2_003_POSTCONDITION_FAILED",
+            "B2_003_STRUCTURE_MISMATCH",
+            "B2_003_POSTCHECK_UNAVAILABLE",
         }:
             code = exc.__class__.__name__
-        return _fail(code, migration=args.migration, target_db=args.target_db)
+        return _fail(code, migration=args.migration, target_db=args.target_db,
+                     mutation_performed=code in {"B2_003_POSTCONDITION_FAILED", "B2_003_STRUCTURE_MISMATCH", "B2_003_POSTCHECK_UNAVAILABLE"})
     except Exception as exc:
         return _fail(exc.__class__.__name__, migration=args.migration, target_db=args.target_db)
     print(json.dumps(result, sort_keys=True))
