@@ -139,12 +139,22 @@ def produce_new_genesis_proof(*, authorization_wire, configuration, receipt_sign
 class ScopedV2PostgresCore:
     route = SCOPED_V2_POSTGRES
 
-    def __init__(self, url, *, database, control, configuration, mode, recovery_verifier=None):
+    def __init__(self, url, *, database, control, configuration, mode, recovery_verifier=None,
+                 genesis_authorization_verifier=None):
         require(isinstance(mode, AuthorityEnvironmentMode), "explicit activation environment mode required")
         self.engine = create_engine(url, isolation_level="READ COMMITTED", pool_pre_ping=True)
         require(self.engine.dialect.name == "postgresql", "Scoped V2 Core requires PostgreSQL")
         self.database, self.control, self.configuration, self.mode = database, control, configuration, mode
         self.recovery_verifier = recovery_verifier
+        # Protected composition dependency, never populated from request data.
+        if genesis_authorization_verifier is not None:
+            from .b2_genesis_authorization import GenesisAuthorizationVerifier, PRODUCTION, NON_PRODUCTION
+            require(type(genesis_authorization_verifier) is GenesisAuthorizationVerifier,
+                    "protected exact genesis verifier required")
+            require(genesis_authorization_verifier.classification ==
+                    (PRODUCTION if mode == AuthorityEnvironmentMode.REAL_PRODUCTION else NON_PRODUCTION),
+                    "genesis verifier environment mismatch")
+        self._genesis_authorization_verifier = genesis_authorization_verifier
         require(control.v2_configuration == configuration.authority_binding(), "Core/Authority fixed V2 configuration mismatch")
         if mode == AuthorityEnvironmentMode.REAL_PRODUCTION:
             require(database == "qingyu_prod", "production V2 target must be qingyu_prod")
@@ -266,9 +276,27 @@ class ScopedV2PostgresCore:
                 return {"status":"GENESIS_DURABLE_CONFLICTING_STATE"}
             raise
 
-    def execute_new_genesis(self, *, authority_reference, intent_id, opening, owner_approval, now, failure_hook=None):
-        if self.mode == AuthorityEnvironmentMode.REAL_PRODUCTION:
+    @property
+    def genesis_authorization_verifier(self):
+        return self._genesis_authorization_verifier
+
+    def _verify_genesis_authorization(self, authorization, *, authority_reference, intent_id, opening, owner_approval):
+        from .b2_genesis_authorization import (GenesisAuthorizationVerifier, VerifiedGenesisAuthorization,
+                                               genesis_authorization_context)
+        if (type(authorization) is not VerifiedGenesisAuthorization
+                or type(self.genesis_authorization_verifier) is not GenesisAuthorizationVerifier):
             raise CoreError("GENESIS_FINAL_OWNER_CONFIRMATION_REQUIRED")
+        context = genesis_authorization_context(self, authority_reference=authority_reference,
+            intent_id=intent_id, opening=opening, owner_approval=owner_approval)
+        return self.genesis_authorization_verifier.revalidate(authorization, context)
+
+    def execute_new_genesis(self, *, authority_reference, intent_id, opening, owner_approval, now, failure_hook=None,
+                            authorization=None):
+        if self.mode == AuthorityEnvironmentMode.REAL_PRODUCTION and authorization is None:
+            raise CoreError("GENESIS_FINAL_OWNER_CONFIRMATION_REQUIRED")
+        if self.mode == AuthorityEnvironmentMode.REAL_PRODUCTION or authorization is not None:
+            self._verify_genesis_authorization(authorization, authority_reference=authority_reference,
+                intent_id=intent_id, opening=opening, owner_approval=owner_approval)
         authority = self.control.read_authority(authority_reference); smi = self.control.read_smi(intent_id)
         require(authority is not None and smi is not None and smi.payload["authority_hash"] == authority.record_hash,
                 "exact durable Authority and SMI required")
@@ -336,7 +364,19 @@ class ScopedV2PostgresCore:
             return "CONFLICT"
         return "EXACT" if state["genesis_hash"] == expected_genesis_hash else "CONFLICT"
 
-    def final_owner_confirmation_gate(self, *, authority_reference, intent_id, now):
+    def final_owner_confirmation_gate(self, *, authority_reference, intent_id, now, authorization=None,
+                                      opening=None, owner_approval=None):
+        if authorization is not None:
+            self._verify_genesis_authorization(authorization, authority_reference=authority_reference,
+                intent_id=intent_id, opening=opening, owner_approval=owner_approval)
+            authority = self.control.read_authority(authority_reference)
+            smi = self.control.read_smi(intent_id)
+            self._environment_source_guard(authority)
+            self.control._verify_intent(SignedMigrationIntent.model_validate(smi.payload["intent"]), authority, now=now)
+            self.read_pre_genesis_state()
+            require(callable(self.recovery_verifier), "protected recovery verifier required")
+            self.recovery_verifier()
+            return {"status":"AUTHORIZATION_VERIFIED_FOR_CONTINUATION"}
         require(self.mode == AuthorityEnvironmentMode.REAL_PRODUCTION, "real final confirmation gate requires explicit production route")
         require(self.database == "qingyu_prod", "real final confirmation gate target mismatch")
         authority, smi = self.control.read_authority(authority_reference), self.control.read_smi(intent_id)
