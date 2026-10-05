@@ -123,6 +123,43 @@ class R1CoreConsumer:
         raise CoreError("R1_LIFECYCLE_NOT_IMPLEMENTED")
 
     bootstrap_genesis = acquire_owner_lease = transfer_owner = verify_restore = activate_restore = _unsupported
+
+
+class ScopedV2CoreConsumer:
+    """Minimal V2 activation successor; ordinary/legacy consumers are unchanged."""
+    def __init__(self, *, adapter):
+        from .r1_scoped_activation_core import ScopedV2PostgresCore
+        if type(adapter) is not ScopedV2PostgresCore:
+            raise CoreError("B2_SCOPED_V2_POSTGRES_ADAPTER_REQUIRED")
+        self.adapter = adapter
+
+    def bootstrap_genesis(self, **request):
+        return self.adapter.execute_new_genesis(**request)
+
+    def prepare_activation(self, *, authority_request, intent, now):
+        # Invalid signatures/targets/timestamps are rejected before even the
+        # first durable dependency. Technical failures after a committed stage
+        # still expose the truthful restart-stable partial state.
+        self.adapter.control.validate_preparation_request(authority_request=authority_request, intent=intent, now=now)
+        authority = self.adapter.control.create_authority(**authority_request)
+        smi = self.adapter.control.persist_smi(intent, authority_reference=authority.payload["authority_reference"], now=now)
+        return {"authority":authority, "smi":smi}
+
+    def activation_state(self, *, authority_reference, intent_id):
+        state = self.adapter.control.partial_state(authority_reference=authority_reference, intent_id=intent_id)
+        core = self.adapter.read_genesis_state()
+        if core["status"] == "PRE_GENESIS":
+            return state
+        if (core["identity"]["authority_reference"] != authority_reference
+                or core["identity"]["intent_id"] != intent_id):
+            raise CoreError("B2_GENESIS_IDENTITY_CONFLICT")
+        return "GENESIS_DURABLE"
+
+    def identity_status(self):
+        return self.adapter.read_genesis_state()
+
+    def core_read_model(self):
+        return self.adapter.verify_core_identity()
 def create_scoped_core_finisher(store, *, trust, deployments, runtime_principal,
                                source=None, checkpoint_hook=None):
     """Explicit V2 local-only integration. No default route or V1 alteration."""

@@ -62,3 +62,21 @@ def build_core_service(settings: Settings, *, runtime: CoreRuntimeDependencies |
     client = AuthorityClient(pin=pin, ca_file=settings.control_plane_ca_file,
                              credential_provider=runtime.credential_provider)
     return R1CoreConsumer(local_store=local, client=client)
+
+
+def build_activation_core_service(*, route, adapter, environment_mode):
+    """Explicit V2 activation composition, with no fallback to the legacy factory.
+
+    No secrets are resolved and no database is connected during composition.
+    The closed real GENESIS final-confirmation gate remains in the adapter.
+    """
+    from .errors import CoreError
+    from .b2_signer_trust import AuthorityEnvironmentMode
+    from .r1_scoped_activation_core import ScopedV2PostgresCore, SCOPED_V2_POSTGRES
+    from .r1_service import ScopedV2CoreConsumer
+    if route != SCOPED_V2_POSTGRES:
+        raise CoreError("B2_PRODUCTION_NEW_GENESIS_V2_ROUTE_REQUIRED")
+    if (not isinstance(environment_mode, AuthorityEnvironmentMode)
+            or type(adapter) is not ScopedV2PostgresCore or adapter.mode != environment_mode):
+        raise CoreError("B2_ACTIVATION_ROUTE_ENVIRONMENT_MISMATCH")
+    return ScopedV2CoreConsumer(adapter=adapter)
