@@ -12,11 +12,14 @@ CORE_REVISION = "b2_005_scoped_core_new_genesis_v2"
 SCHEMA_VERSION = "qingyu-scoped-activation-v2-1"
 
 
-def apply_activation_migration(engine, *, database: str, kind: str):
+def apply_activation_migration(engine, *, database: str, kind: str, authorization=None):
     if kind not in {"control", "core"}:
         raise CoreError("B2_ACTIVATION_MIGRATION_KIND_INVALID")
-    # This callable is deliberately candidate-only, until separately enabled.
-    if database in {"qingyu_control", "qingyu_prod"}:
+    from ..b2_migration_authorization import ProtectedMigrationTarget
+    # Policies belong to protected composition, never an execution argument.
+    if type(engine) is ProtectedMigrationTarget:
+        engine = engine.authorize_continuation(authorization, database=database, kind=kind)
+    elif database in {"qingyu_control", "qingyu_prod"} or authorization is not None:
         raise CoreError("B2_REAL_MIGRATION_NOT_ENABLED")
     schema = "governance" if kind == "control" else "r1_core_v2"
     revision = CONTROL_REVISION if kind == "control" else CORE_REVISION
