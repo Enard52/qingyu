@@ -12,7 +12,6 @@ from hashlib import sha1
 import re
 
 from .b2_activation_readiness import SignedMigrationIntent, activation_candidate_hash, validate_owner_approval
-from .b2_activation_lifecycle import activation_hash
 from .control_plane.r1_validation_codec import c2, decode, sha
 from .errors import CoreError
 
@@ -161,7 +160,6 @@ def genesis_authorization_context(core, *, authority_reference, intent_id, openi
     The prepared-request identity IS the existing frozen GENESIS proof hash.
     Authorization metadata is not added to that proof or the durable root.
     """
-    from .r1_scoped_activation_core import encode_opening, verify_opening
     from .b2_signer_trust import AuthorityEnvironmentMode
     verifier = core.genesis_authorization_verifier
     if type(verifier) is not GenesisAuthorizationVerifier:
@@ -169,19 +167,66 @@ def genesis_authorization_context(core, *, authority_reference, intent_id, openi
     real = core.mode == AuthorityEnvironmentMode.REAL_PRODUCTION
     if verifier.classification != (PRODUCTION if real else NON_PRODUCTION):
         fail("CLASSIFICATION_MISMATCH")
+    return GenesisAuthorizationContext(_genesis_request_context(core, authority_reference=authority_reference,
+        intent_id=intent_id, opening=opening, activation_approval=owner_approval,
+        classification=verifier.classification, foundation_checkpoint=verifier.foundation_checkpoint))
+
+
+@dataclass(frozen=True)
+class GenesisPreapprovalRequestCommitment:
+    """Public deterministic context projection; never an execution capability.
+
+    Forging/copying this value establishes no Owner provenance. Execution must
+    independently recompute its context and revalidate the frozen capability.
+    """
+    wire: bytes
+
+    @property
+    def genesis_request_hash(self):
+        return decode(self.wire)["genesis_request_hash"]
+
+
+def prepare_genesis_approval_request_commitment(core, *, authority_reference, intent_id, opening,
+                                                activation_approval, synthetic_foundation_checkpoint=None):
+    """Read current immutable dependencies; require no second Owner pins.
+
+    activation_approval retains the original first B2 activation approval bytes.
+    The synthetic lineage label is display/context metadata and is accepted
+    only in explicitly synthetic mode. Production Foundation lineage is fixed.
+    This function is neither final preflight nor readiness/consent to execute.
+    """
+    from .b2_signer_trust import AuthorityEnvironmentMode
+    if core.mode == AuthorityEnvironmentMode.REAL_PRODUCTION:
+        if synthetic_foundation_checkpoint is not None:
+            fail("FOUNDATION_CHECKPOINT_MISMATCH")
+        classification, foundation = PRODUCTION, FOUNDATION_CHECKPOINT
+    elif core.mode == AuthorityEnvironmentMode.SYNTHETIC_PRODUCTION_TEST:
+        if (type(synthetic_foundation_checkpoint) is not str
+                or not synthetic_foundation_checkpoint.startswith("NON_PRODUCTION:")):
+            fail("FOUNDATION_CHECKPOINT_MISMATCH")
+        classification, foundation = NON_PRODUCTION, synthetic_foundation_checkpoint
+    else:
+        fail("CLASSIFICATION_MISMATCH")
+    return GenesisPreapprovalRequestCommitment(_genesis_request_context(core,
+        authority_reference=authority_reference, intent_id=intent_id, opening=opening,
+        activation_approval=activation_approval, classification=classification, foundation_checkpoint=foundation))
+
+
+def _genesis_request_context(core, *, authority_reference, intent_id, opening, activation_approval,
+                             classification, foundation_checkpoint):
+    from .r1_scoped_activation_core import genesis_request_proof, verify_opening
     authority, smi = core.control.read_authority(authority_reference), core.control.read_smi(intent_id)
     if authority is None or smi is None or smi.payload["authority_hash"] != authority.record_hash:
         fail("AUTHORITY_MISMATCH")
     intent = SignedMigrationIntent.model_validate(smi.payload["intent"])
-    validate_owner_approval(approval=owner_approval, target=core.control.target, intent=intent)
+    validate_owner_approval(approval=activation_approval, target=core.control.target, intent=intent)
     verify_opening(opening, core.configuration)
-    proof_wire = c2({"schema_version": authority.payload["schema_version"], "authority_wire": authority.wire.hex(),
-                    "smi_wire": smi.wire.hex(), "opening_wire": encode_opening(opening).hex(),
-                    "owner_approval": owner_approval.model_dump(mode="json")})
-    return GenesisAuthorizationContext(c2({"classification": verifier.classification,
-        "foundation_checkpoint": verifier.foundation_checkpoint,
+    _, request_hash = genesis_request_proof(authority_wire=authority.wire, smi_wire=smi.wire,
+        opening=opening, activation_approval=activation_approval, schema_version=authority.payload["schema_version"])
+    return c2({"classification": classification,
+        "foundation_checkpoint": foundation_checkpoint,
         "activation_request_hash": activation_candidate_hash(target=core.control.target, intent=intent),
         "authority_reference": authority_reference, "authority_hash": authority.record_hash,
-        "intent_id": intent_id, "smi_hash": smi.record_hash, "genesis_request_hash": activation_hash("genesis", proof_wire),
-        "target_database": core.database, "environment": PRODUCTION if real else core.control.target.environment_identity,
-        "adapter": core.route}))
+        "intent_id": intent_id, "smi_hash": smi.record_hash, "genesis_request_hash": request_hash,
+        "target_database": core.database, "environment": PRODUCTION if classification == PRODUCTION else core.control.target.environment_identity,
+        "adapter": core.route})

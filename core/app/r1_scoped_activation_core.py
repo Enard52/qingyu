@@ -44,6 +44,24 @@ def decode_opening(raw):
     return proof
 
 
+def genesis_request_hash(proof_wire):
+    """The unchanged GENESIS proof hash, also used by durable readback."""
+    return activation_hash("genesis", proof_wire)
+
+
+def genesis_request_proof(*, authority_wire, smi_wire, opening, activation_approval, schema_version=SCHEMA_VERSION):
+    """Original GENESIS proof bytes/hash, shared by preview and execution.
+
+    activation_approval is the existing B2 activation approval, not the later
+    request-specific Owner GENESIS checkpoint. This pure projection grants no
+    authority and does not validate eligibility or persist anything.
+    """
+    proof_wire = c2({"schema_version": schema_version, "authority_wire": authority_wire.hex(),
+                     "smi_wire": smi_wire.hex(), "opening_wire": encode_opening(opening).hex(),
+                     "owner_approval": activation_approval.model_dump(mode="json")})
+    return proof_wire, genesis_request_hash(proof_wire)
+
+
 @dataclass(frozen=True)
 class OpeningConfiguration:
     """Public configuration supplied by the protected initializer composition."""
@@ -207,7 +225,7 @@ class ScopedV2PostgresCore:
             and set(proof_body) == {"schema_version", "authority_wire", "smi_wire", "opening_wire", "owner_approval"},
             "V2 durable exact fields")
         require(activation_hash("core_identity", iw) == identity["record_hash"]
-            and activation_hash("genesis", pw) == root["proof_hash"] == body["genesis_hash"]
+            and genesis_request_hash(pw) == root["proof_hash"] == body["genesis_hash"]
             and root["identity_hash"] == identity["record_hash"] and sha(cw) == marker["checkpoint_hash"], "GENESIS_DURABLE_CONFLICTING_STATE: hash mismatch")
         require(body["schema_version"] == proof_body["schema_version"] == SCHEMA_VERSION
             and body["environment"] == self.control.target.environment_identity
@@ -309,10 +327,8 @@ class ScopedV2PostgresCore:
         utc(owner_approval.approved_at); utc(now)
         require(datetime.fromisoformat(authority.payload["created_at"]) <= decision_time
                 and owner_approval.approved_at <= decision_time <= now, "GENESIS chronology mismatch")
-        proof_wire = c2({"schema_version":SCHEMA_VERSION, "authority_wire":authority.wire.hex(),
-                         "smi_wire":smi.wire.hex(), "opening_wire":encode_opening(opening).hex(),
-                         "owner_approval":owner_approval.model_dump(mode="json")})
-        proof_hash = activation_hash("genesis", proof_wire)
+        proof_wire, proof_hash = genesis_request_proof(authority_wire=authority.wire, smi_wire=smi.wire,
+            opening=opening, activation_approval=owner_approval)
         body = {"schema_version":SCHEMA_VERSION, "identity":auth["identity"],
                 "authority_reference":authority_reference,"authority_hash":authority.record_hash,
                 "intent_id":intent_id,"smi_hash":smi.record_hash,"genesis_hash":proof_hash,
