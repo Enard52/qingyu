@@ -89,8 +89,14 @@ class FixedAccess:
         from dataclasses import asdict
         from app.control_plane.r1_validation_codec import c2,sha
         if stage not in {"roles","acl"}: fail("PROVISIONING_STAGE_MISMATCH")
+        # Only these fixed recovery-plan fields project ordered Python values
+        # to C2 lists. Do not coerce unordered or recursively nested containers.
+        def ordered_plan_values(values):
+            if type(values) not in (tuple,list): fail("PROVISIONING_PLAN_ORDERED_VALUES_REQUIRED")
+            return list(values)
         return sha(c2({"stage":stage,"policy":asdict(self.policy),"roles":ROLES,"owners":OWNERS,
-                       "tables":TABLES,"inserts":INSERTS,"default":"DENY"}))
+                       "tables":{k:ordered_plan_values(v) for k,v in TABLES.items()},
+                       "inserts":{k:ordered_plan_values(v) for k,v in INSERTS.items()},"default":"DENY"}))
 
     def _recovery_guard(self,stage,admin_control):
         if self.policy.classification!="REAL_PRODUCTION": return
