@@ -36,7 +36,7 @@ def _database_url() -> str:
 def control_plane():
     url = _database_url()
     try:
-        from app.control_plane.authority import PostgresControlPlane
+        from app.control_plane import PostgresControlPlane
     except ImportError:
         pytest.fail("PostgresControlPlane is required for the Commit 1B acceptance run")
 
@@ -132,7 +132,7 @@ def test_enrollment_and_restart_persist_authority(control_plane):
         assert checkpoint_before["identity_id"] == str(identity_id)
 
     url = _database_url()
-    from app.control_plane.authority import PostgresControlPlane
+    from app.control_plane import PostgresControlPlane
 
     params = signature(PostgresControlPlane).parameters
     kwargs = {key: url for key in ("database_url", "control_plane_database_url", "url") if key in params}
@@ -180,6 +180,87 @@ def test_concurrent_recovery_has_at_most_one_winner(control_plane):
     statuses = [item.get("status") for item in outcomes if isinstance(item, dict)]
     assert statuses.count("RECOVERY_PREPARED") <= 1
     assert sum(isinstance(item, dict) for item in outcomes) <= 1
+
+
+def test_transfer_fences_old_writer_and_quorum_is_durable(control_plane):
+    trust_domain_id, _, continuity_id, storage_generation_id = _enroll(control_plane)
+    lease = control_plane.acquire_lease(
+        continuity_id=continuity_id,
+        principal_id="acceptance-owner",
+        capability="core_writer",
+        storage_generation_id=storage_generation_id,
+    )
+    transferred = control_plane.transfer_owner(
+        continuity_id=continuity_id,
+        expected_owner_version=0,
+        current_owner_principal_id="acceptance-owner",
+        target_principal_id="acceptance-owner-b",
+        target_key_fingerprint="acceptance-owner-key-b",
+        request_id=f"owner-transfer-{uuid.uuid4()}",
+    )
+    assert transferred.epoch == 1
+    with pytest.raises(CoreError, match="EPOCH_STALE|LEASE_FENCED"):
+        control_plane.prepare_mutation(
+            continuity_id=continuity_id,
+            epoch=lease.epoch,
+            lease_id=lease.lease_id,
+            mutation_id=f"stale-{uuid.uuid4()}",
+            payload={"x": 1},
+            actor_principal_id="acceptance-owner",
+            capability="core_writer",
+            storage_generation_id=storage_generation_id,
+            expected_state_version=0,
+        )
+
+    url = _database_url()
+    engine = create_engine(url, pool_pre_ping=True)
+    with engine.connect() as connection:
+        witness_count = connection.execute(
+            text("SELECT count(*) FROM cp_quorum_acks WHERE operation_id LIKE 'owner-transfer-%'")
+        ).scalar_one()
+    engine.dispose()
+    assert witness_count >= 2
+
+
+def test_mutation_commit_retry_is_deterministic(control_plane):
+    _, _, continuity_id, storage_generation_id = _enroll(control_plane)
+    lease = control_plane.acquire_lease(
+        continuity_id=continuity_id,
+        principal_id="acceptance-owner",
+        capability="core_writer",
+        storage_generation_id=storage_generation_id,
+    )
+    mutation_id = f"uncertain-{uuid.uuid4()}"
+    permit = control_plane.prepare_mutation(
+        continuity_id=continuity_id,
+        epoch=lease.epoch,
+        lease_id=lease.lease_id,
+        mutation_id=mutation_id,
+        payload={"uncertain": True},
+        actor_principal_id="acceptance-owner",
+        capability="core_writer",
+        storage_generation_id=storage_generation_id,
+        expected_state_version=0,
+    )
+    committed = control_plane.commit_mutation(
+        mutation_id=mutation_id,
+        local_commit_id="local-commit-1",
+        audit_head_hash="head-1",
+        audit_seq=1,
+    )
+    replay = control_plane.prepare_mutation(
+        continuity_id=continuity_id,
+        epoch=lease.epoch + 1,
+        lease_id=lease.lease_id,
+        mutation_id=mutation_id,
+        payload={"uncertain": True},
+        actor_principal_id="acceptance-owner",
+        capability="core_writer",
+        storage_generation_id=storage_generation_id,
+        expected_state_version=0,
+    )
+    assert committed.state.value == "COMMITTED"
+    assert replay.state.value == "COMMITTED"
 
 
 def test_production_backend_never_silently_uses_memory(monkeypatch):

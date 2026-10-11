@@ -27,6 +27,14 @@ def test_settings_rejects_unimplemented_control_plane_backend():
         Settings(CORE_CONTROL_PLANE_BACKEND="sqlite-quorum")
 
 
+def test_settings_rejects_unallowlisted_control_plane_database():
+    with pytest.raises(ValidationError, match="unauthorized"):
+        Settings(
+            CORE_CONTROL_PLANE_BACKEND="postgres",
+            CORE_CONTROL_PLANE_STORE="postgresql+psycopg://x:PASSWORD@localhost/unknown_db",
+        )
+
+
 def test_database_safety_requires_explicit_core_name():
     settings = Settings(CORE_DATABASE_URL="sqlite+pysqlite:///:memory:")
     engine = create_engine("sqlite+pysqlite:///:memory:")

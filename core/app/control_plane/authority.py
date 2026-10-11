@@ -492,6 +492,7 @@ class InMemoryControlPlane:
         current_owner_principal_id: str,
         target_principal_id: str,
         target_key_fingerprint: str,
+        request_id: str | None = None,
     ) -> DomainState:
         self._require_quorum()
         with self._lock:
@@ -588,6 +589,7 @@ class InMemoryControlPlane:
             state = self.get_domain(continuity_id)
             return {
                 "trust_domain_id": str(state.trust_domain_id),
+                "identity_id": str(state.identity_id),
                 "continuity_id": str(state.continuity_id),
                 "epoch": state.epoch,
                 "state_version": state.state_version,

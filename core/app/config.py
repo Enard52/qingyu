@@ -14,6 +14,9 @@ FORBIDDEN_DATABASE_NAMES = frozenset(
     {"qingyu", "qingyu_test", "postgres", "template0", "template1"}
 )
 CORE_WRITE_DATABASE_NAMES = frozenset({"qingyu_core_test", "qingyu_core_acceptance"})
+CONTROL_PLANE_WRITE_DATABASE_NAMES = frozenset(
+    {"qingyu_control_test", "qingyu_control_acceptance", "qingyu_control_prod"}
+)
 
 
 class Settings(BaseSettings):
@@ -81,6 +84,14 @@ class Settings(BaseSettings):
                 raise ValueError("CORE_CONTROL_PLANE_STORE is invalid") from exc
             if not cp_url.database or cp_url.database.lower() in FORBIDDEN_DATABASE_NAMES:
                 raise ValueError("CORE_CONTROL_PLANE_STORE targets a forbidden database")
+            if cp_url.database.lower() not in CONTROL_PLANE_WRITE_DATABASE_NAMES:
+                raise ValueError(
+                    "CORE_CONTROL_PLANE_STORE targets an unauthorized database"
+                )
+            if cp_url.username and cp_url.username.lower() in {"postgres", "qingyu"}:
+                raise ValueError(
+                    "CORE_CONTROL_PLANE_STORE requires a dedicated application credential"
+                )
             if self.core_database_url and cp_url.render_as_string(hide_password=True) == make_url(self.core_database_url).render_as_string(hide_password=True):
                 raise ValueError("control-plane store must be independent from Core database")
         return self

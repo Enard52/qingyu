@@ -495,6 +495,7 @@ class CoreFoundationService:
             current_owner_principal_id=current_owner_principal_id,
             target_principal_id=target_principal_id,
             target_key_fingerprint=target_key_fingerprint,
+            request_id=request_id,
         )
         session = self._session()
         audit_seq = 0
@@ -700,6 +701,7 @@ class CoreFoundationService:
             checkpoint = self.authority.export_checkpoint(manifest.continuity_id)
             if (
                 checkpoint["trust_domain_id"] != str(manifest.trust_domain_id)
+                or checkpoint.get("identity_id") != str(manifest.qingyu_identity_id)
                 or checkpoint["continuity_id"] != str(manifest.continuity_id)
                 or checkpoint["storage_generation_id"] != str(manifest.storage_generation_id)
                 or checkpoint["control_plane_generation_id"] != str(manifest.control_plane_generation_id)
@@ -784,6 +786,7 @@ class CoreFoundationService:
                 raise CoreError("RESTORE_OWNER_UNPROVEN")
             if (
                 checkpoint["trust_domain_id"] != str(manifest.trust_domain_id)
+                or checkpoint.get("identity_id") != str(manifest.qingyu_identity_id)
                 or checkpoint["continuity_id"] != str(manifest.continuity_id)
                 or checkpoint["control_plane_generation_id"]
                 != str(manifest.control_plane_generation_id)

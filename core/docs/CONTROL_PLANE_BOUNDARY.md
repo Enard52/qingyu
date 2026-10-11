@@ -29,8 +29,12 @@ quarantined and writes fail closed until an operator completes reconciliation.
 
 An authority implementation must provide a durable monotonic state, a 2-of-3
 witness quorum, duplicate `mutation_id` detection, and recovery after process
-or node loss. In-memory authority is test/development-only. Production must
-fail closed when no configured external authority is available.
+or node loss. The initial PostgreSQL deployment persists a three-slot witness
+set and two durable acknowledgements per operation in the independent Control
+Plane database; moving those slots to independent witness nodes is an
+operational fault-domain improvement, not a Core interface change. In-memory
+authority is test/development-only. Production must fail closed when no
+configured external authority is available.
 
 ## Separation from Core
 
@@ -69,4 +73,3 @@ checkpoint mismatch, restore identity mismatch, and authority/Core state
 divergence. The system must preserve the evidence needed to investigate the
 condition and must not silently retry with a new identity, alias, epoch, or
 mutation payload.
-
