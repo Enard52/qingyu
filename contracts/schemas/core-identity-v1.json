@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "IdentityContinuityEnvelope": {
+      "additionalProperties": false,
+      "description": "The shared Core identity/continuity fields carried by future APIs.",
+      "properties": {
+        "continuity_alias": {
+          "maxLength": 128,
+          "minLength": 1,
+          "not": {
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+          },
+          "title": "Continuity Alias",
+          "type": "string"
+        },
+        "continuity_epoch": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Continuity Epoch",
+          "type": "integer"
+        },
+        "continuity_id": {
+          "format": "uuid",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$",
+          "title": "Continuity Id",
+          "type": "string"
+        },
+        "contract_version": {
+          "const": "core-identity-v1",
+          "default": "core-identity-v1",
+          "title": "Contract Version",
+          "type": "string"
+        },
+        "qingyu_identity_id": {
+          "format": "uuid",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$",
+          "title": "Qingyu Identity Id",
+          "type": "string"
+        },
+        "state_version": {
+          "default": 0,
+          "minimum": 0,
+          "title": "State Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "qingyu_identity_id",
+        "continuity_id",
+        "continuity_alias"
+      ],
+      "title": "IdentityContinuityEnvelope",
+      "type": "object"
+    }
+  },
+  "required": [
+    "IdentityContinuityEnvelope"
+  ],
+  "title": "Qingyu Core Identity Contract v1",
+  "type": "object"
+}
