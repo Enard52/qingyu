@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions and ideas
+    url: https://github.com/tangwenhai839-create/qingyu/discussions
+    about: Ask questions and discuss design in GitHub Discussions.
+  - name: Security issues
+    url: https://github.com/tangwenhai839-create/qingyu/blob/main/SECURITY.md
+    about: Please report vulnerabilities privately.
