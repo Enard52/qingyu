@@ -104,6 +104,8 @@ cp .env.example .env
 # In .env set POSTGRES_PASSWORD and matching DATABASE_URL, e.g.
 #   POSTGRES_PASSWORD=<your-password>
 #   DATABASE_URL=postgresql+psycopg://qingyu:<your-password>@127.0.0.1:5432/qingyu
+#   If the password contains URL-special characters (@, :, /, %), percent-encode
+#   them in DATABASE_URL so the connection string still parses.
 # and three different random secrets for API_TOKEN, EVIDENCE_READ_API_TOKEN,
 # EVIDENCE_CURSOR_SIGNING_KEY:
 python -c "import secrets; print(secrets.token_urlsafe(32))"

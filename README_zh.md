@@ -73,6 +73,8 @@ cp .env.example .env
 # 在 .env 中设置 POSTGRES_PASSWORD 以及匹配的 DATABASE_URL，例如：
 #   POSTGRES_PASSWORD=<密码>
 #   DATABASE_URL=postgresql+psycopg://qingyu:<密码>@127.0.0.1:5432/qingyu
+#   如果密码包含 URL 特殊字符（@、:、/、%），请在 DATABASE_URL 中对其做百分号编码，
+#   这样连接字符串才能正常解析。
 # 以及三个互不相同的随机密钥 API_TOKEN、EVIDENCE_READ_API_TOKEN、EVIDENCE_CURSOR_SIGNING_KEY，
 # 和一个可写的 ARCHIVE_ROOT 目录
 python -c "import secrets; print(secrets.token_urlsafe(32))"
