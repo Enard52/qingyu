@@ -23,6 +23,19 @@ Set `CORE_DATABASE_URL` to an explicitly named Core test database such as
 `qingyu_core_test`. The safety gate checks both the configured URL and
 `current_database()` before migrations or tests perform writes.
 
+### Linux / macOS (bash)
+
+```bash
+export CORE_DATABASE_URL="postgresql+psycopg://<core-owner>@127.0.0.1:5432/qingyu_core_test"
+python -m alembic upgrade head
+python -m pytest
+python -m compileall -q app tests
+python -m pip check
+python -m alembic check
+```
+
+### Windows (PowerShell)
+
 ```powershell
 $env:CORE_DATABASE_URL = "postgresql+psycopg://<core-owner>@127.0.0.1:5432/qingyu_core_test"
 python -m alembic upgrade head
