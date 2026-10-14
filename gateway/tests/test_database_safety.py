@@ -1,6 +1,11 @@
 import pytest
-
-from conftest import validate_test_database_url, verify_connected_database
+from conftest import (
+    get_expected_alembic_head,
+    validate_test_database_url,
+    verify_connected_database,
+    verify_database_migrations,
+)
+from sqlalchemy import create_engine, text
 
 
 class _Connection:
@@ -39,3 +44,70 @@ def test_rejects_runtime_database_mismatch():
 def test_rejects_similarly_named_database():
     with pytest.raises(RuntimeError):
         validate_test_database_url("postgresql+psycopg://u:PASSWORD@localhost/my_test_backup")
+
+
+def test_get_expected_alembic_head():
+    head = get_expected_alembic_head()
+    assert head == "0016_real_export_evidence"
+
+
+def test_verify_database_migrations_success():
+    class _MigrationConnection:
+        def __enter__(self): return self
+        def __exit__(self, *args): return None
+        def scalar(self, statement): return "0016_real_export_evidence"
+
+    class _MigrationEngine:
+        def connect(self): return _MigrationConnection()
+
+    assert (
+        verify_database_migrations(_MigrationEngine(), expected_head="0016_real_export_evidence")
+        == "0016_real_export_evidence"
+    )
+
+
+def test_verify_database_migrations_mismatched_revision():
+    class _MigrationConnection:
+        def __enter__(self): return self
+        def __exit__(self, *args): return None
+        def scalar(self, statement): return "0001_phase1_baseline"
+
+    class _MigrationEngine:
+        def connect(self): return _MigrationConnection()
+
+    with pytest.raises(
+        RuntimeError, match=r"run: DATABASE_URL=\$TEST_DATABASE_URL APP_ENV=test alembic upgrade head"
+    ):
+        verify_database_migrations(_MigrationEngine(), expected_head="0016_real_export_evidence")
+
+
+def test_verify_database_migrations_missing_table():
+    class _MigrationConnection:
+        def __enter__(self): return self
+        def __exit__(self, *args): return None
+        def scalar(self, statement): return None
+
+    class _MigrationEngine:
+        def connect(self): return _MigrationConnection()
+
+    with pytest.raises(
+        RuntimeError, match=r"run: DATABASE_URL=\$TEST_DATABASE_URL APP_ENV=test alembic upgrade head"
+    ):
+        verify_database_migrations(_MigrationEngine(), expected_head="0016_real_export_evidence")
+
+
+def test_verify_database_migrations_with_sqlite():
+    engine = create_engine("sqlite:///:memory:")
+    with pytest.raises(
+        RuntimeError, match=r"run: DATABASE_URL=\$TEST_DATABASE_URL APP_ENV=test alembic upgrade head"
+    ):
+        verify_database_migrations(engine, expected_head="0016_real_export_evidence")
+
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32))"))
+        conn.execute(text("INSERT INTO alembic_version VALUES ('0016_real_export_evidence')"))
+
+    assert (
+        verify_database_migrations(engine, expected_head="0016_real_export_evidence")
+        == "0016_real_export_evidence"
+    )

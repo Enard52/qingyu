@@ -137,6 +137,8 @@ cd ../core && pip install -e ".[dev]"
 for f in $(sed 's#^core/##' ../ci/core-portable-tests.txt); do pytest -q "$f"; done
 ```
 
+Gateway tests fail fast with `run: DATABASE_URL=$TEST_DATABASE_URL APP_ENV=test alembic upgrade head` if `alembic_version` is missing or has not been migrated to the latest revision.
+
 Core was developed mainly on Windows. Running its full suite needs the setup described in `core/README.md` and `core/docs/DB_SAFETY.md`.
 
 ## Roadmap

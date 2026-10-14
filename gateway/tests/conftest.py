@@ -1,11 +1,41 @@
 import os
 
 import pytest
-from sqlalchemy import create_engine, text
+from alembic.script import ScriptDirectory
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import SQLAlchemyError
 
 ALLOWED_TEST_DATABASES = {"qingyu_test"}
 FORBIDDEN_DATABASE_QUERY_KEYS = {"dbname", "database", "service", "servicefile"}
+
+
+def get_expected_alembic_head() -> str:
+    gateway_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    alembic_dir = os.path.join(gateway_dir, "alembic")
+    script = ScriptDirectory(alembic_dir)
+    return script.get_current_head()
+
+
+def verify_database_migrations(engine, expected_head: str | None = None) -> str:
+    if expected_head is None:
+        expected_head = get_expected_alembic_head()
+    with engine.connect() as connection:
+        try:
+            has_table = inspect(connection).has_table("alembic_version")
+        except (AttributeError, TypeError, ValueError, SQLAlchemyError):
+            has_table = True
+        current_rev = (
+            connection.scalar(text("SELECT version_num FROM alembic_version"))
+            if has_table
+            else None
+        )
+    if current_rev != expected_head:
+        raise RuntimeError(
+            f"Database schema is not at migration head (current: {current_rev!r}, expected: {expected_head!r}); "
+            "run: DATABASE_URL=$TEST_DATABASE_URL APP_ENV=test alembic upgrade head"
+        )
+    return current_rev
 
 
 def validate_test_database_url(raw_url: str):
@@ -46,6 +76,10 @@ def verified_test_database():
     engine = create_engine(validated_url)
     try:
         assert verify_connected_database(engine) == "qingyu_test"
+        try:
+            verify_database_migrations(engine)
+        except RuntimeError as exc:
+            pytest.fail(str(exc), pytrace=False)
         yield engine
     finally:
         engine.dispose()
