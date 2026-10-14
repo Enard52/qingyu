@@ -2,7 +2,6 @@
 
 **一个自托管、只追加的 AI 对话记忆网关，加上一个"出错就拒绝"（fail-closed）的治理核心，用来确定这些记忆属于谁。**
 
-[![CI](https://github.com/tangwenhai839-create/qingyu/actions/workflows/ci.yml/badge.svg)](https://github.com/tangwenhai839-create/qingyu/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 ![状态：开发中](https://img.shields.io/badge/status-work%20in%20progress-orange)
 
@@ -17,9 +16,9 @@
 
 **已实现并有测试**
 
-- **Gateway（Phase 3 已冻结 + Amendment #1）**：按 SHA-256 内容寻址的原始归档和清单；ChatGPT 导出导入（zip 上传、暂存、重试、清理 worker）；归一化的对话/消息/附件证据；只读（GET-only）证据查询 API，有独立读令牌和签名分页游标。共 16 个 Alembic 迁移。Gateway 测试（347 个）在 CI 中基于 PostgreSQL 16 通过。
+- **Gateway（Phase 3 已冻结 + Amendment #1）**：按 SHA-256 内容寻址的原始归档和清单；ChatGPT 导出导入（zip 上传、暂存、重试、清理 worker）；归一化的对话/消息/附件证据；只读（GET-only）证据查询 API，有独立读令牌和签名分页游标。共 16 个 Alembic 迁移。Gateway 测试（347 通过、6 跳过）在本地 PostgreSQL 16 上通过。
 - **Contracts**：`evidence-query-v1` 和 `core-identity-v1` 的 Pydantic DTO 与 JSON Schema，有测试。
-- **Core 基础部分**：GENESIS 服务（配内存版 2-of-3 测试权威）、continuity/epoch 隔离校验、读模型和 Gateway 证据客户端、规范化 JSON 哈希、审计记录，单元测试在 CI 中运行（`core-portable`）。
+- **Core 基础部分**：GENESIS 服务（配内存版 2-of-3 测试权威）、continuity/epoch 隔离校验、读模型和 Gateway 证据客户端、规范化 JSON 哈希、审计记录，单元测试可在普通 Linux 上运行（见 `ci/core-portable-tests.txt`）。
 
 **部分完成 / 验收中**
 
@@ -88,6 +87,7 @@ curl http://127.0.0.1:8000/health
 
 与上面的状态一致，不承诺时间：
 
+0. 启用 GitHub Actions CI：现成的工作流在 [`ci/github-actions-ci.yml`](ci/github-actions-ci.yml)，移到 `.github/workflows/` 即可。
 1. 让 Core 全部测试能在 Linux CI 上运行。
 2. 解决 Core R1 验收阻塞，完成 phase-b2。
 3. 生产 GENESIS 与激活流程，配独立见证。

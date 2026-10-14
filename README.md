@@ -2,7 +2,6 @@
 
 **A self-hosted, append-only memory gateway for your AI conversations, plus a fail-closed governance core that decides who those memories belong to.**
 
-[![CI](https://github.com/tangwenhai839-create/qingyu/actions/workflows/ci.yml/badge.svg)](https://github.com/tangwenhai839-create/qingyu/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 ![Python 3.12](https://img.shields.io/badge/python-3.12-blue)
 ![Status: work in progress](https://img.shields.io/badge/status-work%20in%20progress-orange)
@@ -18,9 +17,9 @@ Based on the code and tests in this repository as of October 2026:
 
 **Implemented and tested**
 
-- **Gateway (Phase 3 frozen + Amendment #1).** Content-addressed raw archive (SHA-256 + manifest), ChatGPT export import (zip upload, staging, retry, cleanup worker), normalized conversation/message/attachment evidence, and a GET-only Evidence Query API with its own read token and signed pagination cursors. 16 Alembic migrations. The Gateway test suite (347 tests) passes against PostgreSQL 16 in CI.
+- **Gateway (Phase 3 frozen + Amendment #1).** Content-addressed raw archive (SHA-256 + manifest), ChatGPT export import (zip upload, staging, retry, cleanup worker), normalized conversation/message/attachment evidence, and a GET-only Evidence Query API with its own read token and signed pagination cursors. 16 Alembic migrations. The Gateway test suite (347 passed, 6 skipped) passes against a local PostgreSQL 16.
 - **Contracts.** Pydantic DTOs and JSON Schemas for `evidence-query-v1` and `core-identity-v1`, with tests.
-- **Core foundation pieces.** GENESIS service with an in-memory 2-of-3 test authority, continuity/epoch fencing checks, read-model and Gateway evidence clients, canonical JSON hashing, audit records. These have unit tests that run in CI (`core-portable`).
+- **Core foundation pieces.** GENESIS service with an in-memory 2-of-3 test authority, continuity/epoch fencing checks, read-model and Gateway evidence clients, canonical JSON hashing, audit records. These have unit tests that run on plain Linux (see `ci/core-portable-tests.txt`).
 
 **Partial / in acceptance**
 
@@ -133,7 +132,7 @@ pytest -q
 # Contracts
 cd ../contracts && pip install -e ".[dev]" && pytest -q
 
-# Core (portable subset, as in CI)
+# Core (portable subset)
 cd ../core && pip install -e ".[dev]"
 for f in $(sed 's#^core/##' ../ci/core-portable-tests.txt); do pytest -q "$f"; done
 ```
@@ -144,6 +143,7 @@ Core was developed mainly on Windows. Running its full suite needs the setup des
 
 Consistent with the status above; nothing here is a promise of dates.
 
+0. Enable GitHub Actions CI: a ready workflow is in [`ci/github-actions-ci.yml`](ci/github-actions-ci.yml) (lint, contracts, Gateway on PostgreSQL 16, portable Core subset); it only needs to be moved to `.github/workflows/`.
 1. Make the full Core test suite runnable on Linux CI (Docker-based PostgreSQL fixtures, skip Windows-only tests cleanly).
 2. Close the Core R1 acceptance blockers and finish phase-b2 (activation, signer admission, backup, migration readiness).
 3. Production GENESIS and activation ceremony, with an independent witness.
