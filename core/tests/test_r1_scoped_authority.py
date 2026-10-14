@@ -3,6 +3,7 @@
 Set R1_SLICE03_PRIVATE_CONFIG to the current isolated test config. No default
 database, environment DSN, prebuilt Ack/FIX/terminal or evidence import is used.
 """
+import os
 import json
 from pathlib import Path
 import unittest

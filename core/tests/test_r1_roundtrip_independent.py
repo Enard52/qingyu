@@ -5,6 +5,7 @@ governance and permit issuance. These checks never synthesize or insert a busine
 Ack, FIX, terminal or local completion. Private test files are not evidence output.
 """
 from dataclasses import replace
+import os
 import hashlib
 import json
 from pathlib import Path
