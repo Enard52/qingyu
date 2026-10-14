@@ -2,7 +2,7 @@ import os
 
 import pytest
 from alembic.script import ScriptDirectory
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -10,11 +10,22 @@ ALLOWED_TEST_DATABASES = {"qingyu_test"}
 FORBIDDEN_DATABASE_QUERY_KEYS = {"dbname", "database", "service", "servicefile"}
 
 
-def get_expected_alembic_head() -> str:
+def alembic_dir() -> str:
     gateway_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    alembic_dir = os.path.join(gateway_dir, "alembic")
-    script = ScriptDirectory(alembic_dir)
-    return script.get_current_head()
+    return os.path.join(gateway_dir, "alembic")
+
+
+def get_expected_alembic_head() -> str:
+    script = ScriptDirectory(alembic_dir())
+    heads = sorted(script.get_heads())
+    if len(heads) > 1:
+        raise RuntimeError(
+            f"Cannot resolve a single expected migration revision: gateway/alembic has multiple "
+            f"heads {heads}; run `alembic merge-heads` before the tests can verify the schema"
+        )
+    if not heads:
+        raise RuntimeError(f"No Alembic revisions found in {alembic_dir()}")
+    return heads[0]
 
 
 def verify_database_migrations(engine, expected_head: str | None = None) -> str:
@@ -22,14 +33,13 @@ def verify_database_migrations(engine, expected_head: str | None = None) -> str:
         expected_head = get_expected_alembic_head()
     with engine.connect() as connection:
         try:
-            has_table = inspect(connection).has_table("alembic_version")
-        except (AttributeError, TypeError, ValueError, SQLAlchemyError):
-            has_table = True
-        current_rev = (
-            connection.scalar(text("SELECT version_num FROM alembic_version"))
-            if has_table
-            else None
-        )
+            current_rev = connection.scalar(text("SELECT version_num FROM alembic_version"))
+        except SQLAlchemyError:
+            # No readable alembic_version row — absent table, missing permissions, a driver that
+            # cannot introspect it — is the same problem as a stale revision. Treat it as
+            # unmigrated so every path ends in the one actionable message below instead of a raw
+            # database error leaking out of the fixture, which only catches RuntimeError.
+            current_rev = None
     if current_rev != expected_head:
         raise RuntimeError(
             f"Database schema is not at migration head (current: {current_rev!r}, expected: {expected_head!r}); "
