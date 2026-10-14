@@ -1,0 +1,107 @@
+{
+  "schema_version": "qingyu-current-scope-index-v1",
+  "effective_at": "2026-09-18T12:36:05.545597+00:00",
+  "implementation_branch": "ai/task-r1-canonical-implementation",
+  "implementation_head": "3028bb41e7b833c77ba58a1194ef596776aeebc1",
+  "candidate_tag": "r1/dev-slice-04-20260917",
+  "relevant_state_marker": "Phase A COMPLETE; Slice04 COMPLETE; Independent Non-Author Review PASS; PHASE_B1_C_BATCH_01 IMPLEMENTED; PHASE_B1_C_BATCH_02 IMPLEMENTED; PHASE_B1_C_BATCH_03 IMPLEMENTED; PHASE_B1_C_BATCH_04 IMPLEMENTED; PHASE_B1_C_BATCH_05 IMPLEMENTED; PHASE_B1_C_STAGE_CANDIDATE_READY_FOR_INDEPENDENT_REVIEW; Implementation Gate BLOCKED; Foundation Closure NOT ENTERED; Phase B NOT COMPLETE; Phase C NOT COMPLETE; Slice05 NOT STARTED",
+  "conflict_precedence": [
+    "original formal disposition",
+    "frozen manifest / evidence",
+    "actual Git state",
+    "CURRENT_SCOPE index"
+  ],
+  "current_state": {
+    "phase_a": "COMPLETE",
+    "slice04": "COMPLETE",
+    "independent_non_author_review": "PASS",
+    "open_p0_p1_p2": 0,
+    "implementation_gate": "BLOCKED",
+    "foundation_closure": "NOT ENTERED",
+    "slice05": "NOT STARTED",
+    "phase_b1_c_batch_01": "IMPLEMENTED",
+    "phase_b1_c_batch_02": "IMPLEMENTED",
+    "phase_b": "NOT COMPLETE",
+    "phase_c": "NOT COMPLETE",
+    "phase_b1_c_batch_03": "IMPLEMENTED",
+    "phase_b1_c_batch_04": "IMPLEMENTED",
+    "phase_b1_c_batch_05": "IMPLEMENTED",
+    "phase_b1_c_stage_candidate": "READY_FOR_INDEPENDENT_REVIEW"
+  },
+  "supersedes": [
+    "Slice04 final non-author BLOCKED disposition for the three targeted findings, superseded only by targeted rework evidence plus independent PASS evidence",
+    "Slice03 development checkpoint as the latest implementation checkpoint",
+    "Phase B1/C Batch02 real read chain evidence as latest navigation checkpoint"
+  ],
+  "allowed_now": [
+    "Phase B1 deterministic Core Read Model development",
+    "CURRENT_SCOPE index maintenance as a non-authoritative navigation aid",
+    "Phase C Value PoC boundary and scaffold work using formal Core/Gateway APIs only",
+    "Codex self-tests and batch evidence before the next independent review"
+  ],
+  "explicitly_deferred": [
+    "production GENESIS",
+    "formal activation",
+    "witness / IBCS",
+    "multi-writer consensus",
+    "Byzantine defense",
+    "online key rotation",
+    "full suppression / cryptographic erase",
+    "Slice05",
+    "Heartbeat",
+    "Thoughts",
+    "proactive messaging",
+    "tool execution",
+    "Voice",
+    "Avatar",
+    "UI",
+    "production Hermes rollout"
+  ],
+  "authoritative_evidence": [
+    {
+      "kind": "closure_commit",
+      "path": "3028bb41e7b833c77ba58a1194ef596776aeebc1",
+      "tag": "r1/dev-slice-04-20260917"
+    },
+    {
+      "kind": "independent_pass",
+      "path": "docs/evidence/r1-acceptance-marathon/slice04-targeted-rework-01-nonauthor-review-20260917/"
+    },
+    {
+      "kind": "closure_checkpoint",
+      "path": "docs/evidence/r1-acceptance-marathon/slice04-closure-checkpoint-20260918T073523Z/"
+    },
+    {
+      "kind": "targeted_rework_author_evidence",
+      "path": "docs/evidence/r1-acceptance-marathon/slice04-targeted-rework-01-20260917T173814Z/"
+    },
+    {
+      "kind": "phase_b1_c_batch_01_evidence",
+      "path": "docs/evidence/r1-acceptance-marathon/phase-b1-c-batch-01-20260918T090136Z/"
+    },
+    {
+      "kind": "phase_b1_c_batch_02_evidence",
+      "path": "docs/evidence/r1-acceptance-marathon/phase-b1-c-batch-02-real-read-chain-20260918T092812Z/"
+    },
+    {
+      "kind": "phase_b1_c_batch_03_evidence",
+      "path": "docs/evidence/r1-acceptance-marathon/phase-b1-c-batch-03-m4-hardening-20260918T100608Z/"
+    },
+    {
+      "kind": "phase_b1_c_batch_04_evidence",
+      "path": "docs/evidence/r1-acceptance-marathon/phase-b1-c-batch-04-recall-context-20260918T121045Z/"
+    },
+    {
+      "kind": "phase_b1_c_batch_05_evidence",
+      "path": "<repo>/core-r1-implementation/docs/evidence/r1-acceptance-marathon/phase-b1-c-batch-05-stage-candidate-20260918T121909Z/"
+    }
+  ],
+  "manifest_hash_reference": {
+    "closure_checkpoint_checksums": "docs/evidence/r1-acceptance-marathon/slice04-closure-checkpoint-20260918T073523Z/checksums.json",
+    "slice04_pass_checksums": "docs/evidence/r1-acceptance-marathon/slice04-targeted-rework-01-nonauthor-review-20260917/checksums.json",
+    "phase_b1_c_batch_02_evidence_hashes": "docs/evidence/r1-acceptance-marathon/phase-b1-c-batch-02-real-read-chain-20260918T092812Z/evidence-file-hashes.json",
+    "phase_b1_c_stage_candidate_manifest": "<repo>/core-r1-implementation/docs/evidence/r1-acceptance-marathon/phase-b1-c-batch-05-stage-candidate-20260918T121909Z/candidate-manifest.json",
+    "phase_b1_c_stage_candidate_manifest_sha256": "<repo>/core-r1-implementation/docs/evidence/r1-acceptance-marathon/phase-b1-c-batch-05-stage-candidate-20260918T121909Z/candidate-manifest.sha256"
+  },
+  "non_authority_notice": "This index is navigation only. If it conflicts with formal evidence, formal evidence wins."
+}
