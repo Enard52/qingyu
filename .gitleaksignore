@@ -1,0 +1,6 @@
+# false positive: public key fingerprint / type annotation
+9a6f7345eeee98458815a530f53710bc336c4d99:core/ops/b2_activation_operations.py:generic-api-key:46
+# false positive: public key fingerprint / type annotation
+98689256a62bc272ba4006e2c0800d659f7a4c7f:core/tests/test_b2_signer_trust.py:generic-api-key:39
+# false positive: public key fingerprint / type annotation
+88e1b46ba6c5e175d6b04802f59cf7df0b4e19e4:core/app/b2_signer_trust.py:generic-api-key:77
