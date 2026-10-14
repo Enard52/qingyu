@@ -69,13 +69,17 @@ git clone https://github.com/tangwenhai839-create/qingyu.git
 cd qingyu/gateway
 python3.12 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
-# 先改 docker-compose.yml 里的 POSTGRES_PASSWORD，再启动数据库
-docker compose up -d db
 cp .env.example .env
-# 在 .env 中设置 DATABASE_URL=postgresql+psycopg://qingyu:<密码>@127.0.0.1:5432/qingyu
+# 在 .env 中设置 POSTGRES_PASSWORD 以及匹配的 DATABASE_URL，例如：
+#   POSTGRES_PASSWORD=<密码>
+#   DATABASE_URL=postgresql+psycopg://qingyu:<密码>@127.0.0.1:5432/qingyu
 # 以及三个互不相同的随机密钥 API_TOKEN、EVIDENCE_READ_API_TOKEN、EVIDENCE_CURSOR_SIGNING_KEY，
 # 和一个可写的 ARCHIVE_ROOT 目录
 python -c "import secrets; print(secrets.token_urlsafe(32))"
+
+# 启动 PostgreSQL 16（自动从 .env 读取 POSTGRES_PASSWORD）：
+docker compose up -d db
+
 alembic upgrade head
 uvicorn app.main:app --host 127.0.0.1 --port 8000
 curl http://127.0.0.1:8000/health

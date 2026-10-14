@@ -100,16 +100,17 @@ cd qingyu/gateway
 python3.12 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 
-# PostgreSQL 16: edit POSTGRES_PASSWORD in docker-compose.yml first, then
-docker compose up -d db
-
 cp .env.example .env
-# In .env set DATABASE_URL, e.g.
+# In .env set POSTGRES_PASSWORD and matching DATABASE_URL, e.g.
+#   POSTGRES_PASSWORD=<your-password>
 #   DATABASE_URL=postgresql+psycopg://qingyu:<your-password>@127.0.0.1:5432/qingyu
 # and three different random secrets for API_TOKEN, EVIDENCE_READ_API_TOKEN,
 # EVIDENCE_CURSOR_SIGNING_KEY:
 python -c "import secrets; print(secrets.token_urlsafe(32))"
 # Also set ARCHIVE_ROOT to a writable directory.
+
+# PostgreSQL 16 (reads POSTGRES_PASSWORD from .env):
+docker compose up -d db
 
 alembic upgrade head
 uvicorn app.main:app --host 127.0.0.1 --port 8000
