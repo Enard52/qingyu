@@ -23,6 +23,11 @@ Set `CORE_DATABASE_URL` to an explicitly named Core test database such as
 `qingyu_core_test`. The safety gate checks both the configured URL and
 `current_database()` before migrations or tests perform writes.
 
+Both blocks below are run from the `core/` directory, inside that directory's
+own virtualenv: `cd core`, then `python3 -m venv .venv`,
+`source .venv/bin/activate` and `pip install -e ".[dev]"`. The Gateway commands
+in `gateway/README.md` belong to `gateway/` and its venv instead.
+
 ### Linux / macOS (bash)
 
 ```bash
